@@ -43,5 +43,6 @@ RUN npm ci --omit=dev
 COPY gateway/ ./
 COPY --chmod=755 start.sh /usr/local/bin/start.sh
 COPY --chmod=755 run-agent.sh /usr/local/bin/run-agent
+COPY github-login.mjs /usr/local/bin/github-login.mjs
 
 CMD ["/usr/local/bin/start.sh"]
