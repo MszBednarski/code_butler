@@ -7,7 +7,7 @@ function App() {
     <main>
       <div className="mark" aria-hidden="true">✦</div>
       <p className="eyebrow">A LITTLE HELP, ALWAYS CLOSE</p>
-      <h1>Pocket Butler</h1>
+      <h1>Hello Team</h1>
       <p className="description">A little help for everything your day holds.</p>
       <div className="status"><span /> Your butler is taking shape.</div>
       <footer>Made together. <small>Commit {import.meta.env.VITE_COMMIT || 'dev'}</small></footer>
