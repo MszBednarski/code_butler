@@ -1,6 +1,6 @@
 # Pocket Butler deployment
 
-This deployment uses private invite links, as requested for the simplest team setup. A teammate does not need a GitHub OAuth app or a personal access token. They authorize their own Codex subscription using its device-code flow.
+This deployment uses private invite links, as requested for the simplest team setup. Each teammate uses a fine-grained personal access token restricted to this repository; no GitHub OAuth login is used. They authorize their own Codex subscription using its device-code flow.
 
 - Repository: https://github.com/MszBednarski/code_butler
 - Agent project: https://railway.com/project/a2204e4a-b82d-4c9e-8f42-552d96295ed1
@@ -25,7 +25,7 @@ The host refuses to start in Railway without an actual mount at `/data`. The che
 - `/data/home/<name>/.codex`: each person's Codex login and conversations.
 - `/data/home/<name>/.butler-task.md`: the agent's current goal, branch, PR, and next step.
 - `/data/home/<name>/.butler-session`: marks a session to recreate automatically at boot.
-- `/data/github`: the shared GitHub CLI login for pushes and PRs.
+- `/data/home/<name>/.config/gh/repo-token`: that workspace’s PAT (file mode 0600).
 - `/data/invites.json`: hashed invite secrets and member identities.
 - `/data/invite-links.json`: private links for the team lead to distribute.
 
@@ -33,7 +33,13 @@ The single volume-backed agent container has a brief service interruption when i
 
 ## First login
 
-Read `/data/invite-links.json` privately through Railway SSH. Open the `msz` link. The terminal first runs GitHub's device login: open the displayed GitHub URL, enter the code, and authorize as **MszBednarski**. This saves one shared GitHub login for repository pushes and PR creation. An optional `GH_TOKEN` can override this if preferred.
+Read `/data/invite-links.json` privately through Railway SSH. Open the `msz` link. Create a [fine-grained PAT](https://github.com/settings/personal-access-tokens/new) as **MszBednarski** with resource owner **MszBednarski**, **Only select repositories → code_butler**, an expiration date, and **Contents**, **Pull requests**, and **Issues** repository permissions set to **Read and write**. Leave account permissions empty; Metadata read access is automatic.
+
+Paste it only into the terminal's hidden prompt, never into chat. The host validates the account identity and repository push access before saving it atomically with mode 0600. It accepts fine-grained PATs only. The API cannot prove no other repositories or permissions were selected; review those settings yourself. The launcher supplies this workspace's PAT through GH_TOKEN, as [recommended by GitHub CLI](https://cli.github.com/manual/gh_auth_login).
+
+To rotate a token, stop the agent, run `run-agent github-token`, then restart the agent. Revoke a token in GitHub settings and remove its workspace repo-token file to disconnect it.
+
+On deployment, startup removes the old shared `/data/github/hosts.yml` login and ignores deployment-wide GitHub token variables. Remove those variables from Railway too, and revoke the old GitHub CLI OAuth authorization in GitHub settings: deleting the local file does not revoke it remotely. Worktrees and Codex credentials are preserved. Every workspace prompts for its own PAT. For a private repository, provision the lead's repo-token securely before restarting: boot needs repository read access.
 
 Next, Codex starts its device login. Open its displayed URL and enter the code in the browser using your own ChatGPT account. Codex credentials remain in that user's HOME. See the [official Codex device-login documentation](https://learn.chatgpt.com/docs/auth#login-on-headless-devices).
 
@@ -60,7 +66,7 @@ Invites use 32 random bytes. The browser exchanges the secret from the URL fragm
 
 Required: `PORT=3000`, `PUBLIC_URL`, `GITHUB_REPO=MszBednarski/code_butler`, `APP_URL`, `SESSION_SECRET` (generated once, retained across redeploys), and `IS_SANDBOX=1`.
 
-Also configured: `REQUIRE_PERSISTENT_VOLUME=1`, `BUTLER_TEAM_LEAD=msz`, `OWNER_LOGIN=MszBednarski`, and `AGENT_CMD=/usr/local/bin/run-agent codex`. GitHub CLI configuration uses `/data/github`. No GitHub OAuth app is needed. Do not commit secrets or invite links.
+Also configured: `REQUIRE_PERSISTENT_VOLUME=1`, `BUTLER_TEAM_LEAD=msz`, `OWNER_LOGIN=MszBednarski`, and `AGENT_CMD=/usr/local/bin/run-agent codex`. GitHub CLI configuration uses each workspace’s `~/.config/gh`. No GitHub OAuth app is needed. Do not commit secrets or invite links.
 
 All three agents remain installed. Alternate launchers are `/usr/local/bin/run-agent claude` and `/usr/local/bin/run-agent gemini`. Docker build checks their required flags against actual `--help` output.
 
@@ -82,4 +88,4 @@ See [acceptance results](ACCEPTANCE.md).
 
 ## Known limits
 
-Everyone shares a root container and can potentially read each other's files and account credentials. Use it only for a trusted team. Infrastructure changes restart the host. PRs appear under the shared GitHub account, with branch prefixes and commit authors identifying the requesting teammate. A reconciler is outside this setup.
+Everyone shares a root container and can potentially read each other's files and account credentials. Use it only for a trusted team. Infrastructure changes restart the host. PRs appear under each workspace token’s GitHub account, with branch prefixes and commit authors identifying the requesting teammate. A reconciler is outside this setup.

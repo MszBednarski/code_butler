@@ -6,7 +6,7 @@
 4. Type or dictate what you want changed into the Send box. Your agent makes the change, pushes a branch, and opens a pull request.
 5. Live app: **https://web-production-0846c.up.railway.app**. Railway previews and automatic main deployments require the repository connection described in the deployment guide.
 
-The team lead connects the shared GitHub account once from their terminal before the first Codex login. Teammates use their own Codex subscription; GitHub pushes and PRs use the shared team account.
+Each workspace first asks for its own fine-grained GitHub PAT in a hidden terminal prompt. Select only this repository and grant Contents, Pull requests, and Issues read/write, with no account permissions. Never paste the token into chat. See the deployment guide for setup and migration.
 
 Tips
 - **Esc** interrupts your agent. **Ctrl-C** stops a stuck command. Use **Enter** for terminal login prompts.

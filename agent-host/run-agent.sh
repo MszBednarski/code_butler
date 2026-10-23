@@ -5,15 +5,24 @@ umask 077
 # Also support relaunching this script directly from an existing shell.
 mkdir -p -- "$HOME" "${CODEX_HOME:-$HOME/.codex}" || exit 1
 
-# One shared GitHub authorization for repository pushes and PRs. Each person's
-# Codex account remains separate under their own HOME/CODEX_HOME.
-if ! gh auth status --hostname github.com >/dev/null 2>&1; then
-  if [ "${BUTLER_USER:-}" = "${BUTLER_TEAM_LEAD:-msz}" ]; then
-    printf '\nConnect the team GitHub account once. Open the link and enter the code in your browser.\n'
-    GH_BROWSER=echo gh auth login --hostname github.com --git-protocol https --web --insecure-storage || exit 1
-  else
-    printf '\nThe team lead still needs to connect GitHub before agents can push and open PRs.\n'
-  fi
+# Never inherit a shared or deployment-wide GitHub credential.
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+export GH_CONFIG_DIR="$HOME/.config/gh"
+mkdir -p "$GH_CONFIG_DIR" || exit 1
+pat_file="$GH_CONFIG_DIR/repo-token"
+if [ ! -s "$pat_file" ] || [ "${1:-}" = "github-token" ]; then
+  printf '\nCreate a fine-grained GitHub PAT for %s only.\n' "$GITHUB_REPO"
+  printf 'Grant Contents, Pull requests, and Issues read/write; no account permissions.\n'
+  printf 'Paste the token here (hidden, never in chat): '
+  IFS= read -r -s pat || exit 1
+  printf '\n'
+  printf '%s' "$pat" | node /srv/gateway/github-token.js || { unset pat; exit 1; }
+  unset pat
+fi
+export GH_TOKEN="$(cat "$pat_file")"
+if [ "${1:-}" = "github-token" ]; then
+  printf 'Repository token updated. Restart your agent to use it.\n'
+  exit 0
 fi
 
 case "${1:-codex}" in
