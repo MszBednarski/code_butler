@@ -12,7 +12,7 @@ This deployment uses private invite links, as requested for the simplest team se
 
 `butler-agents` contains one always-on root container, `agent-host`, with one persistent volume at `/data`. PR environments are off. Each teammate has a separate HOME, git worktree, tmux session, ttyd UNIX socket, and Codex subscription login.
 
-`butler-app` contains only `web`. PR environments are on. A GitHub repository connection is required for previews and automatic main deployments; CLI uploads can deploy the initial app before that connection is installed.
+`butler-app` contains only `web`. PR environments are on. Both services are connected to the GitHub repository on main. Initial deployments were uploaded through the CLI. End-to-end PR previews and main autodeploys remain to be verified after the shared GitHub account is authorized.
 
 Service settings are `/agent-host` and `/app` root directories respectively. Watch patterns are `/agent-host/**` and `/app/**`. The checked-in railway.json files match Railway's schema. The Railway API currently rejects setting legacy config-file paths, so equivalent settings are applied directly to the services instead.
 
@@ -66,7 +66,7 @@ All three agents remain installed. Alternate launchers are `/usr/local/bin/run-a
 
 ## GitHub autodeploy connection
 
-In each Railway project, open the service → Settings → Source → Connect Repo. Authorize/install the Railway GitHub app for `MszBednarski/code_butler` if it is not visible, then select that repo and `main`. Preserve the configured root directory and watch paths. Only the app project has PR environments on; its Railway domain supplies preview domains. The token owner must be a project member for automatic PR deployments.
+The repo source and main branch are configured on both services, with PR environments enabled only in butler-app. If GitHub integration needs authorization, open the service → Settings → Source → Connect Repo. Authorize/install the Railway GitHub app for `MszBednarski/code_butler` if it is not visible, then select that repo and `main`. Preserve the configured root directory and watch paths. Only the app project has PR environments on; its Railway domain supplies preview domains. The token owner must be a project member for automatic PR deployments.
 
 ## Verification
 
