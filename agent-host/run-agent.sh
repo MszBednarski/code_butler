@@ -5,16 +5,25 @@ umask 077
 # Also support relaunching this script directly from an existing shell.
 mkdir -p -- "$HOME" "${CODEX_HOME:-$HOME/.codex}" || exit 1
 
-# One shared GitHub authorization for repository pushes and PRs. Each person's
-# Codex account remains separate under their own HOME/CODEX_HOME.
+# Personal agents must never inherit the host's service credentials.
+export GH_CONFIG_DIR="$HOME/.config/gh"
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+mkdir -p -- "$GH_CONFIG_DIR" || exit 1
 if ! gh auth status --hostname github.com >/dev/null 2>&1; then
-  if [ "${BUTLER_USER:-}" = "${BUTLER_TEAM_LEAD:-msz}" ]; then
-    printf '\nConnect the team GitHub account once. Open the link and enter the code in your browser.\n'
-    GH_BROWSER=echo gh auth login --hostname github.com --git-protocol https --web --insecure-storage || exit 1
-  else
-    printf '\nThe team lead still needs to connect GitHub before agents can push and open PRs.\n'
-  fi
+  printf '\nConnect your own GitHub account. Open the link and enter the code in your browser.\n'
+  GH_BROWSER=echo gh auth login --hostname github.com --git-protocol https --web --insecure-storage || exit 1
 fi
+# Attribute commits to the account used for issues, pushes, and PRs.
+identity=$(gh api user --jq '[.login, (.id | tostring)] | @tsv') || exit 1
+IFS=$'\t' read -r github_login github_id <<< "$identity"
+if [ -z "$github_login" ] || [ -z "$github_id" ]; then
+  printf 'Could not determine your GitHub identity. Please sign in again.\n' >&2
+  exit 1
+fi
+export GIT_AUTHOR_NAME="$github_login" GIT_COMMITTER_NAME="$github_login"
+export GIT_AUTHOR_EMAIL="${github_id}+${github_login}@users.noreply.github.com"
+export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+printf '\nGitHub: signed in as %s.\n' "$github_login"
 
 case "${1:-codex}" in
   claude)
