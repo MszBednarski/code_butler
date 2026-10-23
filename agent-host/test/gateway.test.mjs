@@ -9,22 +9,27 @@ import { validateEnv, sign, verify, createGateway } from '../gateway/server.js';
 
 const environment = {
   PORT: '3000', PUBLIC_URL: 'https://agents.example.com', APP_URL: 'https://app.example.com',
-  GITHUB_REPO: 'team/butler', GH_TOKEN: 'test-only', GITHUB_OAUTH_CLIENT_ID: 'client',
-  GITHUB_OAUTH_CLIENT_SECRET: 'test-only', SESSION_SECRET: 'a'.repeat(64),
-  TEAM: 'AliceGH:alice,BobGH:bob', IS_SANDBOX: '1'
+  GITHUB_REPO: 'team/butler', SESSION_SECRET: 'a'.repeat(64), IS_SANDBOX: '1'
 };
 const config = validateEnv(environment);
 const future = () => Math.floor(Date.now() / 1000) + 600;
 const cookie = (login = 'AliceGH', name = 'alice', exp = future()) =>
-  `butler_session=${sign({ login, name, exp }, config.SESSION_SECRET)}`;
+  `butler_session=${sign({ login, name, exp, version: members[name]?.version }, config.SESSION_SECRET)}`;
 let dir, gateway, base;
 const servers = [];
 const sockets = new Set();
-let githubLogin = 'AliceGH';
-let githubCalls = 0;
+const members = {};
+const tokens = {};
 
 before(async () => {
   dir = await mkdtemp(`${tmpdir()}/butler-test-`);
+  const { createInviteStore } = await import('../gateway/invites.js');
+  config.members = createInviteStore(`${dir}/invites.json`);
+  for (const [name, login] of [['alice', 'AliceGH'], ['bob', 'BobGH']]) {
+    const result = await config.members.add(name, login);
+    members[name] = result.member;
+    tokens[name] = result.token;
+  }
   for (const name of ['alice', 'bob']) {
     const server = createServer((req, res) => res.end(`${name}:${req.url}`));
     server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
@@ -36,19 +41,10 @@ before(async () => {
     servers.push(server);
   }
   const users = { ensureUser: async (name, login) => {
-    assert.equal(config.team.get(login.toLowerCase()), name);
+    assert.equal(members[name].login, login);
     return `${dir}/${name}.sock`;
   }, stop() {} };
-  gateway = createGateway(config, { users, githubFetch: async (url, options) => {
-    githubCalls++;
-    if (url.endsWith('access_token')) {
-      assert.equal(options.method, 'POST');
-      assert.equal(JSON.parse(options.body).redirect_uri, `${config.PUBLIC_URL}/auth/callback`);
-      return Response.json({ access_token: 'not-stored' });
-    }
-    assert.equal(options.headers.Authorization, 'Bearer not-stored');
-    return Response.json({ login: githubLogin });
-  } });
+  gateway = createGateway(config, { users });
   gateway.server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
   await new Promise(resolve => gateway.server.listen(0, '127.0.0.1', resolve));
   base = `http://127.0.0.1:${gateway.server.address().port}`;
@@ -61,18 +57,15 @@ after(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-test('startup rejects missing, invalid or duplicate team settings', () => {
+test('startup validates settings without requiring a PAT or OAuth app', () => {
   for (const key of Object.keys(environment)) {
     const invalid = { ...environment }; delete invalid[key];
     assert.throws(() => validateEnv(invalid), new RegExp(key));
   }
-  for (const TEAM of ['alice:../bob', 'alice:UPPER', `alice:${'a'.repeat(21)}`, 'alice:a,ALICE:b', 'alice:a,bob:a', '']) {
-    assert.throws(() => validateEnv({ ...environment, TEAM }));
-  }
   assert.throws(() => validateEnv({ ...environment, PUBLIC_URL: 'https://host.example/' }));
   assert.throws(() => validateEnv({ ...environment, SESSION_SECRET: 'short' }));
   assert.throws(() => validateEnv({ ...environment, PORT: '0' }));
-  assert.equal(config.team.get('alicegh'), 'alice');
+  assert.equal(config.AGENT_CMD, '/usr/local/bin/run-agent codex');
 });
 
 test('session signatures and expiration reject changes', () => {
@@ -95,42 +88,38 @@ test('health is public; terminal HTTP and API require a valid current member', a
   }
 });
 
-test('OAuth requests no scopes; state is expiring and required', async () => {
-  const response = await fetch(`${base}/auth/github`, { redirect: 'manual' });
-  const url = new URL(response.headers.get('location'));
-  assert.equal(url.origin, 'https://github.com');
-  assert.equal(url.searchParams.get('scope'), null);
-  assert.equal(url.searchParams.get('redirect_uri'), `${config.PUBLIC_URL}/auth/callback`);
-  const stateCookie = response.headers.get('set-cookie');
-  for (const flag of ['HttpOnly', 'Secure', 'SameSite=Lax', 'Path=/', 'Max-Age=600']) assert.ok(stateCookie.includes(flag));
-  assert.equal((await fetch(`${base}/auth/callback?state=wrong&code=x`, { headers: { cookie: stateCookie.split(';')[0] } })).status, 400);
-  assert.equal((await fetch(`${base}/auth/callback?state=${url.searchParams.get('state')}&code=x`)).status, 400);
-  assert.equal(githubCalls, 0);
+test('invite secrets authenticate only their owner and set a secure session cookie', async () => {
+  for (const token of ['', 'wrong', 'a'.repeat(43)]) {
+    const response = await fetch(`${base}/auth/invite`, { method: 'POST', headers: {
+      origin: config.PUBLIC_URL, 'Content-Type': 'application/json'
+    }, body: JSON.stringify({ token }) });
+    assert.equal(response.status, 403);
+    assert.equal(response.headers.get('set-cookie'), null);
+  }
+  const response = await fetch(`${base}/auth/invite`, { method: 'POST', headers: {
+    origin: config.PUBLIC_URL, 'Content-Type': 'application/json'
+  }, body: JSON.stringify({ token: tokens.alice, name: 'bob' }) });
+  assert.equal(response.status, 200);
+  const sessionCookie = response.headers.get('set-cookie');
+  for (const flag of ['HttpOnly', 'Secure', 'SameSite=Lax', 'Path=/', 'Max-Age=604800']) assert.ok(sessionCookie.includes(flag));
+  const me = await (await fetch(`${base}/api/me`, { headers: { cookie: sessionCookie.split(';')[0] } })).json();
+  assert.deepEqual(me, { name: 'alice', login: 'AliceGH', appUrl: config.APP_URL, repo: config.GITHUB_REPO });
+  const { readFile } = await import('node:fs/promises');
+  assert.ok(!(await readFile(`${dir}/invites.json`, 'utf8')).includes(tokens.alice));
 });
 
-async function oauth(login) {
-  githubLogin = login;
-  const start = await fetch(`${base}/auth/github`, { redirect: 'manual' });
-  const state = new URL(start.headers.get('location')).searchParams.get('state');
-  return fetch(`${base}/auth/callback?state=${state}&code=code`, {
-    headers: { cookie: start.headers.get('set-cookie').split(';')[0] }, redirect: 'manual'
-  });
-}
-
-test('OAuth denies an outsider and issues a secure cookie to a case-insensitive member', async () => {
-  const outsider = await oauth('Outsider');
-  assert.equal(outsider.status, 403);
-  assert.match(await outsider.text(), /Ask the team lead to add <strong>Outsider/);
-  assert.ok(!outsider.headers.get('set-cookie').includes('butler_session'));
-  const member = await oauth('ALICEGH');
-  assert.equal(member.status, 302);
-  assert.equal(member.headers.get('location'), '/');
-  const allCookies = member.headers.getSetCookie();
-  const sessionCookie = allCookies.find(value => value.startsWith('butler_session='));
-  for (const flag of ['HttpOnly', 'Secure', 'SameSite=Lax', 'Path=/', 'Max-Age=604800']) assert.ok(sessionCookie.includes(flag));
-  const data = await (await fetch(`${base}/api/me`, { headers: { cookie: sessionCookie.split(';')[0] } })).json();
-  assert.deepEqual(data, { name: 'alice', login: 'ALICEGH', appUrl: config.APP_URL, repo: config.GITHUB_REPO });
-  assert.ok(!JSON.stringify(data).includes('not-stored'));
+test('invalid names are rejected and rotating an invite invalidates existing sessions immediately', async () => {
+  for (const name of ['../alice', 'UPPER', 'a'.repeat(21), '']) await assert.rejects(config.members.add(name));
+  const { member, token } = await config.members.add('rotate', 'RotateGH');
+  const oldCookie = `butler_session=${sign({ login: member.login, name: member.name, version: member.version, exp: future() }, config.SESSION_SECRET)}`;
+  assert.equal((await fetch(`${base}/api/me`, { headers: { cookie: oldCookie } })).status, 200);
+  await config.members.add('rotate', 'RotateGH');
+  assert.equal((await fetch(`${base}/api/me`, { headers: { cookie: oldCookie } })).status, 401);
+  assert.equal(await config.members.findToken(token), null);
+  const newer = await config.members.get('rotate');
+  const newCookie = `butler_session=${sign({ login: newer.login, name: newer.name, version: newer.version, exp: future() }, config.SESSION_SECRET)}`;
+  await config.members.revoke('rotate');
+  assert.equal((await fetch(`${base}/api/me`, { headers: { cookie: newCookie } })).status, 401);
 });
 
 test('terminal paths and query parameters never select another user; proxy preserves /term', async () => {
@@ -141,7 +130,7 @@ test('terminal paths and query parameters never select another user; proxy prese
 });
 
 test('all non-GET requests need our Origin; input and keys are validated', async () => {
-  for (const route of ['/api/send', '/api/key', '/logout']) {
+  for (const route of ['/auth/invite', '/api/send', '/api/key', '/logout']) {
     for (const origin of ['', 'https://evil.example']) {
       assert.equal((await fetch(base + route, { method: 'POST', headers: { cookie: cookie(), origin } })).status, 403);
     }

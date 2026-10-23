@@ -1,129 +1,85 @@
-# Deploy Pocket Butler
+# Pocket Butler deployment
 
-Use two Railway projects. PR environments must be enabled only on `butler-app`; copying `butler-agents` would copy the shared agent service.
+This deployment uses private invite links, as requested for the simplest team setup. A teammate does not need a GitHub OAuth app or a personal access token. They authorize their own Codex subscription using its device-code flow.
 
-Repository: https://github.com/MszBednarski/code_butler
+- Repository: https://github.com/MszBednarski/code_butler
+- Agent project: https://railway.com/project/a2204e4a-b82d-4c9e-8f42-552d96295ed1
+- Agent URL: https://agent-host-production-1fb3.up.railway.app
+- App project: https://railway.com/project/7b8fbb73-f78f-437f-aa06-cb562c092e11
+- App URL: https://web-production-0846c.up.railway.app
 
-## 1. Push the repository
+## Architecture
 
-Push the initial setup to `main`. The repository already exists. This setup is the one occasion when the infrastructure agent commits directly to `main`.
+`butler-agents` contains one always-on root container, `agent-host`, with one persistent volume at `/data`. PR environments are off. Each teammate has a separate HOME, git worktree, tmux session, ttyd UNIX socket, and Codex subscription login.
 
-## 2. Create the shared GitHub token
+`butler-app` contains only `web`. PR environments are on. A GitHub repository connection is required for previews and automatic main deployments; CLI uploads can deploy the initial app before that connection is installed.
 
-GitHub → avatar → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
+Service settings are `/agent-host` and `/app` root directories respectively. Watch patterns are `/agent-host/**` and `/app/**`. The checked-in railway.json files match Railway's schema. The Railway API currently rejects setting legacy config-file paths, so equivalent settings are applied directly to the services instead.
 
-- Resource owner: the repository owner.
-- Repository access: Only select repositories → `code_butler`.
-- Repository permissions: Contents **Read and write**, Pull requests **Read and write**, Issues **Read-only**. Metadata read access is automatic.
+## Persistent state and restarts
 
-Keep the token for step 6. Do not put it in the repository or chat. This token is used by every agent for HTTPS git and `gh`, independently of the SSH key used to push this initial setup.
+The host refuses to start in Railway without an actual mount at `/data`. The checked-in deployment config also declares `requiredMountPath: /data`.
 
-## 3. Create the agent project
+- `/data/repo`: shared git repository and worktree metadata.
+- `/data/wt/<name>`: each person's branch, tracked and uncommitted work.
+- `/data/home/<name>/.codex`: each person's Codex login and conversations.
+- `/data/home/<name>/.butler-task.md`: the agent's current goal, branch, PR, and next step.
+- `/data/home/<name>/.butler-session`: marks a session to recreate automatically at boot.
+- `/data/github`: the shared GitHub CLI login for pushes and PRs.
+- `/data/invites.json`: hashed invite secrets and member identities.
+- `/data/invite-links.json`: private links for the team lead to distribute.
 
-Railway → New Project → Deploy from GitHub repo → `MszBednarski/code_butler`. Name the project `butler-agents` and the service `agent-host`.
+A restart terminates running processes. Boot recreates previously active tmux sessions and launches `codex resume --last`; it never resets a worktree. Interrupted tools may need another request to continue. The volume must be retained across deployments; deleting the volume deletes its data.
 
-Service → Settings:
+## First login
 
-- Source → Root Directory: `/agent-host`.
-- Railway Config File: `/agent-host/railway.json` (the absolute path is required).
-- Attach a volume mounted at `/data`, approximately 10 GB.
-- Networking → Public Networking → Generate Domain. Save its HTTPS origin as `AGENTS_URL`.
-- Serverless/sleeping: **off**. The config also sets `sleepApplication: false` and one replica.
-- Project → Settings → Environments: leave PR environments **off**.
+Read `/data/invite-links.json` privately through Railway SSH. Open the `msz` link. The terminal first runs GitHub's device login: open the displayed GitHub URL, enter the code, and authorize as **MszBednarski**. This saves one shared GitHub login for repository pushes and PR creation. An optional `GH_TOKEN` can override this if preferred.
 
-The service will not start successfully until step 6 supplies its required variables. This is expected. The container runs as root with `IS_SANDBOX=1` and creates sessions only when teammates visit.
+Next, Codex starts its device login. Open its displayed URL and enter the code in the browser using your own ChatGPT account. Codex credentials remain in that user's HOME. See the [official Codex device-login documentation](https://learn.chatgpt.com/docs/auth#login-on-headless-devices).
 
-CLI equivalents when linked to this project:
+## Invites
 
-```sh
-railway add --service agent-host --repo MszBednarski/code_butler
-railway environment edit --service-config agent-host source.rootDirectory /agent-host
-railway environment edit --service-config agent-host configFile /agent-host/railway.json
-railway volume --service agent-host add --mount-path /data
-railway domain --service agent-host --port 3000
-```
+The first boot prepares `msz` plus `teammate1` through `teammate4`. The generic slots work immediately; creating a named invite with a real GitHub login gives clearer commit attribution. Bootstrap runs only once and never recreates a revoked invite.
 
-Check `railway environment config --json` after configuring; if the CLI cannot set a setting, use the dashboard values above. Set `PORT=3000` when generating a domain targeting port 3000.
-
-## 4. Create the GitHub OAuth app
-
-GitHub → avatar → Settings → Developer settings → OAuth Apps → New OAuth App.
-
-- Application name: Pocket Butler.
-- Homepage URL: `AGENTS_URL`.
-- Authorization callback URL: `AGENTS_URL/auth/callback`.
-- Device Flow is not needed for this GitHub OAuth app.
-
-Copy the client ID and generate a client secret. Keep them for step 6. The gateway requests no GitHub scopes, reads the user's login, then discards the OAuth access token.
-
-## 5. Create the app project
-
-Railway → New Project → Deploy from GitHub repo → the same repo. Name the project `butler-app` and its only service `web`.
-
-- Service → Settings → Root Directory: `/app`.
-- Railway Config File: `/app/railway.json`.
-- Source branch: `main`, with automatic deploys enabled.
-- Networking → Generate Domain. Save its HTTPS URL as `APP_URL`.
-- Project → Settings → Environments → Enable PR Environments.
-- Also enable Bot PR Environments if the shared token belongs to a bot account.
-
-A Railway domain on the production service is needed for PR environments to receive public URLs. The Railway GitHub integration must be installed for this repo and allowed to post preview comments. Do not create an agent-host service in this project.
-
-## 6. Configure the agent service
-
-Set these under `butler-agents` → `agent-host` → Variables → Raw Editor. Replace the examples and collect everyone's login before the first deployment:
-
-```dotenv
-PORT=3000
-PUBLIC_URL=https://AGENT-DOMAIN.up.railway.app
-GITHUB_REPO=MszBednarski/code_butler
-GH_TOKEN=YOUR_FINE_GRAINED_TOKEN
-GITHUB_OAUTH_CLIENT_ID=YOUR_CLIENT_ID
-GITHUB_OAUTH_CLIENT_SECRET=YOUR_CLIENT_SECRET
-SESSION_SECRET=GENERATE_A_RANDOM_SECRET
-TEAM=GitHubLogin:short-name,OtherGitHubLogin:other-name
-AGENT_CMD=/usr/local/bin/run-agent codex
-APP_URL=https://APP-DOMAIN.up.railway.app
-IS_SANDBOX=1
-```
-
-Generate the session secret with `openssl rand -hex 32` or `node -p 'require("crypto").randomBytes(32).toString("hex")'`. Keep it unchanged on redeploys so cookies remain valid. `PUBLIC_URL` must have no trailing slash. Duplicate logins or short names are rejected, as are invalid names and missing variables.
-
-Use `railway variable set --service agent-host --stdin KEY` for a secret from stdin; use `railway variable --set 'KEY=value' --skip-deploys` for ordinary values. Apply the variables and redeploy once after all are set.
-
-All three agents are installed. Switch `AGENT_CMD` to `/usr/local/bin/run-agent claude` or `/usr/local/bin/run-agent gemini` to change agents. A custom trusted shell command is also accepted. The image runs each agent's `--help` and fails the build if required flags disappear. The pinned ttyd release is 1.7.7.
-
-Codex's launcher runs `codex login --device-auth` only if not already signed in. The user opens the displayed link and enters the device code in their browser. They may need to enable device code login in ChatGPT security settings. Credentials live under `/data/home/<name>/.codex`; the launcher resumes the last conversation. See the [official authentication documentation](https://learn.chatgpt.com/docs/auth#login-on-headless-devices).
-
-## 7. Fill in teammate links
-
-Replace `<AGENTS_URL>` and `<APP_URL>` in `docs/ONBOARDING.md` with the actual URLs, commit and push `main` once more. Docs-only commits do not redeploy either service because the watch paths are `/app/**` and `/agent-host/**`.
-
-## 8. Verify
-
-Run [the acceptance checks](ACCEPTANCE.md). Optionally add a GitHub ruleset: repository → Settings → Rules → Rulesets → New branch ruleset → target `main` → Require a pull request before merging.
-
-Local verification:
+Using Railway SSH in `agent-host`:
 
 ```sh
-cd app
-npm ci
-npm run typecheck
-npm run build
-cd ../agent-host/gateway
-npm ci
-npm test
-cd ..
-docker build -t pocket-butler-agents .
+# List member names; this does not print secrets.
+node /srv/gateway/invites.js list
+
+# Create or rotate an invite and print its private link.
+node /srv/gateway/invites.js add alice AliceGitHubLogin
+
+# Revoke access, including existing HTTP sessions and future WebSocket connections.
+node /srv/gateway/invites.js revoke alice
 ```
 
-The app is served using `serve`, which accepts Railway's Host headers. App HTML is never cached by the service worker, so refreshing after a merge gets the latest deployment.
+Invites use 32 random bytes. The browser exchanges the secret from the URL fragment for a seven-day HttpOnly Secure SameSite cookie and removes the fragment from its address. Secrets are not sent as URL paths or query strings. Adding or revoking an invite does not redeploy the container.
+
+## Variables
+
+Required: `PORT=3000`, `PUBLIC_URL`, `GITHUB_REPO=MszBednarski/code_butler`, `APP_URL`, `SESSION_SECRET` (generated once, retained across redeploys), and `IS_SANDBOX=1`.
+
+Also configured: `REQUIRE_PERSISTENT_VOLUME=1`, `BUTLER_TEAM_LEAD=msz`, `OWNER_LOGIN=MszBednarski`, and `AGENT_CMD=/usr/local/bin/run-agent codex`. GitHub CLI configuration uses `/data/github`. No GitHub OAuth app is needed. Do not commit secrets or invite links.
+
+All three agents remain installed. Alternate launchers are `/usr/local/bin/run-agent claude` and `/usr/local/bin/run-agent gemini`. Docker build checks their required flags against actual `--help` output.
+
+## GitHub autodeploy connection
+
+In each Railway project, open the service → Settings → Source → Connect Repo. Authorize/install the Railway GitHub app for `MszBednarski/code_butler` if it is not visible, then select that repo and `main`. Preserve the configured root directory and watch paths. Only the app project has PR environments on; its Railway domain supplies preview domains. The token owner must be a project member for automatic PR deployments.
+
+## Verification
+
+```sh
+cd app && npm ci && npm run typecheck && npm run build
+cd ../agent-host/gateway && npm ci && npm test
+cd .. && docker build -t pocket-butler-agents .
+```
+
+`test/runtime-check.mjs` is intended only for a disposable built-image container with `BUTLER_RUNTIME_TEST=1` and a named volume at `/data`. Run it in one container, remove that container, then run it in a fresh container on the same volume to check restoration. It uses a mock agent and simulated login/conversation files; actual subscription login is a live human check.
+
+See [acceptance results](ACCEPTANCE.md).
 
 ## Known limits
 
-- Everyone shares one root container. One person's agent can read another's files and logins. Use this only with a trusted hackathon team.
-- Editing `TEAM` redeploys and restarts every agent. Work on disk survives. Collect everyone's username before the first deployment.
-- Merges touching `agent-host/` redeploy the host, so avoid them during the event.
-- PRs appear under the token owner's account. The branch prefix and commit author identify the teammate.
-
-The reconciler that reviews and merges PRs is outside this setup. OAuth account login and phone dictation must be checked by a human using their own browser.
+Everyone shares a root container and can potentially read each other's files and account credentials. Use it only for a trusted team. Infrastructure changes restart the host. PRs appear under the shared GitHub account, with branch prefixes and commit authors identifying the requesting teammate. A reconciler is outside this setup.

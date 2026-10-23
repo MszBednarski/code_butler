@@ -1,6 +1,6 @@
 # Pocket Butler
 
-A mobile app and a private GitHub sign-in gateway to persistent, personal coding agents. The app and agent host run in separate Railway projects so app previews never copy the shared agent host.
+A mobile app and a private invite-link gateway to persistent, personal coding agents. The app and agent host run in separate Railway projects so app previews never copy the shared agent host.
 
 - [Join the team](docs/ONBOARDING.md)
 - [Deploy and operate](docs/DEPLOY.md)

@@ -1,23 +1,23 @@
 import express from 'express';
 import httpProxy from 'http-proxy';
 import { createServer } from 'node:http';
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
-import { mkdir, access, unlink } from 'node:fs/promises';
+import { mkdir, access, unlink, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
+import { createInviteStore, validName } from './invites.js';
 
 const exec = promisify(execFile);
 const publicDir = fileURLToPath(new URL('./public/', import.meta.url));
 const WEEK = 604800;
 const KEYS = new Set(['Enter', 'Escape', 'C-c', 'Up', 'Down', 'Tab', 'BTab']);
-const DEFAULT_AGENT = 'claude --dangerously-skip-permissions --continue || claude --dangerously-skip-permissions';
+const DEFAULT_AGENT = '/usr/local/bin/run-agent codex';
 
 export function validateEnv(env = process.env) {
-  for (const key of ['PORT', 'PUBLIC_URL', 'GITHUB_REPO', 'GH_TOKEN', 'GITHUB_OAUTH_CLIENT_ID',
-    'GITHUB_OAUTH_CLIENT_SECRET', 'SESSION_SECRET', 'TEAM', 'APP_URL', 'IS_SANDBOX']) {
+  for (const key of ['PORT', 'PUBLIC_URL', 'GITHUB_REPO', 'SESSION_SECRET', 'APP_URL', 'IS_SANDBOX']) {
     if (!env[key]?.trim()) throw new Error(`Missing required environment variable: ${key}`);
   }
   if (!/^\d+$/.test(env.PORT) || +env.PORT < 1 || +env.PORT > 65535) throw new Error('PORT must be 1–65535');
@@ -32,21 +32,8 @@ export function validateEnv(env = process.env) {
   if (!/^[a-z\d][a-z\d-]{0,38}\/[a-z\d_.-]+$/i.test(env.GITHUB_REPO)) throw new Error('GITHUB_REPO must be owner/repo');
   if (Buffer.byteLength(env.SESSION_SECRET) < 32) throw new Error('SESSION_SECRET must contain at least 32 random bytes');
   if (env.IS_SANDBOX !== '1') throw new Error('IS_SANDBOX must be 1');
-  const team = new Map();
-  const names = new Set();
-  for (const entry of env.TEAM.split(',')) {
-    const fields = entry.trim().split(':');
-    const [login, name] = fields;
-    if (fields.length !== 2 || !/^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i.test(login || '')) {
-      throw new Error(`Invalid TEAM entry: ${entry}; expected GitHub-login:short-name`);
-    }
-    if (!/^[a-z0-9-]{1,20}$/.test(name || '')) throw new Error(`Invalid TEAM short name: ${name}; use [a-z0-9-], 1–20 characters`);
-    if (team.has(login.toLowerCase()) || names.has(name)) throw new Error(`Duplicate TEAM login or short name: ${entry}`);
-    team.set(login.toLowerCase(), name);
-    names.add(name);
-  }
   if (env.AGENT_CMD !== undefined && !env.AGENT_CMD.trim()) throw new Error('AGENT_CMD must not be empty');
-  return { ...env, PORT: +env.PORT, AGENT_CMD: env.AGENT_CMD || DEFAULT_AGENT, team };
+  return { ...env, PORT: +env.PORT, AGENT_CMD: env.AGENT_CMD || DEFAULT_AGENT, members: createInviteStore(env.INVITES_FILE) };
 }
 
 export function sign(value, secret) {
@@ -81,18 +68,16 @@ function cookies(req) {
   return result;
 }
 
-export function session(req, config) {
+export async function session(req, config) {
   const data = verify(cookies(req).butler_session, config.SESSION_SECRET);
-  if (!data || typeof data.login !== 'string' || config.team.get(data.login.toLowerCase()) !== data.name) return null;
+  if (!data || !validName(data.name) || typeof data.login !== 'string') return null;
+  const member = await config.members.get(data.name);
+  if (!member || member.login !== data.login || member.version !== data.version) return null;
   return { name: data.name, login: data.login };
 }
 
 function setCookie(res, name, value, maxAge) {
   res.append('Set-Cookie', `${name}=${value}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`);
-}
-
-function escapeHtml(value) {
-  return value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 }
 
 async function exists(file) {
@@ -151,7 +136,7 @@ export function createUserManager(config) {
 
   async function provision(name, login) {
     // Callers derive both fields from a verified cookie; reject mismatches here too.
-    if (config.team.get(login.toLowerCase()) !== name) throw new Error('Unknown team member');
+    if (!validName(name) || (await config.members.get(name))?.login !== login) throw new Error('Unknown team member');
     const home = `/data/home/${name}`;
     const cwd = `/data/wt/${name}`;
     await mkdir(home, { recursive: true, mode: 0o700 });
@@ -173,11 +158,22 @@ export function createUserManager(config) {
       // Only trusted deployment configuration is shell code. Request text is always sent via stdin.
       args.push('bash', '-lc', `${config.AGENT_CMD}; exec bash -l`);
       await command('tmux', args);
+      await writeFile(`${home}/.butler-session`, 'active\n', { mode: 0o600 });
     }
     return startTerminal(name);
   }
 
   return {
+    async restore() {
+      let count = 0;
+      for (const member of await config.members.list()) {
+        if (await exists(`/data/home/${member.name}/.butler-session`)) {
+          try { await this.ensureUser(member.name, member.login); count++; }
+          catch (error) { console.error(`Could not restore ${member.name}: ${error.code || error.name}`); }
+        }
+      }
+      console.log(`Restored ${count} team agent sessions from persistent storage`);
+    },
     ensureUser(name, login) {
       if (stopping) return Promise.reject(new Error('Agent host is shutting down'));
       if (!pending.has(name)) {
@@ -201,7 +197,7 @@ function loadBuffer(text) {
   });
 }
 
-export function createGateway(config, { users = createUserManager(config), githubFetch = fetch } = {}) {
+export function createGateway(config, { users = createUserManager(config) } = {}) {
   const app = express();
   const proxy = httpProxy.createProxyServer({ ws: true });
   const server = createServer(app);
@@ -227,47 +223,25 @@ export function createGateway(config, { users = createUserManager(config), githu
   for (const icon of ['icon-192.png', 'icon-512.png']) {
     app.get(`/${icon}`, (req, res) => res.sendFile(path.join(publicDir, icon)));
   }
-  app.get('/auth/github', (req, res) => {
-    const nonce = randomBytes(32).toString('base64url');
-    setCookie(res, 'oauth_state', sign({ nonce, exp: Math.floor(Date.now() / 1000) + 600 }, config.SESSION_SECRET), 600);
-    const url = new URL('https://github.com/login/oauth/authorize');
-    url.search = new URLSearchParams({ client_id: config.GITHUB_OAUTH_CLIENT_ID, redirect_uri: `${config.PUBLIC_URL}/auth/callback`, state: nonce });
-    res.redirect(url.toString());
-  });
-  app.get('/auth/callback', async (req, res) => {
-    const state = verify(cookies(req).oauth_state, config.SESSION_SECRET);
-    setCookie(res, 'oauth_state', '', 0);
-    if (!state?.nonce || typeof req.query.state !== 'string' || !equal(state.nonce, req.query.state) || typeof req.query.code !== 'string') {
-      return res.status(400).send('Invalid or expired OAuth state. Please sign in again.');
+  app.post('/auth/invite', async (req, res) => {
+    const member = await config.members.findToken(req.body?.token);
+    if (!member) {
+      await delay(150);
+      return res.status(403).json({ error: 'Invalid invite. Ask the team lead for your private link.' });
     }
-    const tokenResponse = await githubFetch('https://github.com/login/oauth/access_token', {
-      method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ client_id: config.GITHUB_OAUTH_CLIENT_ID, client_secret: config.GITHUB_OAUTH_CLIENT_SECRET,
-        code: req.query.code, redirect_uri: `${config.PUBLIC_URL}/auth/callback` }), signal: AbortSignal.timeout(15000)
-    });
-    if (!tokenResponse.ok) return res.status(502).send('GitHub sign-in failed. Please try again.');
-    const token = await tokenResponse.json();
-    if (!token.access_token) return res.status(400).send('GitHub did not approve sign-in. Please try again.');
-    const userResponse = await githubFetch('https://api.github.com/user', { headers: {
-      Authorization: `Bearer ${token.access_token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'Pocket-Butler'
-    }, signal: AbortSignal.timeout(15000) });
-    if (!userResponse.ok) return res.status(502).send('Could not read your GitHub login. Please try again.');
-    const { login } = await userResponse.json();
-    if (typeof login !== 'string') return res.status(502).send('Invalid GitHub user response');
-    const name = config.team.get(login.toLowerCase());
-    if (!name) return res.status(403).type('html').send(`<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><title>Team access required</title><h1>Team access required</h1><p>Ask the team lead to add <strong>${escapeHtml(login)}</strong>.</p><a href="/login">Back to sign in</a>`);
-    setCookie(res, 'butler_session', sign({ login, name, exp: Math.floor(Date.now() / 1000) + WEEK }, config.SESSION_SECRET), WEEK);
-    res.redirect('/');
+    setCookie(res, 'butler_session', sign({ login: member.login, name: member.name, version: member.version,
+      exp: Math.floor(Date.now() / 1000) + WEEK }, config.SESSION_SECRET), WEEK);
+    res.json({ ok: true });
   });
   app.post('/logout', (req, res) => {
     setCookie(res, 'butler_session', '', 0);
     res.redirect('/login');
   });
-  app.use((req, res, next) => {
-    req.user = session(req, config);
+  app.use(async (req, res, next) => {
+    req.user = await session(req, config);
     if (req.user) return next();
     if (req.path.startsWith('/api/') || req.path === '/term' || req.path.startsWith('/term/')) {
-      return res.status(401).send('Sign in with GitHub first');
+      return res.status(401).send('Open your private team invite first');
     }
     return res.redirect('/login');
   });
@@ -320,7 +294,7 @@ export function createGateway(config, { users = createUserManager(config), githu
   server.on('upgrade', async (req, socket, head) => {
     // Verify independently: Express middleware never runs for WebSocket upgrades.
     try {
-      const user = session(req, config);
+      const user = await session(req, config);
       if (!user || req.headers.origin !== config.PUBLIC_URL || !req.url.split('?')[0].startsWith('/term/')) {
         return socket.destroy();
       }
@@ -341,6 +315,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     } else {
       const { server, users, proxy } = createGateway(config);
       server.listen(config.PORT, '0.0.0.0', () => console.log(`Pocket Butler gateway listening on port ${config.PORT}`));
+      users.restore().catch(error => console.error(`Session restoration failed: ${error.code || error.name}`));
       const shutdown = () => {
         users.stop();
         proxy.close();

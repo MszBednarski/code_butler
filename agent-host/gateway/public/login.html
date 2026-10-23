@@ -17,7 +17,11 @@
     .label { color: #90aa9a; font-size: 11px; letter-spacing: .15em; margin-top: 40px; }
     h1 { font-family: Georgia, serif; font-weight: 400; font-size: 48px; letter-spacing: -.04em; margin: 14px 0; }
     p { color: #a8bbab; line-height: 1.65; }
-    a { display: block; margin-top: 30px; padding: 16px 20px; border-radius: 12px; background: #c3e4b8; color: #122014; text-decoration: none; text-align: center; font-weight: 650; }
+    form { margin-top: 30px; }
+    input { width: 100%; font: inherit; font-size: 16px; padding: 15px; border: 1px solid #789180; border-radius: 12px; background: #15241f; color: #eef4e8; }
+    button { display: block; width: 100%; margin-top: 12px; padding: 16px 20px; border: 0; border-radius: 12px; background: #c3e4b8; color: #122014; font: inherit; font-weight: 650; cursor: pointer; }
+    button:disabled { opacity: .5; }
+    #error { color: #f0baa4; font-size: 14px; }
     small { display: block; color: #789180; font-size: 12px; margin-top: 18px; text-align: center; }
   </style>
 </head>
@@ -27,8 +31,38 @@
     <p class="label">POCKET BUTLER · TEAM WORKSPACE</p>
     <h1>Your ideas.<br>Your agent.</h1>
     <p>Pick up where you left off. Tell your coding agent what to build, from wherever you are.</p>
-    <a href="/auth/github">Sign in with GitHub</a>
-    <small>Access is reserved for the team.</small>
+    <form id="login">
+      <input id="token" type="password" placeholder="Your invite secret" aria-label="Your invite secret" autocomplete="off" spellcheck="false" required>
+      <button id="submit" type="submit">Open my workspace</button>
+      <p id="error" role="alert"></p>
+    </form>
+    <small>Open the private invite link from your team lead.</small>
   </main>
+  <script>
+    const form = document.getElementById('login');
+    const token = document.getElementById('token');
+    const button = document.getElementById('submit');
+    const error = document.getElementById('error');
+    async function login(event) {
+      event?.preventDefault();
+      button.disabled = true;
+      error.textContent = '';
+      try {
+        const response = await fetch('/auth/invite', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: token.value.trim() }) });
+        if (!response.ok) {
+          const result = await response.json().catch(() => ({}));
+          throw new Error(result.error || 'Could not sign in. Please try again.');
+        }
+        location.replace('/');
+      } catch (problem) { error.textContent = problem.message; button.disabled = false; }
+    }
+    form.addEventListener('submit', login);
+    const invite = new URLSearchParams(location.hash.slice(1)).get('invite');
+    if (invite) {
+      history.replaceState(null, '', '/login');
+      token.value = invite;
+      login();
+    }
+  </script>
 </body>
 </html>

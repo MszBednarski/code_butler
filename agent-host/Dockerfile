@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim
 
-ENV DEBIAN_FRONTEND=noninteractive IS_SANDBOX=1
+ENV DEBIAN_FRONTEND=noninteractive IS_SANDBOX=1 GH_CONFIG_DIR=/data/github GH_BROWSER=echo
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git tmux curl ca-certificates procps jq ripgrep less nano \
     && mkdir -p -m 755 /etc/apt/keyrings \

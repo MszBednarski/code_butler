@@ -1,14 +1,17 @@
 # Join the team (2 minutes)
 
-1. Send your GitHub username to the team lead. You need to be on the list.
-2. On your phone or laptop, open **<AGENTS_URL>** and sign in with GitHub. On a phone, add it to your home screen.
-3. First time only: your agent asks you to log in to its account. Open the link it shows, approve, then paste the code into the box at the bottom and hit Send.
-4. Type or dictate what you want changed in the app, then hit Send. Your agent makes the change, opens a pull request, and replies with a preview link.
-5. Live app: **<APP_URL>**. Once a PR is merged, the live app updates automatically within a couple of minutes.
+1. Ask the team lead for your private invite link. Each link opens one person's workspace; keep yours private.
+2. Open the link on your phone or laptop. On a phone, add it to your home screen. Your workspace URL is **https://agent-host-production-1fb3.up.railway.app**.
+3. First time only: Codex displays a login link and a device code. Open that link, sign in with your own ChatGPT account, and enter the device code **in the browser**. If asked, enable device code login in your ChatGPT security settings.
+4. Type or dictate what you want changed into the Send box. Your agent makes the change, pushes a branch, and opens a pull request.
+5. Live app: **https://web-production-0846c.up.railway.app**. Railway previews and automatic main deployments require the repository connection described in the deployment guide.
+
+The team lead connects the shared GitHub account once from their terminal before the first Codex login. Teammates use their own Codex subscription; GitHub pushes and PRs use the shared team account.
 
 Tips
-- **Esc** interrupts your agent. **Ctrl-C** stops a stuck command.
-- Your agent and your work survive restarts. If the screen looks frozen, reload the page.
-- You can open the same session on your phone and your laptop at the same time.
-
-For Codex, enter the displayed device code **in the browser**, rather than pasting it into Send. If asked, enable device code login in your ChatGPT security settings first. Your Codex login and conversation are kept in your personal persistent home directory. The host resumes your latest conversation after a restart.
+- **Esc** interrupts your agent. **Ctrl-C** stops a stuck command. Use **Enter** for terminal login prompts.
+- Use your phone keyboard's dictation button in the normal Send textarea.
+- Your worktree, branches, uncommitted files, Codex login, conversation history, and task note live on persistent storage.
+- After a host restart, previously active sessions are recreated and Codex resumes its latest conversation. A running tool or command stops during the restart; ask the agent to continue if needed.
+- You can open the same session on your phone and your laptop together.
+- If the screen freezes during a deployment, reload after the host is healthy again.

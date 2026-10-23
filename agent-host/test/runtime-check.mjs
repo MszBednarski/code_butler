@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import { access, mkdir, readFile, writeFile, unlink } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createGateway, validateEnv, sign } from '../gateway/server.js';
+import { createInviteStore } from '../gateway/invites.js';
 
 assert.equal(process.env.BUTLER_RUNTIME_TEST, '1', 'Use a disposable container with BUTLER_RUNTIME_TEST=1');
 const exec = promisify(execFile);
@@ -46,22 +47,32 @@ process.stdin.on('data', data => {
 `);
 const config = validateEnv({
   ...process.env, PORT: '3000', PUBLIC_URL: 'https://agents.example.com', APP_URL: 'https://app.example.com',
-  GITHUB_REPO: 'test/fixture', GH_TOKEN: 'test-only', GITHUB_OAUTH_CLIENT_ID: 'test-only',
-  GITHUB_OAUTH_CLIENT_SECRET: 'test-only', SESSION_SECRET: 'test-secret-'.repeat(6),
-  TEAM: 'AliceGH:alice,BobGH:bob', IS_SANDBOX: '1', AGENT_CMD: 'node /tmp/butler-input.mjs'
+  GITHUB_REPO: 'test/fixture', SESSION_SECRET: 'test-secret-'.repeat(6),
+  IS_SANDBOX: '1', AGENT_CMD: 'node /tmp/butler-input.mjs'
 });
+const members = {};
+for (const [name, login] of [['alice', 'AliceGH'], ['bob', 'BobGH']]) {
+  members[name] = await config.members.get(name) || (await config.members.add(name, login)).member;
+}
 const gateway = createGateway(config);
+for (const name of ['alice', 'bob']) {
+  await unlink(`/data/home/${name}/ready`).catch(() => {});
+  await unlink(`/data/home/${name}/received`).catch(() => {});
+}
+if (phase === 'restart') {
+  await gateway.users.restore();
+  for (const name of ['alice', 'bob']) await run('tmux', ['has-session', '-t', `=${name}`]);
+  console.log('PASS: previously active tmux sessions are restored before anyone opens the page');
+}
 await new Promise(resolve => gateway.server.listen(0, '127.0.0.1', resolve));
 const base = `http://127.0.0.1:${gateway.server.address().port}`;
 const headers = name => ({
   origin: config.PUBLIC_URL, 'Content-Type': 'application/json',
-  cookie: `butler_session=${sign({ login: name === 'alice' ? 'AliceGH' : 'BobGH', name,
+  cookie: `butler_session=${sign({ version: members[name].version, login: name === 'alice' ? 'AliceGH' : 'BobGH', name,
     exp: Math.floor(Date.now()/1000)+600 }, config.SESSION_SECRET)}`
 });
 try {
   await Promise.all(['alice', 'bob'].map(async name => {
-    await unlink(`/data/home/${name}/ready`).catch(() => {});
-    await unlink(`/data/home/${name}/received`).catch(() => {});
     const response = await fetch(base, { headers: headers(name) });
     assert.equal(response.status, 200);
     await until(() => readFile(`/data/home/${name}/ready`, 'utf8'));
@@ -87,10 +98,19 @@ try {
   if (phase === 'initial') {
     await writeFile('/data/wt/alice/uncommitted.txt', 'do not lose this\n');
     await writeFile('/data/home/alice/login-sentinel', 'persistent login fixture\n');
+    await run('git', ['-C', '/data/wt/alice', 'switch', '-c', 'alice/recovery-check']);
+    await mkdir('/data/home/alice/.codex/sessions', { recursive: true });
+    await writeFile('/data/home/alice/.codex/auth.json', '{"test":"simulated credentials"}\n');
+    await writeFile('/data/home/alice/.codex/sessions/fixture.jsonl', '{"test":"simulated conversation"}\n');
+    await writeFile('/data/home/alice/.butler-task.md', 'Keep the pending change on alice/recovery-check.\n');
   } else {
     assert.equal(await readFile('/data/wt/alice/uncommitted.txt', 'utf8'), 'do not lose this\n');
     assert.equal(await readFile('/data/home/alice/login-sentinel', 'utf8'), 'persistent login fixture\n');
-    console.log('PASS: dirty worktree and per-user credential storage survive a container restart');
+    assert.equal(await run('git', ['-C', '/data/wt/alice', 'branch', '--show-current']), 'alice/recovery-check');
+    assert.match(await readFile('/data/home/alice/.codex/auth.json', 'utf8'), /simulated credentials/);
+    assert.match(await readFile('/data/home/alice/.codex/sessions/fixture.jsonl', 'utf8'), /simulated conversation/);
+    assert.match(await readFile('/data/home/alice/.butler-task.md', 'utf8'), /alice\/recovery-check/);
+    console.log('PASS: dirty worktree, branch, credential storage, conversation storage, and task notes survive container replacement');
   }
   const ttydPid = (await run('pgrep', ['-f', '^ttyd -W -i /run/ttyd/alice.sock'])).split('\n')[0];
   process.kill(+ttydPid, 'SIGKILL');
