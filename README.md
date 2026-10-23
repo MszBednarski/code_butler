@@ -1,9 +1,12 @@
 # Pocket Butler
 
-A mobile app and a private invite-link gateway to persistent, personal coding agents. The app and agent host run in separate Railway projects so app previews never copy the shared agent host.
+Turn a group of people with phones into a software team. A lead connects GitHub, Railway and their Codex subscription; teammates scan an invitation and start requesting changes. Butler handles persistent workspaces, PRs, review, previews and publishing.
 
-- [Join the team](docs/ONBOARDING.md)
-- [Deploy and operate](docs/DEPLOY.md)
-- [Acceptance checks](docs/ACCEPTANCE.md)
+- [Product direction / implementation issue](https://github.com/MszBednarski/code_butler/issues/9)
+- [Run and deploy the platform](docs/PLATFORM.md)
+- [Existing team's onboarding](docs/ONBOARDING.md)
+- [Existing agent-host deployment](docs/DEPLOY.md)
 
-Local app: `cd app && npm ci && npm run dev`. Agent host: `docker build -t pocket-butler-agents agent-host`, then follow the deployment guide for variables and a persistent `/data` mount.
+`app/` is the mobile web portal. `platform/` provides accounts, memberships, provider connections, provisioning and deployment. `project-worker/` runs a team's persistent Codex conversations, worktrees and reviewer. The existing `agent-host/` remains available for the original team.
+
+With Node 22.13+: install package dependencies and run `./scripts/check.sh`. For deployment, build `platform/Dockerfile` from the repository root and mount a persistent volume at `/data`; see the platform guide for the one-time OAuth app registrations.

@@ -1,0 +1,11 @@
+.git
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+**/.railway
+**/*.log
+**/*.sqlite
+**/*.sqlite-*
+**/master.key
+.butler-data
