@@ -154,6 +154,8 @@ export function createUserManager(config) {
       if (error.code === 'ENOENT') throw error;
       const env = { HOME: home, BUTLER_USER: name, NO_BROWSER: 'true', BROWSER: 'false', IS_SANDBOX: '1',
         XDG_CONFIG_HOME: `${home}/.config`, XDG_CACHE_HOME: `${home}/.cache`, XDG_DATA_HOME: `${home}/.local/share`,
+        GH_CONFIG_DIR: `${home}/.config/gh`, GH_TOKEN: '', GITHUB_TOKEN: '',
+        GH_ENTERPRISE_TOKEN: '', GITHUB_ENTERPRISE_TOKEN: '',
         CODEX_HOME: `${home}/.codex`, GIT_AUTHOR_NAME: login, GIT_AUTHOR_EMAIL: `${login}@users.noreply.github.com`,
         GIT_COMMITTER_NAME: login, GIT_COMMITTER_EMAIL: `${login}@users.noreply.github.com` };
       const args = ['new-session', '-d', '-s', name, '-c', cwd];

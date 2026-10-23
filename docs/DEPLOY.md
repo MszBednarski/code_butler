@@ -25,7 +25,8 @@ The host refuses to start in Railway without an actual mount at `/data`. The che
 - `/data/home/<name>/.codex`: each person's Codex login and conversations.
 - `/data/home/<name>/.butler-task.md`: the agent's current goal, branch, PR, and next step.
 - `/data/home/<name>/.butler-session`: marks a session to recreate automatically at boot.
-- `/data/github`: the shared GitHub CLI login for pushes and PRs.
+- `/data/github`: host service credentials for cloning and fetching the shared repository.
+- `/data/home/<name>/.config/gh`: each teammate’s GitHub login for agent operations.
 - `/data/invites.json`: hashed invite secrets and member identities.
 - `/data/invite-links.json`: private links for the team lead to distribute.
 
@@ -33,7 +34,7 @@ A restart terminates running processes. Boot recreates previously active tmux se
 
 ## First login
 
-Read `/data/invite-links.json` privately through Railway SSH. Open the `msz` link. The terminal first runs GitHub's device login: open the displayed GitHub URL, enter the code, and authorize as **MszBednarski**. This saves one shared GitHub login for repository pushes and PR creation. An optional `GH_TOKEN` can override this if preferred.
+Read `/data/invite-links.json` privately through Railway SSH. Open your invite link. The terminal runs GitHub device login: open the displayed URL, enter the code, and authorize **your own GitHub account**. Each member signs in separately. Existing shared credentials are never copied into personal profiles. After deployment, restored sessions prompt for personal login before resuming the agent. Agents ignore host token environment variables, display the authenticated username, and use that identity for commits.
 
 Next, Codex starts its device login. Open its displayed URL and enter the code in the browser using your own ChatGPT account. Codex credentials remain in that user's HOME. See the [official Codex device-login documentation](https://learn.chatgpt.com/docs/auth#login-on-headless-devices).
 
@@ -60,7 +61,7 @@ Invites use 32 random bytes. The browser exchanges the secret from the URL fragm
 
 Required: `PORT=3000`, `PUBLIC_URL`, `GITHUB_REPO=MszBednarski/code_butler`, `APP_URL`, `SESSION_SECRET` (generated once, retained across redeploys), and `IS_SANDBOX=1`.
 
-Also configured: `REQUIRE_PERSISTENT_VOLUME=1`, `BUTLER_TEAM_LEAD=msz`, `OWNER_LOGIN=MszBednarski`, and `AGENT_CMD=/usr/local/bin/run-agent codex`. GitHub CLI configuration uses `/data/github`. No GitHub OAuth app is needed. Do not commit secrets or invite links.
+Also configured: `REQUIRE_PERSISTENT_VOLUME=1`, `BUTLER_TEAM_LEAD=msz`, `OWNER_LOGIN=MszBednarski`, and `AGENT_CMD=/usr/local/bin/run-agent codex`. Host GitHub CLI configuration uses `/data/github`; personal agents override it with their own persistent profile. Host token variables only apply to service operations. No GitHub OAuth app is needed. Do not commit secrets or invite links.
 
 All three agents remain installed. Alternate launchers are `/usr/local/bin/run-agent claude` and `/usr/local/bin/run-agent gemini`. Docker build checks their required flags against actual `--help` output.
 
@@ -82,4 +83,4 @@ See [acceptance results](ACCEPTANCE.md).
 
 ## Known limits
 
-Everyone shares a root container and can potentially read each other's files and account credentials. Use it only for a trusted team. Infrastructure changes restart the host. PRs appear under the shared GitHub account, with branch prefixes and commit authors identifying the requesting teammate. A reconciler is outside this setup.
+Everyone shares a root container and can potentially read each other's files and account credentials. Use it only for a trusted team. Infrastructure changes restart the host. Issues and PRs appear under each teammate’s authenticated GitHub account. Each account needs access to the workspace repository. A reconciler is outside this setup.

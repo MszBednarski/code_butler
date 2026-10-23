@@ -2,11 +2,13 @@
 
 1. Ask the team lead for your private invite link. Each link opens one person's workspace; keep yours private.
 2. Open the link on your phone or laptop. On a phone, add it to your home screen. Your workspace URL is **https://agent-host-production-1fb3.up.railway.app**.
-3. First time only: Codex displays a login link and a device code. Open that link, sign in with your own ChatGPT account, and enter the device code **in the browser**. If asked, enable device code login in your ChatGPT security settings.
+3. First time only: GitHub displays a login link and device code. Open it in your browser and authorize **your own GitHub account**. Then Codex displays a login link and a device code. Open that link, sign in with your own ChatGPT account, and enter the device code **in the browser**. If asked, enable device code login in your ChatGPT security settings.
 4. Type or dictate what you want changed into the Send box. Your agent makes the change, pushes a branch, and opens a pull request.
 5. Live app: **https://web-production-0846c.up.railway.app**. Railway previews and automatic main deployments require the repository connection described in the deployment guide.
 
-The team lead connects the shared GitHub account once from their terminal before the first Codex login. Teammates use their own Codex subscription; GitHub pushes and PRs use the shared team account.
+Each teammate connects their own GitHub account and Codex subscription. Issues, pushes, and PRs use that GitHub account; repository access depends on its permissions. Signing in does not change the workspace repository.
+
+To switch GitHub accounts, stop the agent with Ctrl-C, run `gh auth logout --hostname github.com`, then run `/usr/local/bin/run-agent codex` and authorize the desired account.
 
 Tips
 - **Esc** interrupts your agent. **Ctrl-C** stops a stuck command. Use **Enter** for terminal login prompts.
