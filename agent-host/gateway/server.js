@@ -9,6 +9,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createInviteStore, validName } from './invites.js';
+import { startReconciler } from '../reconciler/loop.mjs';
 
 const exec = promisify(execFile);
 const publicDir = fileURLToPath(new URL('./public/', import.meta.url));
@@ -316,10 +317,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     if (process.argv.includes('--check-env')) {
       console.log('Agent host environment is valid');
     } else {
+      const reconciler = startReconciler();
       const { server, users, proxy } = createGateway(config);
       server.listen(config.PORT, '0.0.0.0', () => console.log(`Pocket Butler gateway listening on port ${config.PORT}`));
       users.restore().catch(error => console.error(`Session restoration failed: ${error.code || error.name}`));
       const shutdown = () => {
+        reconciler.stop();
         users.stop();
         proxy.close();
         server.close(() => process.exit(0));

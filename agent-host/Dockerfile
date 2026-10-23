@@ -41,6 +41,7 @@ WORKDIR /srv/gateway
 COPY gateway/package.json gateway/package-lock.json ./
 RUN npm ci --omit=dev
 COPY gateway/ ./
+COPY reconciler/ /srv/reconciler/
 COPY --chmod=755 start.sh /usr/local/bin/start.sh
 COPY --chmod=755 run-agent.sh /usr/local/bin/run-agent
 

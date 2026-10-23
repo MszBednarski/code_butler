@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            app/package-lock.json
+            agent-host/gateway/package-lock.json
+      - name: Build and typecheck app
+        working-directory: app
+        run: npm ci && npm run typecheck && npm run build
+      - name: Test gateway and reviewer
+        working-directory: agent-host/gateway
+        run: npm ci && npm test
+      - name: Check shell scripts
+        run: bash -n agent-host/start.sh agent-host/run-agent.sh
+      - name: Build agent host
+        run: docker build -t pocket-butler-agents:ci agent-host

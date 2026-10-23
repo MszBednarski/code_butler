@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["decision", "summary", "findings"],
+  "properties": {
+    "decision": { "type": "string", "enum": ["approve", "block"] },
+    "summary": { "type": "string" },
+    "findings": { "type": "array", "items": { "type": "string" } }
+  }
+}
