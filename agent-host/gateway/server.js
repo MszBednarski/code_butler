@@ -139,7 +139,10 @@ export function createUserManager(config) {
     if (!validName(name) || (await config.members.get(name))?.login !== login) throw new Error('Unknown team member');
     const home = `/data/home/${name}`;
     const cwd = `/data/wt/${name}`;
-    await mkdir(home, { recursive: true, mode: 0o700 });
+    // Codex requires an explicitly configured CODEX_HOME to exist before it
+    // loads configuration, including before `codex login` runs.
+    await Promise.all([home, `${home}/.codex`, `${home}/.config`, `${home}/.cache`, `${home}/.local/share`]
+      .map(directory => mkdir(directory, { recursive: true, mode: 0o700 })));
     await withRepoLock(async () => {
       if (!await exists(cwd)) {
         await command('git', ['-C', '/data/repo', 'fetch', 'origin']);

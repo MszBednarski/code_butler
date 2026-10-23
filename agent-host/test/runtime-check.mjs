@@ -80,9 +80,18 @@ try {
     assert.equal(await run('tmux', ['show-environment', '-t', `=${name}`, 'HOME']), `HOME=/data/home/${name}`);
     assert.equal(await run('tmux', ['show-environment', '-t', `=${name}`, 'BUTLER_USER']), `BUTLER_USER=${name}`);
     assert.equal(await run('tmux', ['show-environment', '-t', `=${name}`, 'GIT_AUTHOR_NAME']), `GIT_AUTHOR_NAME=${name === 'alice' ? 'AliceGH' : 'BobGH'}`);
+    await access(`/data/home/${name}/.codex`);
+    if (phase === 'initial') {
+      // Exercise the real config loader, which --help and mock agents bypass.
+      await assert.rejects(exec('codex', ['login', 'status'], { env: {
+        ...process.env, HOME: `/data/home/${name}`, CODEX_HOME: `/data/home/${name}/.codex`
+      } }), error => error.code === 1 && /not logged in/i.test(error.stderr + error.stdout)
+        && !/Error loading configuration|CODEX_HOME points to/i.test(error.stderr + error.stdout));
+    }
     assert.equal((await fetch(`${base}/term/`, { headers: headers(name) })).status, 200);
   }));
   console.log('PASS: two lazy worktrees, separate homes, exact tmux sessions, authors, and real ttyd HTTP proxy');
+  if (phase === 'initial') console.log('PASS: real Codex config loader accepts both fresh persistent profiles before login');
 
   const messages = { alice: '--alice option\nsecond line 🦊', bob: '--bob option\nother line 🐻' };
   await Promise.all(Object.entries(messages).map(async ([name, text]) => {

@@ -1,5 +1,9 @@
 #!/bin/bash
 set -u
+umask 077
+
+# Also support relaunching this script directly from an existing shell.
+mkdir -p -- "$HOME" "${CODEX_HOME:-$HOME/.codex}" || exit 1
 
 # One shared GitHub authorization for repository pushes and PRs. Each person's
 # Codex account remains separate under their own HOME/CODEX_HOME.

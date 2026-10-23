@@ -7,6 +7,8 @@ Record PASS, FAIL, or PENDING with evidence when deploying. Automated local chec
 | App builds and TypeScript checks | PASS | `npm run typecheck` and `npm run build`, Node 22 |
 | Railway key names and values match the live JSON schema | PASS | Both configs validated against the fetched schema with Draft202012Validator, including an explicit check for unknown keys |
 | Image builds; all three agent flags and Codex device login are supported | PASS | Built image: Claude 2.1.309, Gemini 0.65.0, Codex 0.164.0, ttyd 1.7.7, tmux 3.3a; all `--help` assertions pass |
+| Fresh Codex profiles load before account login | PASS | Real `codex login status` in two fresh persistent homes reaches “Not logged in”, without configuration errors; provisioning and the launcher create CODEX_HOME first |
+| Shared GitHub account has repo access | PASS | Live GitHub API returned MszBednarski with push and admin permission on MszBednarski/code_butler |
 | HTTP and WebSocket invite authentication, revocation, Origin, session expiry, and terminal routing | PASS | Eight gateway tests, including invite rotation/revocation, secure cookies, and real HTTP/WebSocket proxies to separate UNIX sockets |
 | Real tmux sessions, worktrees, safe simultaneous paste, ttyd respawn, disk persistence | PASS | Deleted the first container and ran a fresh one on the same named volume: sessions restored before page access, dirty work/branch/credential/conversation/task-note files preserved; used a mock agent and simulated account files |
 | APP_URL loads on a phone, displays commit SHA, and adds to home screen | PENDING | Human phone check after deployment |
