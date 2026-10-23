@@ -16,7 +16,7 @@ RUN test "$(dpkg --print-architecture)" = amd64 \
     && chmod +x /usr/local/bin/ttyd \
     && ttyd --version
 
-RUN npm i -g @anthropic-ai/claude-code @google/gemini-cli @openai/codex \
+RUN npm i -g @anthropic-ai/claude-code @google/gemini-cli @openai/codex @railway/cli@5.71.0 \
     && npm cache clean --force
 
 # Fail the build if a CLI update removes a flag used by our launcher. Keep the
