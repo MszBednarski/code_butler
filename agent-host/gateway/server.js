@@ -3,7 +3,7 @@ import httpProxy from 'http-proxy';
 import { createServer } from 'node:http';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
-import { mkdir, access, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, access, unlink, writeFile, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -255,6 +255,20 @@ export function createGateway(config, { users = createUserManager(config) } = {}
     res.sendFile(path.join(publicDir, 'index.html'));
   });
   app.get('/api/me', (req, res) => res.json({ ...req.user, appUrl: config.APP_URL, repo: config.GITHUB_REPO }));
+  app.get('/api/github', async (req, res) => {
+    await users.ensureUser(req.user.name, req.user.login);
+    try {
+      const status = JSON.parse(await readFile(`/data/home/${req.user.name}/.config/gh/connection.json`, 'utf8'));
+      if (status.state === 'connected' && typeof status.login === 'string') return res.json({ state: 'connected', login: status.login });
+      if (status.state === 'pending' && /^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(status.code) && Date.now() - status.updatedAt < 900000) {
+        return res.json({ state: 'pending', code: status.code, url: 'https://github.com/login/device' });
+      }
+      res.json({ state: status.state === 'starting' && Date.now() - status.updatedAt < 60000 ? 'starting' : 'error' });
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      res.json({ state: 'starting' });
+    }
+  });
   app.post('/api/send', async (req, res) => {
     const text = req.body?.text;
     if (typeof text !== 'string' || !text.trim() || text.length > 20000 || text.includes('\0')) {

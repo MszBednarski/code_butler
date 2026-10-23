@@ -9,10 +9,7 @@ mkdir -p -- "$HOME" "${CODEX_HOME:-$HOME/.codex}" || exit 1
 export GH_CONFIG_DIR="$HOME/.config/gh"
 unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 mkdir -p -- "$GH_CONFIG_DIR" || exit 1
-if ! gh auth status --hostname github.com >/dev/null 2>&1; then
-  printf '\nConnect your own GitHub account. Open the link and enter the code in your browser.\n'
-  GH_BROWSER=echo gh auth login --hostname github.com --git-protocol https --web --insecure-storage || exit 1
-fi
+node "$(dirname -- "${BASH_SOURCE[0]}")/github-login.mjs" || exit 1
 # Attribute commits to the account used for issues, pushes, and PRs.
 identity=$(gh api user --jq '[.login, (.id | tostring)] | @tsv') || exit 1
 IFS=$'\t' read -r github_login github_id <<< "$identity"
