@@ -12,7 +12,10 @@ mkdir -p "$GH_CONFIG_DIR" || exit 1
 pat_file="$GH_CONFIG_DIR/repo-token"
 if [ ! -s "$pat_file" ] || [ "${1:-}" = "github-token" ]; then
   printf '\nCreate a fine-grained GitHub PAT for %s only.\n' "$GITHUB_REPO"
-  printf 'Grant Contents, Pull requests, and Issues read/write; no account permissions.\n'
+  printf 'Open this link to prefill the permissions (expires in 30 days):\n'
+  printf 'https://github.com/settings/personal-access-tokens/new?name=Butler&target_name=%s&expires_in=30&contents=write&pull_requests=write&issues=write\n' "${GITHUB_REPO%%/*}"
+  printf 'Choose Only select repositories, then %s. Leave account permissions empty.\n' "${GITHUB_REPO#*/}"
+  printf 'For a teammate token, the repo must belong to an organization they are a member of.\n'
   printf 'Paste the token here (hidden, never in chat): '
   IFS= read -r -s pat || exit 1
   printf '\n'

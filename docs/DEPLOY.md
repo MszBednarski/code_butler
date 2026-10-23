@@ -33,7 +33,9 @@ The single volume-backed agent container has a brief service interruption when i
 
 ## First login
 
-Read `/data/invite-links.json` privately through Railway SSH. Open the `msz` link. Create a [fine-grained PAT](https://github.com/settings/personal-access-tokens/new) as **MszBednarski** with resource owner **MszBednarski**, **Only select repositories → code_butler**, an expiration date, and **Contents**, **Pull requests**, and **Issues** repository permissions set to **Read and write**. Leave account permissions empty; Metadata read access is automatic.
+Read `/data/invite-links.json` privately through Railway SSH. Open the `msz` link. Create a [fine-grained PAT with permissions prefilled](https://github.com/settings/personal-access-tokens/new?name=Butler&target_name=MszBednarski&expires_in=30&contents=write&pull_requests=write&issues=write) as **MszBednarski** with resource owner **MszBednarski**, **Only select repositories → code_butler**, an expiration date, and **Contents**, **Pull requests**, and **Issues** repository permissions set to **Read and write**. Leave account permissions empty; Metadata read access is automatic.
+
+The link prefills permissions and a 30-day expiration; select the repository manually. Teammates cannot use their own fine-grained PAT for this personally owned repository: transfer it to an organization and add them as members first. The terminal generates its link from GITHUB_REPO so it follows an owner change.
 
 Paste it only into the terminal's hidden prompt, never into chat. The host validates the account identity and repository push access before saving it atomically with mode 0600. It accepts fine-grained PATs only. The API cannot prove no other repositories or permissions were selected; review those settings yourself. The launcher supplies this workspace's PAT through GH_TOKEN, as [recommended by GitHub CLI](https://cli.github.com/manual/gh_auth_login).
 
