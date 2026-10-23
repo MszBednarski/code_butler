@@ -81,7 +81,7 @@ test('health is public; terminal HTTP and API require a valid current member', a
   assert.equal(await health.text(), 'ok');
   assert.equal(health.headers.get('content-security-policy'), "frame-ancestors 'self'");
   assert.equal((await fetch(base, { redirect: 'manual' })).headers.get('location'), '/login');
-  for (const route of ['/term/', '/term/ws', '/api/me']) {
+  for (const route of ['/term/', '/term/ws', '/api/me', '/api/github']) {
     for (const value of ['', cookie('RemovedGH'), cookie('AliceGH', 'bob'), cookie('AliceGH', 'alice', 1), cookie() + 'tampered']) {
       assert.equal((await fetch(base + route, { headers: { cookie: value } })).status, 401);
     }
