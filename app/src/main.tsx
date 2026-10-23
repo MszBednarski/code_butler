@@ -37,6 +37,7 @@ type Project = {
   appUrl?: string;
   repoUrl?: string;
   isOwner: boolean;
+  codingReady: boolean;
   member: Member;
   members: Member[];
   ownMemberships: Member[];
@@ -71,11 +72,9 @@ async function api<T>(url: string, body?: unknown): Promise<T> {
     headers: body === undefined ? {} : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const value = await response
-    .json()
-    .catch(() => ({
-      error: "Butler could not reach its server. Please try again.",
-    }));
+  const value = await response.json().catch(() => ({
+    error: "Butler could not reach its server. Please try again.",
+  }));
   if (!response.ok)
     throw new ApiError(
       value.error || "Something interrupted this request.",
@@ -427,6 +426,8 @@ function Dashboard({
   session: Session;
   refresh: () => Promise<void>;
 }) {
+  const [projectsLoaded, setProjectsLoaded] = useState(false),
+    [memberSaving, setMemberSaving] = useState(false);
   const [projects, setProjects] = useState<Summary[]>([]),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
@@ -441,8 +442,13 @@ function Dashboard({
     );
   useEffect(() => {
     api<{ projects: Summary[] }>("/api/projects")
-      .then((v) => setProjects(v.projects))
-      .catch((e) => setError(e.message));
+      .then((v) => {
+        setProjects(v.projects);
+        if (!session.connections.github && v.projects.length === 1)
+          navigate(`/p/${v.projects[0].id}`, true);
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setProjectsLoaded(true));
   }, []);
   useEffect(() => {
     localStorage.setItem("butler-project-idea", description);
@@ -484,6 +490,69 @@ function Dashboard({
     await api("/api/auth/logout", {});
     await refresh();
   }
+  if (!session.connections.github && !projectsLoaded)
+    return (
+      <div className="loading-page">
+        <Brand />
+        <Spinner />
+        <p>Finding your workspace…</p>
+      </div>
+    );
+  if (!session.connections.github && projects.length > 0)
+    return (
+      <div className="dashboard">
+        <header className="site-header">
+          <Brand />
+          <div className="account-menu">
+            <Avatar name={session.user!.name} />
+            <button
+              className="icon-button"
+              aria-label="Save your access"
+              onClick={() => setMemberSaving(true)}
+            >
+              <Icon name="lock" />
+            </button>
+          </div>
+        </header>
+        <main className="dashboard-main">
+          <div className="eyebrow">YOUR IDEAS HAVE A HOME</div>
+          <h1>
+            Good to have
+            <br />
+            <em>you back.</em>
+          </h1>
+          <p className="page-description">
+            Pick up your conversation and keep making things together.
+          </p>
+          <section className="projects-section">
+            <div className="project-cards">
+              {projects.map((p, i) => (
+                <button
+                  key={p.id}
+                  className={`project-card project-tone-${i % 3}`}
+                  onClick={() => navigate(`/p/${p.id}`)}
+                >
+                  <span className="project-monogram">{p.name.slice(0, 1)}</span>
+                  <h3>{p.name}</h3>
+                  <p>{p.description}</p>
+                  <span className="project-card-foot">
+                    Open your workspace
+                    <Icon name="arrow" size={16} />
+                  </span>
+                </button>
+              ))}
+            </div>
+          </section>
+        </main>
+        {memberSaving && (
+          <SaveAccess
+            session={session}
+            projectId={projects[0].id}
+            onClose={() => setMemberSaving(false)}
+          />
+        )}
+      </div>
+    );
   return (
     <div className="dashboard">
       <header className="site-header">
@@ -1079,6 +1148,8 @@ const jobLabel: Record<string, string> = {
   live: "Live",
   unchanged: "Done",
   failed: "Needs a hand",
+  preview_failed: "Preview needs a hand",
+  publish_failed: "Publishing needs a hand",
   needs_attention: "Needs a hand",
 };
 function JobState({ job }: { job: Job }) {
@@ -1240,11 +1311,15 @@ function Workspace({
           <small>Your shared creation</small>
         </div>
         <div className="workspace-header-actions">
-          <div className="avatar-stack">
+          <button
+            className="avatar-stack team-toggle"
+            aria-label="Show your team"
+            onClick={() => setTab(tab === "team" ? "chat" : "team")}
+          >
             {project.members.slice(0, 4).map((m, i) => (
               <Avatar key={m.id} name={m.name} index={i} />
             ))}
-          </div>
+          </button>
           {project.isOwner && (
             <button
               className="button primary compact"
@@ -1426,6 +1501,22 @@ function Workspace({
                 )}
               </div>
             )}
+            {project.isOwner &&
+              project.state === "ready" &&
+              project.tasks.some((task) => task.state === "failed") && (
+                <Alert>
+                  Publishing needs another try. Your team’s work is saved.
+                  <button className="text-button" onClick={retry}>
+                    Retry publishing <Icon name="refresh" size={13} />
+                  </button>
+                </Alert>
+              )}
+            {latestJob?.error && !project.isOwner && (
+              <Alert>
+                Your work is saved. This change needs another try before it can
+                go live.
+              </Alert>
+            )}
             {project.isOwner && (
               <CodexConnection project={project} onConnected={connected} />
             )}
@@ -1539,8 +1630,8 @@ function Workspace({
               <span>
                 {preparing
                   ? "You can send ideas while we prepare."
-                  : project.isOwner && !codexReady
-                    ? "Requests wait safely until Codex is connected."
+                  : !project.codingReady
+                    ? "Your lead is connecting Codex. Requests wait safely."
                     : "Type it. Dictate it. Make it happen."}
               </span>
               <span>↵ ⌘ / Ctrl</span>
@@ -1658,6 +1749,286 @@ function EmailComplete({ refresh }: { refresh: () => Promise<void> }) {
     </div>
   );
 }
+function InstallationSetup() {
+  const [secret] = useState(
+    () => new URLSearchParams(location.hash.slice(1)).get("token") || "",
+  );
+  const [status, setStatus] = useState<{
+      github: boolean;
+      railway: boolean;
+      publicUrl: string;
+      railwaySettingsUrl: string;
+    } | null>(null),
+    [error, setError] = useState(""),
+    [message, setMessage] = useState(""),
+    [busy, setBusy] = useState("");
+  const [githubId, setGithubId] = useState(""),
+    [githubSecret, setGithubSecret] = useState(""),
+    [railwayId, setRailwayId] = useState(""),
+    [railwaySecret, setRailwaySecret] = useState("");
+  useEffect(() => {
+    if (!secret) {
+      setError(
+        "Open the private installation link provided by your Butler operator.",
+      );
+      return;
+    }
+    api<{
+      github: boolean;
+      railway: boolean;
+      publicUrl: string;
+      railwaySettingsUrl: string;
+    }>("/api/setup/status", { token: secret })
+      .then(setStatus)
+      .catch((e) => setError(e.message));
+  }, [secret]);
+  async function save(provider: string, event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(provider);
+    setError("");
+    setMessage("");
+    try {
+      const result = await api<typeof status>("/api/setup/save", {
+        token: secret,
+        provider,
+        clientId: provider === "github" ? githubId : railwayId,
+        clientSecret: provider === "github" ? githubSecret : railwaySecret,
+      });
+      setStatus(result);
+      if (provider === "github") setGithubSecret("");
+      else setRailwaySecret("");
+      setMessage(
+        (provider === "github" ? "GitHub" : "Railway") +
+          " is connected. Settings saved and applied immediately.",
+      );
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+  function urls(provider: string) {
+    const home = status!.publicUrl,
+      callback = home + "/auth/" + provider + "/callback";
+    return (
+      <div className="setup-urls">
+        <label>
+          Homepage
+          <input readOnly value={home} onFocus={(e) => e.target.select()} />
+        </label>
+        <label>
+          Callback URL
+          <div>
+            <input
+              readOnly
+              value={callback}
+              onFocus={(e) => e.target.select()}
+            />
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={"Copy " + provider + " callback URL"}
+              onClick={() =>
+                copy(callback)
+                  .then(() => setMessage("Callback URL copied."))
+                  .catch((e) => setMessage(e.message))
+              }
+            >
+              <Icon name="copy" size={16} />
+            </button>
+          </div>
+        </label>
+      </div>
+    );
+  }
+  const githubUrl = status
+    ? "https://github.com/settings/applications/new?" +
+      new URLSearchParams({
+        "oauth_application[name]": "Pocket Butler",
+        "oauth_application[url]": status.publicUrl,
+        "oauth_application[callback_url]":
+          status.publicUrl + "/auth/github/callback",
+      })
+    : "#";
+  return (
+    <div className="dashboard">
+      <header className="site-header">
+        <Brand />
+        <span className="header-note">Private installation setup</span>
+      </header>
+      <main className="dashboard-main setup-main">
+        <div className="eyebrow">ONE SETUP. EVERY TEAM.</div>
+        <h1>
+          Make room
+          <br />
+          <em>for everyone.</em>
+        </h1>
+        <p className="page-description">
+          Register Butler’s two integrations once. Paste their credentials here;
+          Butler saves and applies everything. Team leads only sign in
+          afterward.
+        </p>
+        {error && <Alert>{error}</Alert>}
+        {message && (
+          <p className="inline-status" role="status">
+            {message}
+          </p>
+        )}
+        {status ? (
+          <div className="setup-cards">
+            <form className="create-card" onSubmit={(e) => save("github", e)}>
+              <div className="card-heading">
+                <span className="round-icon">
+                  <Icon name="github" />
+                </span>
+                <div>
+                  <h2>1. GitHub</h2>
+                  <p>
+                    {status.github
+                      ? "Connected — you can update it below."
+                      : "Create the OAuth app, then paste its two values."}
+                  </p>
+                </div>
+                {status.github && <Icon name="check" />}
+              </div>
+              <a
+                className="button ghost full"
+                href={githubUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Open GitHub registration
+                <Icon name="external" size={16} />
+              </a>
+              <p className="setup-instructions">
+                Name it Pocket Butler. Use the homepage and callback below if
+                GitHub doesn’t fill them automatically. Register the app and
+                generate a client secret.
+              </p>
+              {urls("github")}
+              <label>
+                Client ID
+                <input
+                  autoComplete="off"
+                  value={githubId}
+                  onChange={(e) => setGithubId(e.target.value)}
+                  required
+                  placeholder="Paste from GitHub"
+                />
+              </label>
+              <label>
+                Client secret
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={githubSecret}
+                  onChange={(e) => setGithubSecret(e.target.value)}
+                  required
+                  placeholder="Paste the generated secret"
+                />
+              </label>
+              <button
+                className="button primary full"
+                disabled={Boolean(busy) || !githubId || !githubSecret}
+              >
+                {busy === "github" ? (
+                  <Spinner />
+                ) : (
+                  <Icon name="check" size={17} />
+                )}
+                Save GitHub
+              </button>
+            </form>
+            <form className="create-card" onSubmit={(e) => save("railway", e)}>
+              <div className="card-heading">
+                <span className="round-icon">
+                  <Icon name="railway" />
+                </span>
+                <div>
+                  <h2>2. Railway</h2>
+                  <p>
+                    {status.railway
+                      ? "Connected — you can update it below."
+                      : "Create the OAuth app in your workspace."}
+                  </p>
+                </div>
+                {status.railway && <Icon name="check" />}
+              </div>
+              <a
+                className="button ghost full"
+                href={status.railwaySettingsUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Open Railway settings
+                <Icon name="external" size={16} />
+              </a>
+              <p className="setup-instructions">
+                Workspace settings → Developer → New OAuth App. Name it Pocket
+                Butler, add the callback below, and copy the client ID and
+                secret.
+              </p>
+              {urls("railway")}
+              <label>
+                Client ID
+                <input
+                  autoComplete="off"
+                  value={railwayId}
+                  onChange={(e) => setRailwayId(e.target.value)}
+                  required
+                  placeholder="Paste from Railway"
+                />
+              </label>
+              <label>
+                Client secret
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={railwaySecret}
+                  onChange={(e) => setRailwaySecret(e.target.value)}
+                  required
+                  placeholder="Paste the generated secret"
+                />
+              </label>
+              <button
+                className="button primary full"
+                disabled={Boolean(busy) || !railwayId || !railwaySecret}
+              >
+                {busy === "railway" ? (
+                  <Spinner />
+                ) : (
+                  <Icon name="check" size={17} />
+                )}
+                Save Railway
+              </button>
+            </form>
+          </div>
+        ) : (
+          !error && <Spinner />
+        )}
+        {status?.github && status.railway && (
+          <div className="setup-complete">
+            <Icon name="check" />
+            <h2>Ready for your first team.</h2>
+            <p>
+              Sign in with GitHub, connect your Railway account, and create a
+              project. Codex sign-in happens inside the project.
+            </p>
+            <a className="button primary" href="/auth/github">
+              Start your first project
+              <Icon name="arrow" size={17} />
+            </a>
+          </div>
+        )}
+        <p className="quiet-note">
+          This link controls your Butler installation. Keep it private. No
+          Railway variable editing or redeploy is needed to save these
+          connections.
+        </p>
+      </main>
+    </div>
+  );
+}
 function App() {
   const route = useRoute(),
     [session, setSession] = useState<Session>(emptySession),
@@ -1691,6 +2062,7 @@ function App() {
   useEffect(() => {
     refresh();
   }, [route, refresh]);
+  if (route === "/setup") return <InstallationSetup />;
   if (route === "/join") return <Join />;
   if (route === "/recover") return <Recover refresh={refresh} />;
   if (route === "/email") return <EmailComplete refresh={refresh} />;

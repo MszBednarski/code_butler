@@ -11,6 +11,7 @@ import { installAuth, publicUser, cookie } from "./auth.mjs";
 import { installWorkerApi } from "./worker-api.mjs";
 import { installGitProxy } from "./git-proxy.mjs";
 import { createProvisioner } from "./provision.mjs";
+import { installSetup } from "./setup.mjs";
 
 const uuid = (value) =>
   typeof value === "string" && /^[a-f0-9-]{36}$/.test(value);
@@ -147,6 +148,7 @@ export function createPlatform(
         if (value.until < now()) limits.delete(k);
     next();
   });
+  installSetup(app, config, store);
   installWorkerApi(app, config, store, provider);
   installAuth(app, config, store, provider);
   const signed = (req, res, next) =>
@@ -169,12 +171,10 @@ export function createPlatform(
           )
         : null;
     if (!req.member)
-      return res
-        .status(404)
-        .json({
-          error:
-            "This project is not in your account. Open its invitation to join.",
-        });
+      return res.status(404).json({
+        error:
+          "This project is not in your account. Open its invitation to join.",
+      });
     next();
   }
   const owner = (req, res, next) =>
@@ -313,12 +313,9 @@ export function createPlatform(
           )
         : null;
     if (!project)
-      return res
-        .status(404)
-        .json({
-          error:
-            "This invitation has expired. Ask the team lead for a new one.",
-        });
+      return res.status(404).json({
+        error: "This invitation has expired. Ask the team lead for a new one.",
+      });
     res.json(project);
   });
   app.post("/api/invites/join", (req, res) => {
@@ -330,12 +327,9 @@ export function createPlatform(
           )
         : null;
     if (!project)
-      return res
-        .status(403)
-        .json({
-          error:
-            "This invitation has expired. Ask the team lead for a new one.",
-        });
+      return res.status(403).json({
+        error: "This invitation has expired. Ask the team lead for a new one.",
+      });
     if (!name(req.body.name))
       return res
         .status(400)
@@ -354,11 +348,9 @@ export function createPlatform(
         project.id,
       ).total >= 20
     )
-      return res
-        .status(409)
-        .json({
-          error: "This team is full. Ask the lead to make another project.",
-        });
+      return res.status(409).json({
+        error: "This team is full. Ask the lead to make another project.",
+      });
     const user = req.account || store.guest(req.body.name.trim()),
       memberId = id();
     const prefix = `${
@@ -391,6 +383,7 @@ export function createPlatform(
       appUrl: p.app_url,
       repoUrl: p.repo ? `https://github.com/${p.repo}` : null,
       isOwner: p.owner_id === req.account.id,
+      codingReady: Boolean(p.codex_ready),
       member: memberView(req.member),
       members: store.all(
         "SELECT id,name,prefix,role FROM members WHERE project_id=? ORDER BY created_at",
@@ -511,8 +504,15 @@ export function createPlatform(
     signed,
     membership,
     owner,
-    async (req, res) =>
-      res.json(await provider.worker(req.project, "/auth/status")),
+    async (req, res) => {
+      const status = await provider.worker(req.project, "/auth/status");
+      store.run(
+        "UPDATE projects SET codex_ready=? WHERE id=?",
+        status.state === "connected" ? 1 : 0,
+        req.project.id,
+      );
+      res.json(status);
+    },
   );
   app.post(
     "/api/projects/:projectId/codex",
@@ -521,12 +521,10 @@ export function createPlatform(
     owner,
     async (req, res) => {
       if (req.project.state !== "ready")
-        return res
-          .status(409)
-          .json({
-            error:
-              "Your workspace is still being prepared. You can invite teammates now.",
-          });
+        return res.status(409).json({
+          error:
+            "Your workspace is still being prepared. You can invite teammates now.",
+        });
       res.json(await provider.worker(req.project, "/auth/start", "POST"));
     },
   );
@@ -574,15 +572,13 @@ export function createPlatform(
         : error.status >= 400 && error.status < 500
           ? error.status
           : 502;
-    res
-      .status(status)
-      .json({
-        error: error.provider
-          ? error.message.slice(0, 350)
-          : status === 413
-            ? "This request is too large."
-            : "Something interrupted this request. Please try again.",
-      });
+    res.status(status).json({
+      error: error.provider
+        ? error.message.slice(0, 350)
+        : status === 413
+          ? "This request is too large."
+          : "Something interrupted this request. Please try again.",
+    });
   });
   return { app, server, store, provider, provisioner };
 }

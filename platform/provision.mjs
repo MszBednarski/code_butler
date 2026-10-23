@@ -1,6 +1,13 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readdir, readFile, mkdtemp, writeFile, rm } from "node:fs/promises";
+import {
+  readdir,
+  readFile,
+  mkdtemp,
+  writeFile,
+  rm,
+  cp,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { x as extract } from "tar";
@@ -324,7 +331,7 @@ export function createProvisioner(
       ],
       {
         env,
-        cwd: directory,
+        cwd: config.dataDir,
         timeout: 240000,
         maxBuffer: 2 * 1024 * 1024,
       },
@@ -610,18 +617,48 @@ export function createProvisioner(
       if (main.object.sha !== sha) return;
     }
     const target = prNumber ? await previewResource(project, prNumber) : app;
-    const directory = await source(project, sha);
+    const repository = await source(project, sha);
+    const directory = await mkdtemp(path.join(tmpdir(), "butler-upload-"));
     try {
+      // Source-controlled IaC must never execute in the credentialed platform
+      // process. Only a clean app snapshot is passed to the Railway uploader.
+      const excluded = new Set([
+        ".railway",
+        "railway.ts",
+        "railway.json",
+        "railway.toml",
+        "railway.config.ts",
+        "railway.config.js",
+        ".railwayignore",
+        "Dockerfile",
+        ".git",
+        "node_modules",
+      ]);
+      await cp(path.join(repository, "app"), directory, {
+        recursive: true,
+        filter: (file) =>
+          !excluded.has(path.basename(file)) &&
+          !path.basename(file).startsWith(".env"),
+      });
+      await writeFile(
+        path.join(directory, "railway.json"),
+        JSON.stringify({
+          build: { builder: "RAILPACK" },
+          deploy: {
+            startCommand: "npm start",
+            healthcheckPath: "/",
+            restartPolicyType: "ALWAYS",
+          },
+        }),
+      );
       await variables(project, target, {
         BUTLER_COMMIT_SHA: sha,
         PORT: "3000",
       });
-      await wait(
-        project,
-        await upload(project, target, path.join(directory, "app")),
-      );
+      await wait(project, await upload(project, target, directory));
     } finally {
       await rm(directory, { recursive: true, force: true });
+      await rm(repository, { recursive: true, force: true });
     }
     if (prNumber) {
       store.run(
@@ -631,7 +668,7 @@ export function createProvisioner(
         prNumber,
       );
       store.run(
-        "UPDATE jobs SET preview_url=?,updated_at=? WHERE project_id=? AND pr_number=?",
+        "UPDATE jobs SET preview_url=?,error=CASE WHEN state='preview_failed' THEN NULL ELSE error END,state=CASE WHEN state='preview_failed' THEN 'reviewing' ELSE state END,updated_at=? WHERE project_id=? AND pr_number=?",
         target.domain,
         now(),
         project.id,
@@ -653,7 +690,7 @@ export function createProvisioner(
         );
     } else {
       for (const job of store.all(
-        "SELECT id,merge_sha FROM jobs WHERE project_id=? AND state='deploying'",
+        "SELECT id,merge_sha FROM jobs WHERE project_id=? AND state IN ('deploying','publish_failed')",
         project.id,
       )) {
         if (!job.merge_sha) continue;
@@ -663,7 +700,7 @@ export function createProvisioner(
         );
         if (["ahead", "identical"].includes(comparison.status))
           store.run(
-            "UPDATE jobs SET state='live',updated_at=? WHERE id=?",
+            "UPDATE jobs SET state='live',error=NULL,updated_at=? WHERE id=?",
             now(),
             job.id,
           );
@@ -746,6 +783,29 @@ export function createProvisioner(
             message,
             project.id,
           );
+        if (task.kind === "deploy" && attempts >= 5) {
+          const payload = JSON.parse(task.payload);
+          if (payload.prNumber) {
+            store.run(
+              "UPDATE previews SET state='failed' WHERE project_id=? AND pr_number=?",
+              project.id,
+              payload.prNumber,
+            );
+            store.run(
+              "UPDATE jobs SET state='preview_failed',error=?,updated_at=? WHERE project_id=? AND pr_number=? AND state IN ('reviewing','preview_failed')",
+              message,
+              now(),
+              project.id,
+              payload.prNumber,
+            );
+          } else
+            store.run(
+              "UPDATE jobs SET state='publish_failed',error=?,updated_at=? WHERE project_id=? AND state='deploying'",
+              message,
+              now(),
+              project.id,
+            );
+        }
         console.error(`[tasks] ${task.kind} ${project.id}: ${error.name}`);
       }
     } finally {

@@ -32,6 +32,16 @@ export function installWorkerApi(app, config, store, provider) {
       state: req.project.state,
     }),
   );
+  app.post("/api/worker/auth", (req, res) => {
+    if (typeof req.body.connected !== "boolean")
+      return res.status(400).json({ error: "Invalid connection state." });
+    store.run(
+      "UPDATE projects SET codex_ready=? WHERE id=?",
+      req.body.connected ? 1 : 0,
+      req.project.id,
+    );
+    res.json({ ok: true });
+  });
   app.post("/api/worker/claim", (req, res) =>
     res.json({
       job:
@@ -302,11 +312,9 @@ export function installWorkerApi(app, config, store, provider) {
             (s) => s.context === context && s.state === "success",
           )
         )
-          return res
-            .status(409)
-            .json({
-              error: "Compilation and review must pass before merging.",
-            });
+          return res.status(409).json({
+            error: "Compilation and review must pass before merging.",
+          });
         result = await github(`/pulls/${b.number}/merge`, "PUT", {
           sha: b.sha,
           merge_method: "squash",
@@ -316,7 +324,7 @@ export function installWorkerApi(app, config, store, provider) {
             .status(409)
             .json({ error: result.message || "The PR could not be merged." });
         store.run(
-          "UPDATE jobs SET state='deploying',merge_sha=?,updated_at=? WHERE project_id=? AND pr_number=? AND state IN ('reviewing','needs_attention')",
+          "UPDATE jobs SET state='deploying',error=NULL,merge_sha=?,updated_at=? WHERE project_id=? AND pr_number=? AND state IN ('reviewing','needs_attention','preview_failed')",
           result.sha,
           now(),
           project.id,

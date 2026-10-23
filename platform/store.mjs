@@ -36,6 +36,7 @@ export function createStore(directory) {
       email TEXT UNIQUE, recovery_hash TEXT UNIQUE, recovery_secret TEXT, merged_into TEXT, created_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS sessions (
       hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, secret TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS connections (
       user_id TEXT NOT NULL REFERENCES users(id), provider TEXT NOT NULL, secret TEXT NOT NULL,
       PRIMARY KEY(user_id, provider));
@@ -50,7 +51,7 @@ export function createStore(directory) {
       invite_secret TEXT NOT NULL, worker_secret TEXT NOT NULL, worker_hash TEXT NOT NULL UNIQUE,
       webhook_secret TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued', error TEXT,
       repo TEXT, app_url TEXT, worker_url TEXT, resources TEXT NOT NULL DEFAULT '{}',
-      workspace_id TEXT, create_key TEXT, created_at INTEGER NOT NULL, UNIQUE(owner_id,create_key));
+      workspace_id TEXT, create_key TEXT, codex_ready INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, UNIQUE(owner_id,create_key));
     CREATE TABLE IF NOT EXISTS members (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), user_id TEXT NOT NULL REFERENCES users(id),
       name TEXT NOT NULL, prefix TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member',
@@ -77,6 +78,15 @@ export function createStore(directory) {
     CREATE INDEX IF NOT EXISTS members_user ON members(user_id,project_id);
     CREATE INDEX IF NOT EXISTS messages_member ON messages(member_id,created_at);
   `);
+  if (
+    !db
+      .prepare("PRAGMA table_info(projects)")
+      .all()
+      .some((column) => column.name === "codex_ready")
+  )
+    db.exec(
+      "ALTER TABLE projects ADD COLUMN codex_ready INTEGER NOT NULL DEFAULT 0",
+    );
   const get = (sql, ...args) => db.prepare(sql).get(...args);
   const all = (sql, ...args) => db.prepare(sql).all(...args);
   const run = (sql, ...args) => db.prepare(sql).run(...args);
@@ -126,6 +136,16 @@ export function createStore(directory) {
       user,
       provider,
     );
+    return row ? open(row.secret) : null;
+  }
+  function setting(name, value) {
+    if (value !== undefined)
+      run(
+        "INSERT INTO settings VALUES(?,?) ON CONFLICT(name) DO UPDATE SET secret=excluded.secret",
+        name,
+        seal(value),
+      );
+    const row = get("SELECT secret FROM settings WHERE name=?", name);
     return row ? open(row.secret) : null;
   }
   function guest(name = "Teammate") {
@@ -211,6 +231,7 @@ export function createStore(directory) {
     seal,
     open,
     connection,
+    setting,
     guest,
     session,
     mergeUsers,

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, cp, mkdir, writeFile } from "node:fs/promises";
 import { c as archive } from "tar";
 import { createStore, id, token, digest, now } from "../store.mjs";
 import { createProvisioner } from "../provision.mjs";
@@ -38,8 +38,15 @@ test("provisioning retries reuse repository/services/volume and PR environments 
   );
   const template = new URL("../template/", import.meta.url).pathname,
     tarball = directory + "/repo.tgz";
+  const sourceFixture = directory + "/fixture";
+  await cp(template, sourceFixture, { recursive: true });
+  await mkdir(sourceFixture + "/app/.railway");
+  await writeFile(
+    sourceFixture + "/app/.railway/railway.ts",
+    'throw new Error("Source-controlled IaC must never run on the platform");',
+  );
   await archive(
-    { gzip: true, cwd: template, prefix: "repository", file: tarball },
+    { gzip: true, cwd: sourceFixture, prefix: "repository", file: tarball },
     ["."],
   );
   const bytes = await readFile(tarball);
@@ -193,7 +200,12 @@ test("provisioning retries reuse repository/services/volume and PR environments 
       assert.equal(options.env.GH_TOKEN, undefined);
       assert.equal(options.env.OPENAI_API_KEY, undefined);
       uploads.push(args.at(-1));
-      if (args.at(-1).endsWith("/app"))
+      if (!args.at(-1).endsWith("project-worker/"))
+        await assert.rejects(readFile(args.at(-1) + "/.railway/railway.ts"), {
+          code: "ENOENT",
+        });
+      assert.equal(options.cwd, directory);
+      if (!args.at(-1).endsWith("project-worker/"))
         assert.ok(
           (await readFile(args.at(-1) + "/package.json", "utf8")).includes(
             "vite",

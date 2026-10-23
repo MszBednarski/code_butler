@@ -46,12 +46,11 @@ export function installAuth(app, config, store, provider) {
     next();
   });
   const begin = (name, clientId, authorize, scopes) => (req, res) => {
+    clientId = config[name === "github" ? "githubClientId" : "railwayClientId"];
     if (!clientId)
-      return res
-        .status(503)
-        .json({
-          error: `${name === "github" ? "GitHub" : "Railway"} connection has not been configured by the Butler operator yet.`,
-        });
+      return res.status(503).json({
+        error: `${name === "github" ? "GitHub" : "Railway"} connection has not been configured by the Butler operator yet.`,
+      });
     if (name === "railway" && !req.account?.github_id)
       return res.redirect(
         `/auth/github?returnTo=${encodeURIComponent(safeReturn(req.query.returnTo))}`,
@@ -252,11 +251,9 @@ export function installAuth(app, config, store, provider) {
       digest(req.body.token),
     );
     if (!user)
-      return res
-        .status(403)
-        .json({
-          error: "This private sign-in link has expired or was replaced.",
-        });
+      return res.status(403).json({
+        error: "This private sign-in link has expired or was replaced.",
+      });
     for (let hop = 0; user.merged_into && hop < 10; hop++)
       user = store.get("SELECT * FROM users WHERE id=?", user.merged_into);
     cookie(res, config, "butler_account", store.session(user.id));
@@ -264,12 +261,10 @@ export function installAuth(app, config, store, provider) {
   });
   app.post("/api/auth/email", async (req, res) => {
     if (!config.emailKey || !config.emailFrom)
-      return res
-        .status(503)
-        .json({
-          error:
-            "Email sign-in is not configured. Save your private sign-in link instead.",
-        });
+      return res.status(503).json({
+        error:
+          "Email sign-in is not configured. Save your private sign-in link instead.",
+      });
     const email = String(req.body?.email || "")
       .trim()
       .toLowerCase();
@@ -318,11 +313,9 @@ export function installAuth(app, config, store, provider) {
           )
         : null;
     if (!link)
-      return res
-        .status(400)
-        .json({
-          error: "Sign-in link expired. Request a new link from Butler.",
-        });
+      return res.status(400).json({
+        error: "Sign-in link expired. Request a new link from Butler.",
+      });
     store.run("DELETE FROM email_links WHERE hash=?", link.hash);
     // Link a guest only in the browser that requested the email. An attacker
     // must not attach a victim's email to an attacker-controlled session.

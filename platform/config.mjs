@@ -36,6 +36,8 @@ export function configuration(env = process.env) {
     githubClientSecret: env.GITHUB_OAUTH_CLIENT_SECRET,
     railwayClientId: env.RAILWAY_OAUTH_CLIENT_ID,
     railwayClientSecret: env.RAILWAY_OAUTH_CLIENT_SECRET,
+    setupToken: env.SETUP_TOKEN,
+    operatorWorkspaceId: env.OPERATOR_WORKSPACE_ID,
     emailKey: env.RESEND_API_KEY,
     emailFrom: env.EMAIL_FROM,
     githubApi: "https://api.github.com",

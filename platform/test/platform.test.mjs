@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { createPlatform } from "../server.mjs";
 import { createStore, id, token, now, digest } from "../store.mjs";
 
-async function fixture(t) {
+async function fixture(t, overrides = {}) {
   const dir = await mkdtemp(`${tmpdir()}/butler-platform-`),
     store = createStore(dir);
   const config = {
@@ -20,6 +20,7 @@ async function fixture(t) {
     emailKey: "mail-key",
     emailFrom: "team@example.test",
     commit: "test",
+    ...overrides,
   };
   let sentEmail,
     profile = { id: 4242, login: "test-lead", name: "Test Lead" };
@@ -453,4 +454,65 @@ test("invite replacement prevents new claims through old links while existing me
     (await f.call(`/api/projects/${p.id}`, undefined, member)).status,
     200,
   );
+});
+
+test("private installation setup saves encrypted provider credentials, applies them immediately, and can be revoked", async (t) => {
+  const bootstrap = token(),
+    f = await fixture(t, {
+      setupToken: bootstrap,
+      githubClientId: undefined,
+      githubClientSecret: undefined,
+      railwayClientId: undefined,
+      railwayClientSecret: undefined,
+    });
+  assert.equal(
+    (await f.call("/api/setup/status", { token: "wrong" }, "")).status,
+    403,
+  );
+  const first = await (
+    await f.call("/api/setup/status", { token: bootstrap }, "")
+  ).json();
+  assert.equal(first.github, false);
+  const saved = await f.call(
+    "/api/setup/save",
+    {
+      token: bootstrap,
+      provider: "github",
+      clientId: "github-fixture-client",
+      clientSecret: "github-fixture-private-secret",
+    },
+    "",
+  );
+  assert.equal(saved.status, 200);
+  assert.equal((await saved.json()).github, true);
+  const begin = await f.call("/auth/github", undefined, "");
+  assert.equal(
+    new URL(begin.headers.get("location")).searchParams.get("client_id"),
+    "github-fixture-client",
+  );
+  const status = JSON.stringify(
+    await (await f.call("/api/setup/status", { token: bootstrap }, "")).json(),
+  );
+  assert.ok(!status.includes("github-fixture-private-secret"));
+  const reboot = {
+    ...f.config,
+    githubClientId: undefined,
+    githubClientSecret: undefined,
+  };
+  createPlatform(reboot, {
+    store: f.store,
+    provider: f.provider,
+    provisioner: {},
+  });
+  assert.equal(reboot.githubClientId, "github-fixture-client");
+  await f.call("/api/setup/finish", { token: bootstrap }, "");
+  assert.equal(
+    (await f.call("/api/setup/status", { token: bootstrap }, "")).status,
+    403,
+  );
+  createPlatform(
+    { ...f.config },
+    { store: f.store, provider: f.provider, provisioner: {} },
+  );
+  assert.equal(f.store.setting("setup-enabled"), false);
 });

@@ -18,7 +18,8 @@ export function createAgent({
     WORKER_SECRET: secret,
   };
   let stopping = false,
-    child;
+    child,
+    reportedAuth;
   async function api(endpoint, body) {
     const response = await request(`${platform}/api/worker${endpoint}`, {
       method: body === undefined ? "GET" : "POST",
@@ -267,7 +268,13 @@ export function createAgent({
     });
   }
   async function codeOne() {
-    if (stopping || (await auth.status()).state !== "connected") return;
+    if (stopping) return;
+    const connected = (await auth.status()).state === "connected";
+    if (reportedAuth !== connected) {
+      await api("/auth", { connected });
+      reportedAuth = connected;
+    }
+    if (!connected) return;
     const { job } = await api("/claim", {});
     if (!job) return;
     const heartbeat = setInterval(
