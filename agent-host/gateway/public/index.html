@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#15241f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="icon" href="/icon-192.png">
+  <title>Your agent · Pocket Butler</title>
+  <style>
+    :root { color-scheme: dark; --app-height: 100dvh; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #101613; color: #ecf3ec; }
+    * { box-sizing: border-box; }
+    body { margin: 0; height: var(--app-height); display: flex; flex-direction: column; overflow: hidden; }
+    header { padding: max(10px, env(safe-area-inset-top)) 14px 10px; background: #15241f; display: flex; align-items: center; gap: 16px; flex-shrink: 0; border-bottom: 1px solid #2b3b32; }
+    .identity { flex: 1; min-width: 0; font-size: 14px; overflow: hidden; text-overflow: ellipsis; }
+    .identity span { color: #90aa9a; margin-right: 6px; }
+    a { color: #c4e1c5; text-decoration: none; font-size: 13px; }
+    button { font: inherit; cursor: pointer; touch-action: manipulation; }
+    header button { border: 0; background: transparent; color: #a4b6aa; font-size: 12px; padding: 8px 0; }
+    iframe { display: block; width: 100%; flex: 1; min-height: 0; border: 0; background: #000; }
+    footer { flex-shrink: 0; position: sticky; bottom: 0; background: #15241f; border-top: 1px solid #2b3b32; padding: 10px 12px max(10px, env(safe-area-inset-bottom)); }
+    #composer { display: flex; align-items: flex-end; gap: 8px; }
+    textarea { font: inherit; font-size: 16px; line-height: 1.4; resize: none; width: 100%; min-height: 46px; max-height: min(180px, 28dvh); border: 1px solid #3e5145; border-radius: 12px; background: #101b15; color: #f4f7f2; padding: 11px 12px; }
+    textarea:focus { outline: 2px solid #8abb8e; outline-offset: -1px; }
+    #send { height: 46px; padding: 0 18px; border: 0; border-radius: 12px; background: #c3e4b8; color: #122014; font-weight: 650; }
+    #send:disabled { opacity: .5; }
+    .keys { display: flex; gap: 6px; margin-top: 9px; overflow-x: auto; }
+    .keys button { flex: 1; min-width: 40px; height: 36px; border: 1px solid #35483c; border-radius: 7px; background: #1d3025; color: #c7d6c9; font-size: 12px; white-space: nowrap; }
+    #status { font-size: 12px; color: #d6caa5; margin: 6px 2px 0; }
+    #status:empty { display: none; }
+    @media (min-width: 850px) { footer { padding-left: max(16px, calc((100vw - 1000px)/2)); padding-right: max(16px, calc((100vw - 1000px)/2)); } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="identity"><span>✦</span> <strong id="name">Your agent</strong></div>
+    <a id="app-link" target="_blank" rel="noopener noreferrer">App ↗</a>
+    <a id="prs-link" target="_blank" rel="noopener noreferrer">PRs ↗</a>
+    <form action="/logout" method="post"><button type="submit">Logout</button></form>
+  </header>
+  <iframe src="/term/" title="Your personal coding agent" allow="clipboard-read; clipboard-write"></iframe>
+  <footer>
+    <form id="composer">
+      <textarea id="text" rows="1" maxlength="20000" placeholder="Tell your agent…" aria-label="Tell your agent" autocapitalize="sentences" spellcheck="true"></textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+    <div class="keys" aria-label="Terminal keys">
+      <button type="button" data-key="Escape">Esc</button>
+      <button type="button" data-key="Up" aria-label="Up arrow">↑</button>
+      <button type="button" data-key="Down" aria-label="Down arrow">↓</button>
+      <button type="button" data-key="Tab">Tab</button>
+      <button type="button" data-key="BTab" aria-label="Shift Tab">⇧ Tab</button>
+      <button type="button" data-key="Enter">Enter</button>
+      <button type="button" data-key="C-c">Ctrl-C</button>
+    </div>
+    <p id="status" role="status" aria-live="polite"></p>
+  </footer>
+  <script>
+    const textarea = document.getElementById('text');
+    const send = document.getElementById('send');
+    const status = document.getElementById('status');
+    const resize = () => { textarea.style.height = 'auto'; textarea.style.height = textarea.scrollHeight + 'px'; };
+    textarea.addEventListener('input', resize);
+    function fitViewport() {
+      document.documentElement.style.setProperty('--app-height', (window.visualViewport?.height || window.innerHeight) + 'px');
+    }
+    window.visualViewport?.addEventListener('resize', fitViewport);
+    window.addEventListener('resize', fitViewport);
+    fitViewport();
+    async function api(route, body) {
+      const response = await fetch(route, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (response.status === 401) { location.assign('/login'); throw new Error('Please sign in again.'); }
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        throw new Error(result.error || 'Could not send. Please try again.');
+      }
+    }
+    document.getElementById('composer').addEventListener('submit', async event => {
+      event.preventDefault();
+      const text = textarea.value;
+      if (!text.trim() || send.disabled) return;
+      send.disabled = true;
+      status.textContent = 'Sending…';
+      try {
+        await api('/api/send', { text });
+        if (textarea.value === text) textarea.value = '';
+        resize();
+        status.textContent = '';
+      } catch (error) { status.textContent = error.message; }
+      finally { send.disabled = false; }
+    });
+    textarea.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        document.getElementById('composer').requestSubmit();
+      }
+    });
+    document.querySelectorAll('[data-key]').forEach(button => {
+      button.addEventListener('pointerdown', event => event.preventDefault());
+      button.addEventListener('click', async () => {
+        try { await api('/api/key', { key: button.dataset.key }); status.textContent = ''; }
+        catch (error) { status.textContent = error.message; }
+      });
+    });
+    fetch('/api/me').then(async response => {
+      if (response.status === 401) { location.assign('/login'); return; }
+      if (!response.ok) throw new Error('Could not load your session. Reload the page.');
+      const me = await response.json();
+      document.getElementById('name').textContent = me.name;
+      document.title = me.name + ' · Pocket Butler';
+      document.getElementById('app-link').href = me.appUrl;
+      document.getElementById('prs-link').href = 'https://github.com/' + me.repo + '/pulls';
+    }).catch(error => { status.textContent = error.message; });
+  </script>
+</body>
+</html>
