@@ -48,6 +48,14 @@ export function installWorkerApi(app, config, store, provider) {
         req.project.state === "ready" ? store.claimJob(req.project.id) : null,
     }),
   );
+  app.get("/api/worker/pending-pulls", (req, res) =>
+    res.json(
+      store.all(
+        "SELECT DISTINCT pr_number AS number FROM jobs WHERE project_id=? AND pr_number IS NOT NULL AND state IN ('reviewing','needs_attention','preview_failed')",
+        req.project.id,
+      ),
+    ),
+  );
   app.post("/api/worker/jobs/:jobId/heartbeat", (req, res) => {
     const job = store.get(
       "SELECT id FROM jobs WHERE id=? AND project_id=? AND state=?",
@@ -105,6 +113,12 @@ export function installWorkerApi(app, config, store, provider) {
       ? `https://github.com/${req.project.repo}/pull/${pr}`
       : null;
     store.transaction(() => {
+      if (/^[a-f0-9-]{36}$/.test(req.body.threadId || ""))
+        store.run(
+          "UPDATE members SET thread_id=? WHERE id=?",
+          req.body.threadId,
+          job.member_id,
+        );
       if (!["working", "queued"].includes(job.state)) return;
       store.run(
         "UPDATE jobs SET state=?,result=?,error=?,pr_number=?,pr_url=?,updated_at=?,lease_until=NULL WHERE id=?",
@@ -293,8 +307,17 @@ export function installWorkerApi(app, config, store, provider) {
           !SHA.test(b.base || "")
         )
           return res.status(400).json({ error: "Invalid reviewed revision." });
-        const pr = await github(`/pulls/${b.number}`),
-          main = await github("/git/ref/heads/main");
+        const pr = await github(`/pulls/${b.number}`);
+        if (
+          pr.state === "closed" &&
+          pr.merged &&
+          pr.head.sha === b.sha &&
+          SHA.test(pr.merge_commit_sha || "")
+        ) {
+          store.recordMerge(project.id, b.number, pr.merge_commit_sha);
+          return res.json({ merged: true, sha: pr.merge_commit_sha });
+        }
+        const main = await github("/git/ref/heads/main");
         if (
           pr.state !== "open" ||
           pr.draft ||
@@ -323,19 +346,7 @@ export function installWorkerApi(app, config, store, provider) {
           return res
             .status(409)
             .json({ error: result.message || "The PR could not be merged." });
-        store.run(
-          "UPDATE jobs SET state='deploying',error=NULL,merge_sha=?,updated_at=? WHERE project_id=? AND pr_number=? AND state IN ('reviewing','needs_attention','preview_failed')",
-          result.sha,
-          now(),
-          project.id,
-          b.number,
-        );
-        store.enqueue(
-          project.id,
-          "deploy",
-          `main:${project.id}:${result.sha}`,
-          { sha: result.sha },
-        );
+        store.recordMerge(project.id, b.number, result.sha);
         // Keep the preview for the team to inspect; a closed unmerged PR's
         // environment is cleaned up by its webhook.
         break;

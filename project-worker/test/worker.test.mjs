@@ -108,3 +108,72 @@ test("worker exposes health publicly and protects Codex device authorization wit
   assert.equal((await response.json()).code, "ABCD-EFGH");
   assert.equal(started, 1);
 });
+
+test("a failed proposed merge build is recorded and does not starve later PRs", async (t) => {
+  const { mkdtemp, rm, mkdir } = await import("node:fs/promises"),
+    { save, load } = await import("../runtime.mjs"),
+    { createReviewer } = await import("../reviewer.mjs");
+  const dir = await mkdtemp("/tmp/butler-review-");
+  await mkdir(dir + "/reviews");
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const base = "a".repeat(40),
+    candidate = "c".repeat(40),
+    pulls = [1, 2].map((number) => ({
+      number,
+      state: "open",
+      draft: false,
+      title: "Request " + number,
+      labels: [],
+      head: {
+        sha: String(number).repeat(40),
+        ref: "member/task-" + number,
+        repo: { full_name: "team/project" },
+      },
+      base: { ref: "main", repo: { full_name: "team/project" } },
+    }));
+  for (const pr of pulls)
+    await save(`${dir}/reviews/${pr.number}.json`, {
+      key: `${pr.head.sha}:${base}`,
+      decision: "reviewed",
+      verdict: { decision: "approve", summary: "Fine", findings: [] },
+    });
+  let active,
+    blocked = [];
+  const agent = {
+    stopping: false,
+    github: async (operation, b) => {
+      if (operation === "pulls") return pulls;
+      if (operation === "pull") {
+        active = b.number;
+        return pulls.find((p) => p.number === b.number);
+      }
+      if (operation === "main") return { object: { sha: base } };
+      if (operation === "reviews") return [];
+      if (operation === "block") {
+        blocked.push(b.number);
+        return {};
+      }
+      return {};
+    },
+    git: async (args) => ({
+      code: 0,
+      stdout:
+        args[0] === "rev-parse" && args[1] === "HEAD"
+          ? candidate
+          : args[0] === "ls-files"
+            ? ""
+            : "",
+    }),
+    build: async () => {
+      if (active === 1) throw new Error("Compilation failed.");
+    },
+  };
+  const reviewer = createReviewer(agent, {
+    dataDir: dir,
+    auth: { status: async () => ({ state: "connected" }) },
+  });
+  await reviewer.one();
+  assert.deepEqual(blocked, [1]);
+  assert.equal((await load(`${dir}/reviews/1.json`)).decision, "block");
+  assert.equal((await load(`${dir}/reviews/2.json`)).decision, "validated");
+});

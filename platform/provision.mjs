@@ -598,11 +598,34 @@ export function createProvisioner(
     }
     return { ...app, environment: saved.environment_id, domain: saved.url };
   }
+  async function markPublished(project, sha) {
+    if (!SHA.test(sha || "")) return;
+    for (const job of store.all(
+      "SELECT id,merge_sha FROM jobs WHERE project_id=? AND state IN ('deploying','publish_failed')",
+      project.id,
+    )) {
+      if (!job.merge_sha) continue;
+      const comparison = await provider.github(
+        project.owner_id,
+        `/repos/${project.repo}/compare/${job.merge_sha}...${sha}`,
+      );
+      if (["ahead", "identical"].includes(comparison.status))
+        store.run(
+          "UPDATE jobs SET state='live',error=NULL,updated_at=? WHERE id=?",
+          now(),
+          job.id,
+        );
+    }
+  }
   async function deploy(project, payload) {
     const { sha, prNumber } = payload;
     if (!SHA.test(sha)) throw new Error("Invalid deployment revision.");
     const app = resources(project).app;
     if (!app) throw new Error("Project hosting is still being prepared.");
+    if (!prNumber && resources(project).deployedSha === sha) {
+      await markPublished(project, sha);
+      return;
+    }
     if (prNumber) {
       const pr = await provider.github(
         project.owner_id,
@@ -614,7 +637,10 @@ export function createProvisioner(
         project.owner_id,
         `/repos/${project.repo}/git/ref/heads/main`,
       );
-      if (main.object.sha !== sha) return;
+      if (main.object.sha !== sha) {
+        await markPublished(project, resources(project).deployedSha);
+        return;
+      }
     }
     const target = prNumber ? await previewResource(project, prNumber) : app;
     const repository = await source(project, sha);
@@ -689,22 +715,8 @@ export function createProvisioner(
           },
         );
     } else {
-      for (const job of store.all(
-        "SELECT id,merge_sha FROM jobs WHERE project_id=? AND state IN ('deploying','publish_failed')",
-        project.id,
-      )) {
-        if (!job.merge_sha) continue;
-        const comparison = await provider.github(
-          project.owner_id,
-          `/repos/${project.repo}/compare/${job.merge_sha}...${sha}`,
-        );
-        if (["ahead", "identical"].includes(comparison.status))
-          store.run(
-            "UPDATE jobs SET state='live',error=NULL,updated_at=? WHERE id=?",
-            now(),
-            job.id,
-          );
-      }
+      save(project, { deployedSha: sha });
+      await markPublished(project, sha);
     }
   }
   async function cleanup(project, { prNumber }) {

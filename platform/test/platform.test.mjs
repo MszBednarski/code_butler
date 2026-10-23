@@ -516,3 +516,106 @@ test("private installation setup saves encrypted provider credentials, applies t
   );
   assert.equal(f.store.setting("setup-enabled"), false);
 });
+
+test("linking a verified email account to GitHub preserves future email sign-in and its existing workspaces", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    inv = await f.invite(p.id),
+    guestCookie = await f.join(inv.url, "Maya");
+  const guest = await (
+    await f.call("/api/session", undefined, guestCookie)
+  ).json();
+  f.store.run(
+    "UPDATE users SET email=? WHERE id=?",
+    "maya@example.test",
+    guest.user.id,
+  );
+  f.store.mergeUsers(guest.user.id, f.lead.id);
+  assert.equal(
+    f.store.get("SELECT email FROM users WHERE id=?", f.lead.id).email,
+    "maya@example.test",
+  );
+  await f.call("/api/auth/email", { email: "maya@example.test" }, "");
+  const link = f.email().text.match(/https?:\/\/\S+/)[0],
+    secret = new URL(link).hash.slice(7);
+  const signed = await f.call(
+    "/api/auth/email/complete",
+    { token: secret },
+    "",
+  );
+  const cookie = signed.headers.get("set-cookie").split(";")[0];
+  const account = await (
+    await f.call("/api/session", undefined, cookie)
+  ).json();
+  assert.equal(account.user.id, f.lead.id);
+  const projects = await (
+    await f.call("/api/projects", undefined, cookie)
+  ).json();
+  assert.ok(projects.projects.some((project) => project.id === p.id));
+  const other = f.store.guest("Other");
+  f.store.run(
+    "UPDATE users SET email=? WHERE id=?",
+    "other@example.test",
+    other.id,
+  );
+  f.store.mergeUsers(other.id, f.lead.id);
+  assert.equal(
+    f.store.get(
+      "SELECT user_id FROM email_aliases WHERE email=?",
+      "other@example.test",
+    ).user_id,
+    f.lead.id,
+  );
+});
+
+test("merge reconciliation is idempotent even when publication finished before the response was recorded", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    job = f.store.get("SELECT * FROM jobs WHERE project_id=?", p.id),
+    sha = "a".repeat(40),
+    later = "b".repeat(40);
+  f.store.run(
+    "UPDATE jobs SET state='reviewing',pr_number=7 WHERE id=?",
+    job.id,
+  );
+  f.store.run(
+    "UPDATE projects SET resources=? WHERE id=?",
+    JSON.stringify({ deployedSha: sha }),
+    p.id,
+  );
+  f.store.recordMerge(p.id, 7, sha);
+  assert.equal(
+    f.store.get("SELECT state FROM jobs WHERE id=?", job.id).state,
+    "live",
+  );
+  f.store.run(
+    "UPDATE jobs SET state='reviewing',merge_sha=NULL WHERE id=?",
+    job.id,
+  );
+  f.store.run(
+    "UPDATE projects SET resources=? WHERE id=?",
+    JSON.stringify({ deployedSha: later }),
+    p.id,
+  );
+  f.store.enqueue(p.id, "deploy", `main:${p.id}:${sha}`, { sha });
+  f.store.run(
+    "UPDATE tasks SET state='done' WHERE dedupe_key=?",
+    `main:${p.id}:${sha}`,
+  );
+  f.store.recordMerge(p.id, 7, sha);
+  assert.equal(
+    f.store.get(
+      "SELECT state FROM tasks WHERE dedupe_key=?",
+      `main:${p.id}:${sha}`,
+    ).state,
+    "queued",
+  );
+  f.store.recordMerge(p.id, 7, sha);
+  assert.equal(
+    f.store.get(
+      "SELECT COUNT(*) AS n FROM tasks WHERE dedupe_key=?",
+      `main:${p.id}:${sha}`,
+    ).n,
+    1,
+  );
+});

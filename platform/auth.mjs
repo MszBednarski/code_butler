@@ -320,7 +320,11 @@ export function installAuth(app, config, store, provider) {
     // Link a guest only in the browser that requested the email. An attacker
     // must not attach a victim's email to an attacker-controlled session.
     const source = req.account?.id === link.user_id ? link.user_id : null;
-    let user = store.get("SELECT * FROM users WHERE email=?", link.email);
+    let user = store.get(
+      "SELECT * FROM users WHERE email=? OR id IN (SELECT user_id FROM email_aliases WHERE email=?) LIMIT 1",
+      link.email,
+      link.email,
+    );
     if (user) store.mergeUsers(source, user.id);
     else {
       user = source

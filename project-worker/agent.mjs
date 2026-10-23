@@ -166,6 +166,13 @@ export function createAgent({
       throw new Error(
         "Your workspace branch changed. Existing work was preserved; ask the lead to inspect it.",
       );
+    if (
+      recovery.phase === "started" &&
+      !(await git(["status", "--porcelain"], cwd)).stdout.trim()
+    )
+      await git(["merge", "--no-commit", "--no-ff", "origin/main"], cwd, {
+        allowFailure: true,
+      });
     await writeFile(
       `${home}/.butler-task.md`,
       `Request: ${job.text}\nJob: ${job.id}\nBranch: ${branch}\nPreserve existing edits. The Butler controller publishes and reviews this request.\n`,
@@ -175,7 +182,9 @@ export function createAgent({
     if (!["edited", "pushed"].includes(recovery.phase)) {
       const prompt = `You are ${member.name}'s personal Pocket Butler coding agent. Work only in this project's app/ directory.\nRequest id: ${job.id}. This request may be recovering after a process restart: inspect existing edits and $HOME/.butler-task.md first and preserve completed work.\nMake the requested website change. Use the files in this checkout as the source of truth. Do not run gh, commit, push, merge, change branches/remotes, inspect other workspaces, or read account credentials. A controller independently builds, commits, opens a PR, reviews and publishes your local changes. Keep the final reply short and say what changed; do not claim publication has already happened. Do not delegate.\n\nTeammate's request:\n${job.text}`;
       const output = `${dataDir}/jobs/${job.id}.txt`;
-      const thread = recovery.threadId || member.thread_id;
+      const localThread = await load(`${home}/.butler-conversation.json`);
+      const thread =
+        recovery.threadId || localThread.threadId || member.thread_id;
       const args = [
         "exec",
         ...(thread ? ["resume", thread] : []),
@@ -202,11 +211,18 @@ export function createAgent({
               threadPromise = threadPromise
                 .then(async () => {
                   await save(file, recovery);
+                  await save(`${home}/.butler-conversation.json`, {
+                    threadId: event.thread_id,
+                  });
                   await api(`/jobs/${job.id}/thread`, {
                     threadId: event.thread_id,
                   });
                 })
-                .catch(() => {});
+                .catch(() => {
+                  console.error(
+                    "[agent] Conversation is saved locally; the result will synchronize it with Butler.",
+                  );
+                });
             }
           } catch {}
         },
@@ -225,7 +241,10 @@ export function createAgent({
     const changed = await git(["diff", "--cached", "--quiet"], cwd, {
       allowFailure: true,
     });
-    if (changed.code !== 0) {
+    const merging = await git(["rev-parse", "--verify", "MERGE_HEAD"], cwd, {
+      allowFailure: true,
+    });
+    if (changed.code !== 0 || merging.code === 0) {
       await git(["diff", "--cached", "--check"], cwd);
       await git(
         [
@@ -244,6 +263,7 @@ export function createAgent({
     if (sha === (await git(["rev-parse", "origin/main"], cwd)).stdout.trim()) {
       await api(`/jobs/${job.id}/result`, {
         state: "unchanged",
+        threadId: recovery.threadId,
         text: final || "The website already matches this request.",
       });
       return;
@@ -261,6 +281,7 @@ export function createAgent({
     });
     await api(`/jobs/${job.id}/result`, {
       state: "reviewing",
+      threadId: recovery.threadId,
       text: `${final || "Your change is ready."}\n\nI’ve sent it for review. The preview and live website will update here.`,
       branch,
       sha,
@@ -289,6 +310,7 @@ export function createAgent({
       const recovery = await load(`${dataDir}/jobs/${job.id}.json`);
       await api(`/jobs/${job.id}/result`, {
         state: "failed",
+        threadId: recovery.threadId,
         branch: recovery.branch,
         text: "This request stopped before it could be published. Your edits and conversation were saved. Ask your agent to continue, or ask the lead to check the workspace.",
       });

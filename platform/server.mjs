@@ -104,6 +104,16 @@ export function createPlatform(
         );
       if (kind === "pull_request" && Number.isSafeInteger(event.number)) {
         if (
+          event.action === "closed" &&
+          event.pull_request.merged &&
+          /^[a-f0-9]{40}$/.test(event.pull_request.merge_commit_sha || "")
+        )
+          store.recordMerge(
+            project.id,
+            event.number,
+            event.pull_request.merge_commit_sha,
+          );
+        if (
           ["opened", "reopened", "synchronize"].includes(event.action) &&
           event.pull_request.base.ref === "main"
         )

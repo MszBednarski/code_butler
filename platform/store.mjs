@@ -37,6 +37,7 @@ export function createStore(directory) {
     CREATE TABLE IF NOT EXISTS sessions (
       hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, secret TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS email_aliases (email TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id));
     CREATE TABLE IF NOT EXISTS connections (
       user_id TEXT NOT NULL REFERENCES users(id), provider TEXT NOT NULL, secret TEXT NOT NULL,
       PRIMARY KEY(user_id, provider));
@@ -170,7 +171,28 @@ export function createStore(directory) {
   }
   function mergeUsers(from, to) {
     if (!from || from === to) return;
+    const source = get("SELECT * FROM users WHERE id=?", from),
+      target = get("SELECT * FROM users WHERE id=?", to);
+    if (
+      source.github_id &&
+      target.github_id &&
+      source.github_id !== target.github_id
+    ) {
+      const error = new Error(
+        "This email belongs to a different GitHub account. Sign out to use that account, or choose another email.",
+      );
+      error.status = 409;
+      error.provider = "Account";
+      throw error;
+    }
     transaction(() => {
+      run("UPDATE email_aliases SET user_id=? WHERE user_id=?", to, from);
+      if (source.email)
+        run(
+          "INSERT INTO email_aliases VALUES(?,?) ON CONFLICT(email) DO UPDATE SET user_id=excluded.user_id",
+          source.email,
+          to,
+        );
       run("UPDATE members SET user_id=? WHERE user_id=?", to, from);
       run("UPDATE projects SET owner_id=? WHERE owner_id=?", to, from);
       run("UPDATE sessions SET user_id=? WHERE user_id=?", to, from);
@@ -185,6 +207,13 @@ export function createStore(directory) {
         "UPDATE users SET github_id=NULL,github_login=NULL,email=NULL,merged_into=? WHERE id=?",
         to,
         from,
+      );
+      run(
+        "UPDATE users SET github_id=COALESCE(github_id,?),github_login=COALESCE(github_login,?),email=COALESCE(email,?) WHERE id=?",
+        source.github_id,
+        source.github_login,
+        source.email,
+        to,
       );
     });
   }
@@ -222,6 +251,32 @@ export function createStore(directory) {
       };
     });
   }
+  function recordMerge(project, number, sha) {
+    return transaction(() => {
+      const resources = JSON.parse(
+        get("SELECT resources FROM projects WHERE id=?", project).resources,
+      );
+      const state = resources.deployedSha === sha ? "live" : "deploying";
+      run(
+        "UPDATE jobs SET state=?,error=NULL,merge_sha=?,updated_at=? WHERE project_id=? AND pr_number=? AND state IN ('reviewing','needs_attention','preview_failed','deploying','publish_failed')",
+        state,
+        sha,
+        now(),
+        project,
+        number,
+      );
+      if (state !== "live") {
+        const key = `main:${project}:${sha}`;
+        enqueue(project, "deploy", key, { sha });
+        run(
+          "UPDATE tasks SET state='queued',attempts=0,error=NULL,available_at=? WHERE dedupe_key=? AND state='done'",
+          now(),
+          key,
+        );
+      }
+      return state;
+    });
+  }
   return {
     db,
     get,
@@ -237,6 +292,7 @@ export function createStore(directory) {
     mergeUsers,
     enqueue,
     claimJob,
+    recordMerge,
     close: () => db.close(),
   };
 }

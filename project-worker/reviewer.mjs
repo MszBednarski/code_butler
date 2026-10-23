@@ -43,6 +43,7 @@ export function createReviewer(agent, { dataDir = "/data", auth } = {}) {
         key = `${pr.head.sha}:${base}`,
         file = `${dataDir}/reviews/${pr.number}.json`;
       const cached = await load(file);
+      if (cached.key === key && cached.retryAt > Date.now()) continue;
       if (
         cached.key === key &&
         ["block", "merged", "validated"].includes(cached.decision)
@@ -131,7 +132,25 @@ export function createReviewer(agent, { dataDir = "/data", auth } = {}) {
         }
         await save(file, { key, verdict, decision: "reviewed" });
       }
-      await agent.build(directory, home);
+      try {
+        await agent.build(directory, home);
+      } catch (error) {
+        if (agent.stopping) return;
+        if (/EAI_AGAIN|ECONNRESET|ENOTFOUND|ETIMEDOUT/.test(error.output || ""))
+          await save(file, {
+            key,
+            verdict,
+            decision: "retry",
+            retryAt: Date.now() + 60000,
+          });
+        else
+          await block(
+            pr,
+            key,
+            "The proposed merge does not pass the app checks. Ask your agent to fix the build against current main; existing work is preserved.",
+          );
+        continue;
+      }
       const current = await agent.github("pull", { number: pr.number });
       if (
         !mergeAllowed(
@@ -184,7 +203,19 @@ export function createReviewer(agent, { dataDir = "/data", auth } = {}) {
   }
   async function finish() {
     if (agent.stopping || (await auth.status()).state !== "connected") return;
-    for (const pr of await agent.github("pulls")) {
+    const opened = await agent.github("pulls"),
+      openNumbers = new Set(opened.map((pr) => pr.number));
+    for (const pending of await agent.api("/pending-pulls")) {
+      if (openNumbers.has(pending.number)) continue;
+      const pr = await agent.github("pull", { number: pending.number });
+      if (pr.state === "closed" && pr.merged && pr.merge_commit_sha)
+        await agent.github("merge", {
+          number: pr.number,
+          sha: pr.head.sha,
+          base: (await agent.github("main")).object.sha,
+        });
+    }
+    for (const pr of opened) {
       const cached = await load(`${dataDir}/reviews/${pr.number}.json`);
       if (cached.decision !== "validated" || cached.candidate !== pr.head.sha)
         continue;

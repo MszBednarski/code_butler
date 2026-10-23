@@ -149,7 +149,11 @@ test("real git transport and app builds carry a teammate request through PR revi
         await git(["commit", "-m", "Publish teammate change"]);
         await git(["push", "origin", "main"]);
         pr.state = "closed";
-        return { merged: true, sha: await sha("main") };
+        pr.merged = true;
+        pr.merge_commit_sha = await sha("main");
+        throw new Error(
+          "Simulated lost response after GitHub completed the merge",
+        );
       }
       throw new Error(`Unexpected mocked GitHub endpoint ${method} ${suffix}`);
     },
@@ -235,6 +239,15 @@ test("real git transport and app builds carry a teammate request through PR revi
       projectId,
       secret,
       auth,
+      request: (url, options) =>
+        url.endsWith("/thread")
+          ? Promise.resolve(
+              Response.json(
+                { error: "Temporary thread persistence failure" },
+                { status: 503 },
+              ),
+            )
+          : fetch(url, options),
     }),
     reviewer = createReviewer(agent, { dataDir: data, auth });
   await agent.initialize();
@@ -269,6 +282,11 @@ test("real git transport and app builds carry a teammate request through PR revi
   // Waiting for a preview must not create a new commit on every poll.
   await reviewer.one();
   assert.equal((await currentPull()).head.sha, candidate);
+  await assert.rejects(reviewer.finish(), /Something interrupted this request/);
+  assert.equal(
+    store.get("SELECT state FROM jobs WHERE id=?", job.id).state,
+    "reviewing",
+  );
   await reviewer.finish();
   assert.equal(pr.state, "closed");
   assert.equal(
@@ -286,6 +304,7 @@ test("real git transport and app builds carry a teammate request through PR revi
     ),
   );
   // A new worker object uses the same disk and resumes this member's exact conversation.
+  store.run("UPDATE members SET thread_id=NULL WHERE id=?", member.id);
   const resumed = createAgent({
     dataDir: data,
     platform: config.publicUrl,
