@@ -12,7 +12,7 @@ This deployment uses private invite links, as requested for the simplest team se
 
 `butler-agents` contains one always-on root container, `agent-host`, with one persistent volume at `/data`. PR environments are off. Each teammate has a separate HOME, git worktree, tmux session, ttyd UNIX socket, and Codex subscription login.
 
-`butler-app` contains only `web`. PR environments are on. Both services are connected to the GitHub repository on main. Initial deployments were uploaded through the CLI. End-to-end PR previews and main autodeploys remain to be verified after the shared GitHub account is authorized.
+`butler-app` contains only `web`. PR environments are on. Both services are connected to the GitHub repository on main. Initial deployments were uploaded through the CLI. The shared GitHub account is authorized and branch pushes/PR creation work. Railway previews and main autodeploys are blocked until a Railway project member has contributor access to the repository (see acceptance results).
 
 Service settings are `/agent-host` and `/app` root directories respectively. Watch patterns are `/agent-host/**` and `/app/**`. The checked-in railway.json files match Railway's schema. The Railway API currently rejects setting legacy config-file paths, so equivalent settings are applied directly to the services instead.
 
@@ -29,7 +29,7 @@ The host refuses to start in Railway without an actual mount at `/data`. The che
 - `/data/invites.json`: hashed invite secrets and member identities.
 - `/data/invite-links.json`: private links for the team lead to distribute.
 
-A restart terminates running processes. Boot recreates previously active tmux sessions and launches `codex resume --last`; it never resets a worktree. Interrupted tools may need another request to continue. The volume must be retained across deployments; deleting the volume deletes its data.
+The single volume-backed agent container has a brief service interruption when it is replaced; exact downtime has not been measured. The browser may need a reload to reattach. A restart terminates running processes. Boot recreates previously active tmux sessions and launches `codex resume --last`; it never resets a worktree. Interrupted tools may need another request to continue. The volume must be retained across deployments; deleting the volume deletes its data.
 
 ## First login
 
@@ -66,7 +66,7 @@ All three agents remain installed. Alternate launchers are `/usr/local/bin/run-a
 
 ## GitHub autodeploy connection
 
-The repo source and main branch are configured on both services, with PR environments enabled only in butler-app. If GitHub integration needs authorization, open the service → Settings → Source → Connect Repo. Authorize/install the Railway GitHub app for `MszBednarski/code_butler` if it is not visible, then select that repo and `main`. Preserve the configured root directory and watch paths. Only the app project has PR environments on; its Railway domain supplies preview domains. The token owner must be a project member for automatic PR deployments.
+The repo source and main branch are configured on both services, with PR environments enabled only in butler-app and production selected as their base. Automatic deployment triggers are blocked: the Railway account is linked to GitHub copiumnicus, which lacks contributor access to this repo. Either grant that account Write access or add a Railway account linked to repo contributor MszBednarski to both projects, then enable/create the main triggers. The GitHub login stored inside the agent container does not grant the Railway platform access. See [Railway autodeploy requirements](https://docs.railway.com/deployments/github-autodeploys#requirements-for-autodeploy). If GitHub integration needs authorization, open the service → Settings → Source → Connect Repo. Authorize/install the Railway GitHub app for `MszBednarski/code_butler` if it is not visible, then select that repo and `main`. Preserve the configured root directory and watch paths. Only the app project has PR environments on; its Railway domain supplies preview domains. The token owner must be a project member for automatic PR deployments.
 
 ## Verification
 
