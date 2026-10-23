@@ -118,6 +118,8 @@ export function startReconciler(env = process.env) {
     await cp(`${checkout}/agent-host`, staged, { recursive: true, filter: source =>
       !source.split(path.sep).includes('node_modules') && !path.basename(source).startsWith('.env') &&
       source !== `${checkout}/agent-host/railway.json` });
+    const dockerfile = await readFile(`${staged}/Dockerfile`, 'utf8');
+    await writeFile(`${staged}/Dockerfile`, `${dockerfile}\nCOPY test/ /srv/test/\nRUN ln -sf /usr/local/bin/run-agent /srv/run-agent.sh && node --test /srv/test/*.test.mjs\n`);
     const uploaded = await run('railway', ['up', '--project', ciProject, '--service', ciService,
       '--environment', ciEnvironment, '--detach', '--path-as-root', staged], {
       env: railwayEnv, timeout: 180000, logFile: `${root}/pr-${number}-docker-upload.log`
