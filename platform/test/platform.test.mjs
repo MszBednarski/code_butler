@@ -21,6 +21,7 @@ async function fixture(t, overrides = {}) {
     githubAppWebhookSecret: "fixture-hook-secret",
     railwayClientId: "rail-client",
     railwayClientSecret: "rail-secret",
+    defaultHostingProvider: "railway",
     emailKey: "mail-key",
     emailFrom: "team@example.test",
     commit: "test",

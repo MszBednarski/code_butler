@@ -163,6 +163,7 @@ test("real git transport and app builds carry a teammate request through PR revi
     frontend: "/missing",
     dataDir: path.join(dir, "platform"),
     commit: "test",
+    defaultHostingProvider: "railway",
     githubAppId: 123,
     githubAppSlug: "butler-test",
     githubAppPrivateKey: "fixture-key",

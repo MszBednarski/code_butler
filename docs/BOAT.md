@@ -1,6 +1,6 @@
-# Boat hosting pilot
+# Boat hosting
 
-Boat is an optional host for **new** teams. The Butler website and existing Railway projects keep their current addresses and storage. Open `/connect/boat` on Butler, sign in with GitHub, then follow the Boat browser sign-in. There is no API key to copy. Completing that connection selects Boat for that lead's subsequent projects. Leave `DEFAULT_HOSTING_PROVIDER` unset until a real-account pilot passes; setting it to `boat` makes Boat the default for new leads.
+Boat is the default host for **new** teams. Open Butler's regular homepage, sign in with GitHub, then follow the Boat browser sign-in in step 2. There is no special entry link, Railway signup or API key to copy. The Butler website and existing Railway projects keep their current addresses and storage. `DEFAULT_HOSTING_PROVIDER=railway` is an explicit operator override for legacy installations; leaving it unset uses Boat. The older `/connect/boat` link still works.
 
 Boat may require activation through its own checkout. The lead reviews the trial, card requirements and charges there. Butler does not accept card details or start a machine during connection. See Boat's [sign-in documentation](https://docs.boat.dev/agent-auth) and [trial terms](https://docs.boat.dev/free-trial).
 
@@ -26,4 +26,4 @@ Boat documents deletion of unsaved stopped snapshots after 14 days. Long-term ba
 
 Automated tests cover browser-auth persistence, tenant/origin checks, narrow credentials, refusal of unrestricted credentials, checkout handoff, idempotent provisioning, credential-free preview archives, preview reopen/port reuse and VM resume. Browser checks exercise the guided flow with simulated provider responses. These checks do not prove account eligibility, billing, VM startup or real public hosting.
 
-Before making Boat the default, use a real account to verify connection and scope support, project creation, Codex subscription sign-in, a request → PR → preview → reviewed merge → live app, and VM stop/resume with the same worktree, login and conversation. This real-account acceptance remains pending.
+Use a real account to verify connection and scope support, project creation, Codex subscription sign-in, a request → PR → preview → reviewed merge → live app, and VM stop/resume with the same worktree, login and conversation. This real-account acceptance remains pending; making Boat the default does not establish that these external checks have passed.

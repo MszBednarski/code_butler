@@ -5,6 +5,7 @@ import { createStore, id, token, digest, now } from "../store.mjs";
 import { createBoat, boatActions } from "../boat.mjs";
 import { createBoatProvisioner } from "../boat-provision.mjs";
 import { createPlatform } from "../server.mjs";
+import { configuration } from "../config.mjs";
 import { gunzipSync } from "node:zlib";
 
 async function fixture(t) {
@@ -26,6 +27,103 @@ async function fixture(t) {
     },
   };
 }
+test("regular onboarding defaults to Boat even with a remembered Railway connection, without moving saved projects", async (t) => {
+  assert.equal(configuration({}).defaultHostingProvider, "boat");
+  assert.equal(
+    configuration({ DEFAULT_HOSTING_PROVIDER: "railway" })
+      .defaultHostingProvider,
+    "railway",
+  );
+  const f = await fixture(t);
+  Object.assign(f.config, {
+    frontend: "/missing",
+    githubAppId: 123,
+    githubAppSlug: "butler-test",
+    githubAppPrivateKey: "fixture-key",
+    githubAppWebhookSecret: "fixture-hook",
+  });
+  f.store.run(
+    "UPDATE users SET github_id=?,github_login=? WHERE id=?",
+    "42",
+    "lead",
+    f.user.id,
+  );
+  f.store.connection(f.user.id, "github_installation", {
+    id: 99,
+    accountId: 42,
+  });
+  f.store.connection(f.user.id, "railway", {
+    access_token: "remembered-railway-fixture",
+  });
+  const platform = createPlatform(f.config, {
+    store: f.store,
+    provider: {},
+    provisioner: {},
+  });
+  await new Promise((resolve) =>
+    platform.server.listen(0, "127.0.0.1", resolve),
+  );
+  f.config.publicUrl = `http://127.0.0.1:${platform.server.address().port}`;
+  t.after(() => new Promise((resolve) => platform.server.close(resolve)));
+  const request = (path, body) =>
+    fetch(f.config.publicUrl + path, {
+      method: body === undefined ? "GET" : "POST",
+      headers: {
+        cookie: `butler_account=${f.store.session(f.user.id)}`,
+        origin: f.config.publicUrl,
+        "content-type": "application/json",
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  const fresh = await (await fetch(f.config.publicUrl + "/api/session")).json();
+  assert.equal(fresh.hostingProvider, "boat");
+  const remembered = await (await request("/api/session")).json();
+  assert.equal(remembered.connections.railway, true);
+  assert.equal(remembered.hostingProvider, "boat");
+  const missingBoat = await request("/api/projects", {
+    name: "Together",
+    description: "A team website",
+    requestKey: id(),
+    hostingProvider: "railway",
+  });
+  assert.equal(missingBoat.status, 409);
+  assert.match((await missingBoat.json()).error, /Boat/);
+  f.store.connection(f.user.id, "boat", {
+    access_token: "limited-fixture",
+    environmentId: id(),
+    expiresAt: new Date(Date.now() + 86400000).toISOString(),
+  });
+  const create = async () => {
+    const response = await request("/api/projects", {
+      name: "Together",
+      description: "A team website",
+      requestKey: id(),
+    });
+    assert.equal(response.status, 201);
+    return (await response.json()).id;
+  };
+  const saved = await create();
+  f.store.run(
+    "UPDATE projects SET hosting_provider='railway',repo=?,resources=? WHERE id=?",
+    "lead/existing",
+    '{"existing":true}',
+    saved,
+  );
+  const next = await create();
+  assert.equal(
+    f.store.get("SELECT hosting_provider FROM projects WHERE id=?", next)
+      .hosting_provider,
+    "boat",
+  );
+  assert.equal(
+    (await (await request(`/api/projects/${saved}`)).json()).hostingProvider,
+    "railway",
+  );
+  assert.deepEqual(
+    { ...f.store.get("SELECT repo,resources FROM projects WHERE id=?", saved) },
+    { repo: "lead/existing", resources: '{"existing":true}' },
+  );
+});
 test("Boat browser login survives a restart and retains only an environment-limited credential", async (t) => {
   const f = await fixture(t),
     requests = [];

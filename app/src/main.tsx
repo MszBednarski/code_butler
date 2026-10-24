@@ -61,6 +61,7 @@ type Summary = Pick<
 type Codex = { state: string; code?: string; url?: string; message?: string };
 const emptySession: Session = {
   user: null,
+  hostingProvider: "boat",
   connections: { github: false, railway: false },
   capabilities: { github: false, railway: false, email: false },
   commit: "dev",
@@ -640,7 +641,7 @@ function Dashboard({
     sessionStorage.setItem("butler-create-key", key);
     return key;
   });
-  const useBoat = session.hostingProvider === "boat";
+  const useBoat = session.hostingProvider !== "railway";
   const workspaceKey = `butler-hosting-${session.user!.id}`;
   useEffect(() => {
     let alive = true;
@@ -2279,7 +2280,7 @@ function InstallationSetup() {
                   <Icon name="railway" />
                 </span>
                 <div>
-                  <h2>2. Railway</h2>
+                  <h2>Railway (optional legacy hosting)</h2>
                   <p>
                     {status.railway
                       ? "Connected — you can update it below."
@@ -2340,12 +2341,12 @@ function InstallationSetup() {
         ) : (
           !error && <Spinner />
         )}
-        {status?.github && status.githubApp && status.railway && (
+        {status?.github && status.githubApp && (
           <div className="setup-complete">
             <Icon name="check" />
             <h2>Ready for your first team.</h2>
             <p>
-              Sign in with GitHub, connect your Railway account, and create a
+              Sign in with GitHub, connect your Boat account, and create a
               project. Codex sign-in happens inside the project.
             </p>
             <a className="button primary" href="/auth/github">

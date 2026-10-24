@@ -2,9 +2,9 @@
 
 The product direction and acceptance demo are tracked in [issue #9](https://github.com/MszBednarski/code_butler/issues/9).
 
-Pocket Butler gives a lead one place to connect GitHub, Railway and an existing Codex subscription. Teammates open an invitation, choose a name and start asking for website changes. They need no provider accounts or repository permissions.
+Pocket Butler gives a lead one place to connect GitHub, Boat and an existing Codex subscription. Teammates open an invitation, choose a name and start asking for website changes. They need no provider accounts or repository permissions.
 
-An optional [Boat hosting pilot](BOAT.md) is available for new projects through `/connect/boat`. It preserves existing Railway projects and is not the global default until real-account acceptance passes.
+[Boat hosting](BOAT.md) is the default for new projects in the regular guided setup. Existing Railway projects retain their resources. Real-account Boat acceptance is still pending.
 
 ## Run the new platform
 
@@ -16,7 +16,6 @@ docker volume create butler-platform-data
 docker run --rm -p 3000:3000 -v butler-platform-data:/data \
   -e PUBLIC_URL=http://localhost:3000 \
   -e GITHUB_OAUTH_CLIENT_ID -e GITHUB_OAUTH_CLIENT_SECRET \
-  -e RAILWAY_OAUTH_CLIENT_ID -e RAILWAY_OAUTH_CLIENT_SECRET \
   butler-platform
 ```
 
@@ -50,6 +49,8 @@ Butler deliberately does not request repository Administration solely to manage 
 
 ### Railway
 
+This connection is optional for legacy installations using `DEFAULT_HOSTING_PROVIDER=railway`. New teams use Boat's browser sign-in and do not register or authorize a Railway account.
+
 1. Railway → workspace settings → Developer → New OAuth App.
 2. Add redirect URI `PUBLIC_URL/auth/railway/callback`.
 3. Paste the client ID and secret into the Railway card on Butler’s private installation page and click Save Railway.
@@ -62,14 +63,14 @@ Optional email sign-in uses `RESEND_API_KEY` and `EMAIL_FROM`. Without it, teamm
 
 ## What happens for each team
 
-1. The lead follows one guided flow: sign in with GitHub, authorize Butler to create the project automatically, connect Railway, then describe an idea. Each screen offers one primary next action. A Railway workspace choice appears only when more than one was granted. Existing repositories never need to be selected in Butler. Drafts and the project creation key survive redirects and refreshes.
-2. Butler creates a private GitHub repo containing the web-app template. It creates separate Railway **app** and **agents** projects. The agent service has its own persistent volume; only the app project receives preview environments.
+1. The lead follows one guided flow: sign in with GitHub, authorize Butler to create the project automatically, connect Boat, then describe an idea. Each screen offers one primary next action. Existing repositories never need to be selected in Butler. Drafts and the project creation key survive redirects and refreshes.
+2. Butler creates a private GitHub repo containing the web-app template and a fresh Boat VM for the project. The worker keeps its data on the VM's persistent disk; production and PR previews run as separate app containers. Existing Railway projects continue using their recorded provider.
 3. The lead can share the QR immediately. Requests are durably queued while infrastructure is building.
 4. The same setup flow waits while Butler creates the private repository and hosting. Its final screen asks the lead to **Connect Codex**; the collaboration workspace opens after sign-in. The worker runs `codex login --device-auth`; Butler shows its authorization link and code. The lead completes sign-in in their browser. If necessary, enable device-code login in ChatGPT Settings → Security first.
-5. The login is stored under the worker's persistent `/data/codex`. Coding and reviewing use that project host's subscription login, not an OpenAI API key. GitHub and Railway connections are remembered at the account level; Codex is authorized for each newly provisioned host and retained across visits/redeploys.
+5. The login is stored under the worker's persistent `/data/codex`. Coding and reviewing use that project host's subscription login, not an OpenAI API key. GitHub and Boat connections are remembered at the account level; Codex is authorized for each newly provisioned host and retained across visits/redeploys.
 6. Each member has a persistent identity, home, git worktree and explicit Codex conversation ID. The small MVP worker runs coding and review jobs sequentially within a project. This keeps subscription use bounded by one active coding/review task and avoids conversation/auth-refresh races.
 7. The controller builds the app, commits and opens a PR. A separate reviewer conversation checks the proposed merge into current main, builds it, publishes the tested merge candidate to the PR without force-pushing, waits for a working preview and other checks, and squash-merges.
-8. Butler stages clean app copies from exact commits, strips source-controlled Railway IaC/configuration before invoking its credentialed uploader from a trusted directory, and uploads snapshots to Railway for PR previews and production. It adds preview URLs to the PR and project interface. Main publishing uses a GitHub webhook and the controller's durable deployment queue. This does not depend on GitHub Actions or Railway's separate GitHub App connection.
+8. Butler stages clean app copies from exact commits and builds them as app-only containers on the project's Boat VM. It adds public preview URLs to the PR and project interface. Main publishing uses a GitHub webhook and the controller's durable deployment queue. Legacy Railway projects retain their separate app/agent services and trusted artifact uploader.
 
 ## Recovery and access
 

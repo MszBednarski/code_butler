@@ -50,7 +50,7 @@ export function configuration(env = process.env) {
     railwayApi: "https://backboard.railway.app/graphql/v2",
     boatOrigin: "https://boat.dev",
     defaultHostingProvider:
-      env.DEFAULT_HOSTING_PROVIDER === "boat" ? "boat" : "railway",
+      env.DEFAULT_HOSTING_PROVIDER === "railway" ? "railway" : "boat",
     commit: env.RAILWAY_GIT_COMMIT_SHA || "dev",
   };
 }

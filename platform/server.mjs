@@ -249,7 +249,7 @@ export function createPlatform(
     );
   };
   const hostingFor = (user) =>
-    boatConnected(user) ? "boat" : config.defaultHostingProvider || "railway";
+    boatConnected(user) ? "boat" : config.defaultHostingProvider || "boat";
   app.get("/api/session", (req, res) => {
     const github =
       req.account && store.connection(req.account.id, "github_installation");
