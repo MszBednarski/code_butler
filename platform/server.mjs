@@ -1,5 +1,6 @@
 import {
   githubAppReady,
+  creationCredential,
   githubLoginClient,
   retireLegacyGithub,
 } from "./github-app.mjs";
@@ -287,6 +288,9 @@ export function createPlatform(
       user: publicUser(req.account),
       connections: {
         github: Boolean(github && githubAppReady(config)),
+        githubCreation: Boolean(
+          req.account && creationCredential(config, store, req.account.id),
+        ),
         railway: Boolean(
           req.account && store.connection(req.account.id, "railway"),
         ),
@@ -342,7 +346,7 @@ export function createPlatform(
     if (
       !req.account.github_id ||
       !githubAppReady(config) ||
-      !store.connection(req.account.id, "github_installation") ||
+      !creationCredential(config, store, req.account.id) ||
       !store.connection(req.account.id, hosting)
     )
       return res.status(409).json({
@@ -515,9 +519,6 @@ export function createPlatform(
       return res
         .status(404)
         .json({ error: "This chat is not in your project." });
-    const installation =
-      p.owner_id === req.account.id &&
-      store.connection(req.account.id, "github_installation");
     res.json({
       id: p.id,
       name: p.name,
@@ -530,12 +531,10 @@ export function createPlatform(
       codingReady: Boolean(p.codex_ready),
       hostingProvider: p.hosting_provider,
       githubAccess:
-        p.state === "github_access" &&
-        p.repo &&
-        Number.isSafeInteger(installation?.id)
+        p.state === "github_access" && p.repo && p.owner_id === req.account.id
           ? {
               repo: p.repo,
-              url: `https://github.com/settings/installations/${installation.id}`,
+              url: `/auth/github/install?returnTo=${encodeURIComponent(`/p/${p.id}`)}`,
             }
           : null,
       member: memberView(req.member),

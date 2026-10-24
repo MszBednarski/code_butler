@@ -41,9 +41,9 @@ On Butler’s private operator page, click **Register limited repository app**, 
 
 The app requests exactly these repository permissions: Metadata read, Contents write, Pull requests write, Commit statuses write, Checks read, and Repository creation write. It requests no repository administration, organization permissions, Issues permission, Workflows permission, deploy keys or collaborator management. Repository creation is a dedicated permission. If GitHub does not include a newly created repository in the selected installation, Butler saves the repository and shows an approval link for that project. It checks access automatically on return and resumes the same setup. It never requests all-repository access to work around this. App-level push/PR webhooks avoid granting permission to manage repository hooks.
 
-Each lead signs into Butler with their own GitHub account and installs the app using **Only select repositories**. Butler rejects all-repository installations and verifies that the personal installation belongs to the signed-in lead. The MVP provisions new repositories under that personal account; organization installations are not accepted. Invited teammates need no GitHub account.
+Each lead signs into Butler with their own GitHub account, authorizes new-project creation, and describes an idea. Butler creates the new private repository before asking the lead to install the app using **Only select repositories** for that new repository. Butler rejects all-repository installations and verifies that the personal installation belongs to the signed-in lead. The MVP provisions new repositories under that personal account; organization installations are not accepted. Invited teammates need no GitHub account.
 
-Profile sign-in tokens are discarded after reading identity and never used for repository operations. Repository work uses renewable installation tokens valid for at most an hour, with `repository_ids` restricted to the single project repository. Metadata lookup and repository creation use separate tokens without Contents permission. A worker still receives only its Butler project credential; the git bridge obtains its short-lived repository token centrally.
+Ordinary profile sign-in tokens are discarded after reading identity. Explicit project-creation consent exchanges the GitHub App user token for a creation-only scoped token, stored encrypted for at most one hour. Repository work uses renewable installation tokens valid for at most an hour, with `repository_ids` restricted to the single project repository. Repository creation uses that scoped user token, without Contents permission; installation tokens cannot create personal repositories. A worker still receives only its Butler project credential; the git bridge obtains its short-lived repository token centrally.
 
 Legacy OAuth `repo` grants are never used as a fallback. On migration, persisted OAuth credentials are quarantined and revoked at GitHub; interrupted revocations remain encrypted for retry. Previously authorized users may also revoke the old OAuth application in GitHub Settings → Applications → Authorized OAuth Apps. The old OAuth client is retained only for migration and temporary profile-only sign-in until the scoped app is registered. New app registration configures its own identity flow automatically.
 
@@ -94,3 +94,24 @@ Butler serializes its own merges and rechecks head/base. Without an owner-config
 Real GitHub consent, Railway OAuth permissions/provisioning, Codex subscription authorization, production previews and publishing must also be exercised against the deployed installation after its integration apps are registered. Fixture tests do not establish that these external account connections are configured.
 
 The old `agent-host/` gateway remains operational for the existing team. Its credentials, sessions, worktrees and deployment are separate from this platform.
+
+### New repositories before installation
+
+New-project setup authorizes creation with the GitHub App user sign-in, then asks
+for hosting and the project idea. Butler creates a new private personal repository
+before opening GitHub's installation screen. For a first installation, that screen preselects only the new
+repository. Returning leads add it to their existing selected-repository installation
+so earlier projects keep their access. Existing repositories, including the Butler source repository, are
+not prerequisites.
+
+The creation callback exchanges the user token for an encrypted, permission-scoped
+user token (`metadata:read`, `repository_creation:write`), retained for at most one
+hour. It never requests OAuth `repo` or uses the creation credential for coding,
+git, or workers. Personal `POST /user/repos` requires a user token; installation
+tokens are used only after the new repository is approved. Expired creation
+consent returns the saved project to a reconnect step. A completed create is
+persisted before waiting for installation so retries reuse the same repository.
+
+Provider-free tests cover this sequence, credential boundaries, and lost responses.
+A fresh GitHub account must still exercise the live scoped-token and installation
+consent flow before deployment is considered verified.

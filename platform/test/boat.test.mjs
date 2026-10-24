@@ -48,6 +48,12 @@ test("regular onboarding defaults to Boat even with a remembered Railway connect
     "lead",
     f.user.id,
   );
+  f.store.connection(f.user.id, "github_creation", {
+    token: "create-only",
+    accountId: "42",
+    appId: "123",
+    expiresAt: Date.now() + 3600000,
+  });
   f.store.connection(f.user.id, "github_installation", {
     id: 99,
     accountId: 42,
