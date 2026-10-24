@@ -284,6 +284,23 @@ export function installAuth(app, config, store, provider) {
         throw error;
       }
     }
+    const registration = await provider.app("/app");
+    if (
+      String(registration.id) !== String(config.githubAppId) ||
+      !/^[a-z0-9-]{1,100}$/.test(registration.slug || "")
+    )
+      return res
+        .status(503)
+        .send(
+          "Butler’s GitHub connection could not be verified. Please try again.",
+        );
+    if (config.githubAppSlug !== registration.slug) {
+      config.githubAppSlug = registration.slug;
+      store.setting("provider-settings", {
+        ...(store.setting("provider-settings") || {}),
+        githubAppSlug: registration.slug,
+      });
+    }
     const state = token(),
       browser = token();
     store.run("DELETE FROM oauth_states WHERE created_at<?", now() - 600000);

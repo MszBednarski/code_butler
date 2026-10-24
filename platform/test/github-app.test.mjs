@@ -557,7 +557,10 @@ test("installation callbacks require the browser, signed-in account and installa
     frontend: "/missing",
   });
   const connected = [];
+  let registration = { id: f.config.githubAppId, slug: "butler-renamed" };
   const access = createGithubAccess(f.config, f.store, async (url) => {
+    if (url === "https://api.github.com/app")
+      return Response.json(registration);
     if (url.endsWith("/app/installations/99"))
       return Response.json(f.installation);
     return Response.json({ message: "Not found" }, { status: 404 });
@@ -583,7 +586,21 @@ test("installation callbacks require the browser, signed-in account and installa
   const url = new URL(start.headers.get("location")),
     browser = start.headers.get("set-cookie").split(";")[0];
   assert.equal(url.hostname, "github.com");
+  assert.equal(url.pathname, "/apps/butler-renamed/installations/new");
+  assert.equal(f.config.githubAppSlug, "butler-renamed");
+  assert.equal(
+    f.store.setting("provider-settings").githubAppSlug,
+    "butler-renamed",
+  );
   assert.equal(url.searchParams.get("suggested_target_id"), "42");
+  registration = { id: "wrong-app", slug: "unrelated-app" };
+  const wrong = await fetch(f.config.publicUrl + "/auth/github/install", {
+    headers: { cookie },
+    redirect: "manual",
+  });
+  assert.equal(wrong.status, 503);
+  assert.equal(wrong.headers.get("location"), null);
+  registration = { id: f.config.githubAppId, slug: "butler-renamed" };
   const callback =
     f.config.publicUrl +
     `/auth/github/install/callback?installation_id=99&state=${url.searchParams.get("state")}`;
