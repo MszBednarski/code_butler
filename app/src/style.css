@@ -1149,7 +1149,7 @@ small {
   overflow-y: auto;
   min-height: 0;
   padding: 20px 18px 10px;
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
 }
 .agent-welcome {
   display: flex;
