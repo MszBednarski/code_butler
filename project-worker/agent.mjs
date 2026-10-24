@@ -171,7 +171,7 @@ export function createAgent({
         child = c;
       },
     });
-    for (const script of ["typecheck", "test", "build"])
+    for (const script of ["typecheck", "build", "test"])
       await run(
         "npm",
         ["run", script, ...(script === "build" ? [] : ["--if-present"])],

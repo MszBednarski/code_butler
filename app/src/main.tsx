@@ -7,9 +7,12 @@ import React, {
 } from "react";
 import ReactDOM from "react-dom/client";
 import "./style.css";
-import { explainButler } from "./communication";
+import { chatBubbles, explainButler } from "./communication";
+import type { ChatMessage } from "./communication";
 import { attachWorkspaceViewport } from "./workspace-viewport";
 import LandingTour from "./LandingTour";
+import Reactions from "./Reactions";
+import type { ReactionSummary, ReactionTarget } from "./Reactions";
 
 type User = {
   id: string;
@@ -81,14 +84,8 @@ type Project = {
   readOnly?: boolean;
   members: Member[];
   ownMemberships: Member[];
-  messages: {
-    id: string;
-    jobId: string;
-    role: string;
-    text: string;
-    kind?: string;
-    createdAt?: number;
-  }[];
+  messages: ChatMessage[];
+  reactions?: ReactionSummary;
   jobs: Job[];
   activity: Job[];
   releases?: {
@@ -293,19 +290,26 @@ function ButlerText({
   text,
   kind = "message",
   developerUrl,
+  diagnostics = [],
 }: {
   text: string;
   kind?: string;
   developerUrl?: string;
+  diagnostics?: string[];
 }) {
   const explanation = explainButler(text, kind);
+  const details = [...new Set([text, ...diagnostics])].filter(
+    (value) => value.trim() !== explanation,
+  );
   return (
     <>
       <p>{explanation}</p>
-      {(explanation !== text.trim() || developerUrl) && (
+      {(details.length > 0 || developerUrl) && (
         <details className="developer-details">
           <summary>Details for developers</summary>
-          {explanation !== text.trim() && <p>{text}</p>}
+          {details.map((value) => (
+            <p key={value}>{value}</p>
+          ))}
           {developerUrl && (
             <a href={developerUrl} target="_blank" rel="noopener noreferrer">
               View code review on GitHub <Icon name="external" size={12} />
@@ -1874,6 +1878,27 @@ function Workspace({
       setError((e as Error).message);
     }
   }
+  async function react(
+    targetType: ReactionTarget,
+    targetId: string,
+    emoji: string,
+    active: boolean,
+  ) {
+    try {
+      const response = await api<{ reactions: ReactionSummary }>(
+        `/api/projects/${projectId}/reactions${memberId ? "?member=" + memberId : ""}`,
+        { targetType, targetId, emoji, active },
+      );
+      setProject((current) =>
+        current?.id === projectId
+          ? { ...current, reactions: response.reactions }
+          : current,
+      );
+    } catch (error) {
+      setError((error as Error).message);
+      throw error;
+    }
+  }
   if (!project)
     return (
       <div className="loading-page">
@@ -2232,6 +2257,17 @@ function Workspace({
                 </div>
               </div>
             )}
+            {shownArtifact && websiteUrl && (
+              <div className="preview-reactions">
+                <Reactions
+                  key={shownArtifact.id}
+                  targetType="preview"
+                  targetId={shownArtifact.id}
+                  summary={project.reactions}
+                  onReact={react}
+                />
+              </div>
+            )}
           </div>
           {canApprove && shownArtifact && (
             <div className="preview-approval">
@@ -2397,7 +2433,7 @@ function Workspace({
                 </small>
               </div>
             </div>
-            {project.messages.map((message) => {
+            {chatBubbles(project.messages).map((message) => {
               const job = project.jobs.find((j) => j.id === message.jobId);
               return (
                 <div
@@ -2430,11 +2466,21 @@ function Workspace({
                     {message.role === "user" ? (
                       <p>{message.text}</p>
                     ) : (
-                      <ButlerText text={message.text} kind={message.kind} />
+                      <ButlerText
+                        text={message.text}
+                        kind={message.kind}
+                        diagnostics={message.diagnostics}
+                      />
                     )}
                     {message.role === "user" && job && (
                       <JobState job={job} clock={clock} />
                     )}
+                    <Reactions
+                      targetType="message"
+                      targetId={message.id}
+                      summary={project.reactions}
+                      onReact={react}
+                    />
                   </div>
                 </div>
               );

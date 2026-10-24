@@ -552,7 +552,7 @@ export function createProvisioner(
   async function markPublished(project, sha, historical = false) {
     if (!SHA.test(sha || "")) return;
     for (const job of store.all(
-      "SELECT id,merge_sha FROM jobs WHERE project_id=? AND state IN ('deploying','publish_failed')",
+      "SELECT id,pr_number,merge_sha FROM jobs WHERE project_id=? AND state IN ('deploying','publish_failed')",
       project.id,
     )) {
       if (!job.merge_sha) continue;
@@ -569,8 +569,9 @@ export function createProvisioner(
           job.id,
         );
       if (["ahead", "identical"].includes(comparison.status))
-        store.recordEvent(
-          job.id,
+        store.recordPullEvent(
+          project.id,
+          job.pr_number,
           `published:${job.merge_sha}`,
           "status",
           "Your change is live on the website.",
@@ -726,17 +727,13 @@ export function createProvisioner(
         prNumber,
       );
       const marker = `<!-- butler-preview:${sha} -->`;
-      for (const job of store.all(
-        "SELECT id FROM jobs WHERE project_id=? AND pr_number=?",
+      store.recordPullEvent(
         project.id,
         prNumber,
-      ))
-        store.recordEvent(
-          job.id,
-          `preview:${sha}`,
-          "status",
-          `Preview ready: ${target.domain}`,
-        );
+        `preview:${sha}`,
+        "status",
+        `Preview ready: ${target.domain}`,
+      );
       const comments = await provider.github(
         project.owner_id,
         `/repos/${project.repo}/issues/${prNumber}/comments?per_page=100`,
@@ -1034,17 +1031,13 @@ export function createProvisioner(
               project.id,
               payload.prNumber,
             );
-            for (const job of store.all(
-              "SELECT id FROM jobs WHERE project_id=? AND pr_number=?",
+            store.recordPullEvent(
               project.id,
               payload.prNumber,
-            ))
-              store.recordEvent(
-                job.id,
-                `preview-error:${task.id}:${task.attempts}`,
-                "error",
-                `The preview failed to deploy: ${message}\nYour code is saved. Ask the team lead to retry the preview deployment.`,
-              );
+              `preview-error:${task.id}:${task.attempts}`,
+              "error",
+              `The preview failed to deploy: ${message}\nYour code is saved. Ask the team lead to retry the preview deployment.`,
+            );
             store.run(
               "UPDATE jobs SET state='preview_failed',error=?,updated_at=? WHERE project_id=? AND pr_number=? AND state IN ('reviewing','preview_failed')",
               message,
@@ -1060,11 +1053,12 @@ export function createProvisioner(
               project.id,
             );
           for (const job of store.all(
-            "SELECT id FROM jobs WHERE project_id=? AND state='publish_failed'",
+            "SELECT id,pr_number FROM jobs WHERE project_id=? AND state='publish_failed'",
             project.id,
           ))
-            store.recordEvent(
-              job.id,
+            store.recordPullEvent(
+              project.id,
+              job.pr_number,
               `publish-error:${task.id}:${task.attempts}`,
               "error",
               `The website update failed to deploy: ${message}\nThe PR is merged and your code is saved. Ask the team lead to retry publishing.`,

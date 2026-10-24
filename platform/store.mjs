@@ -87,6 +87,11 @@ export function createStore(directory) {
       title TEXT NOT NULL, author TEXT, merge_sha TEXT NOT NULL,
       merged_at INTEGER, published_at INTEGER, is_live INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(project_id,pr_number));
+    CREATE TABLE IF NOT EXISTS reactions (
+      project_id TEXT NOT NULL REFERENCES projects(id), target_type TEXT NOT NULL,
+      target_id TEXT NOT NULL, emoji TEXT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id),
+      member_id TEXT NOT NULL REFERENCES members(id), created_at INTEGER NOT NULL,
+      PRIMARY KEY(project_id,target_type,target_id,emoji,user_id));
   `);
   if (
     !db
@@ -281,6 +286,8 @@ export function createStore(directory) {
           to,
         );
       run("UPDATE members SET user_id=? WHERE user_id=?", to, from);
+      run("UPDATE OR IGNORE reactions SET user_id=? WHERE user_id=?", to, from);
+      run("DELETE FROM reactions WHERE user_id=?", from);
       run("UPDATE projects SET owner_id=? WHERE owner_id=?", to, from);
       revokeAccess(from);
       run(
@@ -366,6 +373,49 @@ export function createStore(directory) {
       at,
     );
   }
+  // A pull can contain a request and several automatic repairs in one chat.
+  // Keep shared progress on one stable job per chat, including on retries.
+  function recordPullEvent(project, number, key, kind, text, at = now()) {
+    for (const job of all(
+      `SELECT j.id FROM jobs j WHERE j.project_id=? AND j.pr_number=?
+       AND j.id=(SELECT first.id FROM jobs first WHERE first.member_id=j.member_id AND first.pr_number=j.pr_number ORDER BY first.created_at,first.rowid LIMIT 1)`,
+      project,
+      number,
+    ))
+      recordEvent(job.id, key, kind, text, at);
+  }
+  function chatMessages(member) {
+    const rows = all(
+      `SELECT id,job_id AS jobId,role,text,created_at AS createdAt,'message' AS kind,CASE role WHEN 'user' THEN 0 ELSE 2 END AS position,rowid AS sequence,NULL AS eventKey,NULL AS prNumber FROM messages WHERE member_id=?
+       UNION ALL SELECT j.id||':'||e.event_key,j.id,'assistant',e.text,e.created_at,e.kind,1,e.rowid,e.event_key,j.pr_number FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.member_id=?
+       ORDER BY createdAt,position,sequence`,
+      member,
+      member,
+    );
+    const seen = new Set();
+    return rows
+      .filter((message) => {
+        // Old versions copied PR updates to every repair job. Retain raw records,
+        // and show each shared update once; job starts and repairs stay separate.
+        const shared =
+          message.prNumber &&
+          ((message.kind === "review" && message.eventKey.includes(":")) ||
+            /^(?:preview|merged|published|preview-error|publish-error|previous-error):/.test(
+              message.eventKey || "",
+            ));
+        if (!shared) return true;
+        const key = JSON.stringify([
+          message.prNumber,
+          message.eventKey,
+          message.kind,
+          message.text,
+        ]);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .map(({ eventKey, prNumber, position, sequence, ...message }) => message);
+  }
   function recordRelease(project, number, sha, metadata = {}) {
     const job = get(
       "SELECT j.pr_title,m.name FROM jobs j JOIN members m ON m.id=j.member_id WHERE j.project_id=? AND j.pr_number=? ORDER BY j.created_at DESC LIMIT 1",
@@ -386,6 +436,26 @@ export function createStore(directory) {
       mergedAt,
       Number.isFinite(metadata.mergedAt) ? 1 : 0,
     );
+  }
+  function reactionSummary(project, user) {
+    const summary = {};
+    for (const row of all(
+      `SELECT r.target_type,r.target_id,r.emoji,COUNT(*) AS count,
+       MAX(r.user_id=?) AS reacted,json_group_array(m.name) AS names
+       FROM reactions r JOIN members m ON m.id=r.member_id
+       WHERE r.project_id=? GROUP BY r.target_type,r.target_id,r.emoji ORDER BY MIN(r.created_at),r.emoji`,
+      user,
+      project,
+    )) {
+      const key = row.target_type + ":" + row.target_id;
+      (summary[key] ||= []).push({
+        emoji: row.emoji,
+        count: row.count,
+        reacted: Boolean(row.reacted),
+        names: JSON.parse(row.names).sort(),
+      });
+    }
+    return summary;
   }
   function recordMerge(project, number, sha, metadata = {}) {
     return transaction(() => {
@@ -411,17 +481,13 @@ export function createStore(directory) {
           project,
           number,
         );
-      for (const job of all(
-        "SELECT id FROM jobs WHERE project_id=? AND pr_number=?",
+      recordPullEvent(
         project,
         number,
-      ))
-        recordEvent(
-          job.id,
-          `merged:${sha}`,
-          "status",
-          `PR #${number} merged. ${state === "live" ? "Your change is live." : "Publishing the website update."}`,
-        );
+        `merged:${sha}`,
+        "status",
+        `PR #${number} merged. ${state === "live" ? "Your change is live." : "Publishing the website update."}`,
+      );
       if (state !== "live") {
         const key = `main:${project}:${sha}`;
         enqueue(project, "deploy", key, { sha });
@@ -452,6 +518,9 @@ export function createStore(directory) {
     claimJob,
     recordMerge,
     recordEvent,
+    recordPullEvent,
+    chatMessages,
+    reactionSummary,
     recordRelease,
     close: () => db.close(),
   };

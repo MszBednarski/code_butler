@@ -990,10 +990,68 @@ small {
   background: #7b9d60;
 }
 .preview-surface {
+  position: relative;
   flex: 1;
   min-height: 0;
   background: #f0f3e8;
 }
+.reactions {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+}
+.reactions button {
+  cursor: pointer;
+  color: #53664f;
+  border: 1px solid #dfe7d8;
+  background: #fbfcf7;
+  border-radius: 20px;
+  font: inherit;
+}
+.reaction-add, .reaction-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 3px 7px;
+  min-height: 26px;
+  font-size: 10px !important;
+}
+.reaction-add > span:first-child { font-size: 16px; line-height: 1; }
+.reaction-count > span:first-child { font-size: 13px; }
+.reactions button[aria-pressed="true"] { background: #e8f0da; border-color: #98b27f; color: #294c2e; }
+.reactions button:focus-visible { outline: 2px solid #56784b; outline-offset: 2px; }
+.reactions button:disabled { opacity: .6; }
+.emoji-picker {
+  position: absolute;
+  z-index: 20;
+  bottom: calc(100% + 5px);
+  right: 0;
+  display: flex;
+  padding: 5px;
+  gap: 1px;
+  width: max-content;
+  background: #fffef7;
+  border: 1px solid #dfe7d8;
+  box-shadow: 0 4px 20px #25371d20;
+  border-radius: 24px;
+}
+.emoji-picker button { border: 0; padding: 5px; font-size: 19px; width: 31px; height: 34px; }
+.message-assistant .emoji-picker { left: 0; right: auto; }
+.preview-reactions {
+  position: absolute;
+  bottom: 12px;
+  right: 12px;
+  max-width: calc(100% - 24px);
+  border-radius: 20px;
+  background: #fffef7ed;
+  padding: 4px;
+  box-shadow: 0 2px 12px #25371d1a;
+}
+.preview-reactions .reactions { margin: 0; justify-content: flex-end; }
 .preview-surface iframe {
   display: block;
   border: 0;

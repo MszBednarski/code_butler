@@ -439,6 +439,306 @@ test("team chat reads expose live durable progress while writes and worker event
   );
   reopened.close();
 });
+test("PR progress is recorded once per chat across repairs and existing copied history is shown once", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    inv = await f.invite(p.id);
+  const alice = await f.join(inv.url, "Alice"),
+    bob = await f.join(inv.url, "Bob");
+  f.store.run(
+    "UPDATE projects SET state='ready',repo='lead/site' WHERE id=?",
+    p.id,
+  );
+  const project = f.store.get("SELECT * FROM projects WHERE id=?", p.id);
+  const chats = [];
+  for (const cookie of [alice, bob]) {
+    const jobs = [];
+    for (let i = 0; i < 3; i++) {
+      const job = await (
+        await f.call(
+          `/api/projects/${p.id}/messages`,
+          { text: "Continue", requestKey: id() },
+          cookie,
+        )
+      ).json();
+      f.store.run(
+        "UPDATE jobs SET pr_number=7,state='reviewing' WHERE id=?",
+        job.jobId,
+      );
+      jobs.push(job.jobId);
+      // Reproduce historical fan-out, including independent job-local events.
+      f.store.recordEvent(
+        job.jobId,
+        "revision:checks",
+        "review",
+        "Checking the shared change.",
+        now() + i,
+      );
+      f.store.recordEvent(
+        job.jobId,
+        "published:revision",
+        "status",
+        "Your change is live on the website.",
+        now() + i,
+      );
+      f.store.recordEvent(
+        job.jobId,
+        "started",
+        "status",
+        "I’m starting work on your request.",
+      );
+      f.store.recordEvent(
+        job.jobId,
+        "automatic-repair",
+        "review",
+        "Repairing this attempt.",
+      );
+    }
+    chats.push({ cookie, jobs });
+  }
+  const event = {
+    key: "new-revision:checks",
+    kind: "review",
+    text: "Checking a fresh revision.",
+  };
+  const report = () =>
+    workerCall(f, project, "/pulls/7/events", { events: [event] });
+  assert.equal((await report()).status, 200);
+  for (const { cookie, jobs } of chats) {
+    const data = await (
+      await f.call(`/api/projects/${p.id}`, undefined, cookie)
+    ).json();
+    assert.equal(data.messages.filter((m) => m.text === "Continue").length, 3);
+    assert.equal(
+      data.messages.filter((m) => m.text === "Checking the shared change.")
+        .length,
+      1,
+    );
+    assert.equal(
+      data.messages.filter(
+        (m) => m.text === "Your change is live on the website.",
+      ).length,
+      1,
+    );
+    assert.equal(
+      data.messages.filter(
+        (m) => m.text === "I’m starting work on your request.",
+      ).length,
+      3,
+    );
+    assert.equal(
+      data.messages.filter((m) => m.text === "Repairing this attempt.").length,
+      3,
+    );
+    assert.equal(data.messages.filter((m) => m.text === event.text).length, 1);
+    assert.equal(
+      f.store.get(
+        "SELECT COUNT(*) AS n FROM job_events WHERE job_id IN (?,?,?) AND event_key='revision:checks'",
+        ...jobs,
+      ).n,
+      3,
+      "Raw historical evidence remains intact",
+    );
+  }
+  // A new repair must not receive a second copy of an already reported PR event.
+  const repair = await (
+    await f.call(
+      `/api/projects/${p.id}/messages`,
+      { text: "Fix the timer", requestKey: id() },
+      alice,
+    )
+  ).json();
+  f.store.run(
+    "UPDATE jobs SET pr_number=7,state='reviewing' WHERE id=?",
+    repair.jobId,
+  );
+  assert.equal((await report()).status, 200);
+  assert.equal(
+    f.store.get(
+      "SELECT COUNT(*) AS n FROM job_events WHERE event_key=?",
+      event.key,
+    ).n,
+    2,
+  );
+  for (let i = 0; i < 2; i++) {
+    assert.equal(
+      (
+        await workerCall(f, project, "/pulls/7/start", {
+          key: "head:base:container-v2",
+        })
+      ).status,
+      200,
+    );
+    f.store.recordMerge(p.id, 7, "b".repeat(40));
+  }
+  f.provider.github = async () => ({ id: 1 });
+  for (const operation of ["review", "block"])
+    assert.equal(
+      (
+        await workerCall(f, project, "/github", {
+          operation,
+          number: 7,
+          sha: "a".repeat(40),
+          text: "Specific feedback",
+          retryable: true,
+        })
+      ).status,
+      200,
+    );
+  for (const key of [
+    "head:base:container-v2:start",
+    "merged:" + "b".repeat(40),
+    "review-complete:" + "a".repeat(40),
+    "review-block:" + digest("Specific feedback"),
+  ])
+    assert.equal(
+      f.store.get("SELECT COUNT(*) AS n FROM job_events WHERE event_key=?", key)
+        .n,
+      2,
+      key,
+    );
+  const other = await f.create("Other project");
+  const otherProject = f.store.get(
+    "SELECT * FROM projects WHERE id=?",
+    other.id,
+  );
+  assert.equal(
+    (await workerCall(f, otherProject, "/pulls/7/events", { events: [event] }))
+      .status,
+    404,
+  );
+});
+
+test("teammates can react to each other's chat and previews with durable, scoped, idempotent reactions", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    inv = await f.invite(p.id);
+  const alice = await f.join(inv.url, "Alice"),
+    bob = await f.join(inv.url, "Bob");
+  const sent = await (
+    await f.call(
+      `/api/projects/${p.id}/messages`,
+      { text: "Make a shared race", requestKey: id() },
+      alice,
+    )
+  ).json();
+  f.store.run(
+    "UPDATE jobs SET artifact_url='https://preview.example.test',state='awaiting_approval' WHERE id=?",
+    sent.jobId,
+  );
+  f.store.recordEvent(
+    sent.jobId,
+    "attempt:item_1",
+    "agent",
+    "The race is ready.",
+  );
+  const message = f.store.get(
+    "SELECT id,member_id FROM messages WHERE job_id=? AND role='user'",
+    sent.jobId,
+  );
+  const react = (
+    cookie,
+    targetType,
+    targetId,
+    active = true,
+    emoji = "🔥",
+    headers,
+  ) =>
+    f.call(
+      `/api/projects/${p.id}/reactions`,
+      { targetType, targetId, emoji, active },
+      cookie,
+      headers,
+    );
+  for (const [type, target] of [
+    ["message", message.id],
+    ["message", sent.jobId + ":attempt:item_1"],
+    ["preview", sent.jobId],
+  ]) {
+    assert.equal((await react(alice, type, target)).status, 200);
+    assert.equal((await react(alice, type, target)).status, 200);
+    assert.equal((await react(bob, type, target)).status, 200);
+    const watched = await (
+      await f.call(
+        `/api/projects/${p.id}?chat=${message.member_id}`,
+        undefined,
+        bob,
+      )
+    ).json();
+    assert.equal(watched.readOnly, true);
+    assert.deepEqual(watched.reactions[type + ":" + target][0], {
+      emoji: "🔥",
+      count: 2,
+      reacted: true,
+      names: ["Alice", "Bob"],
+    });
+    assert.equal((await react(bob, type, target, false)).status, 200);
+    assert.equal((await react(bob, type, target, false)).status, 200);
+    const remaining = await (
+      await f.call(`/api/projects/${p.id}`, undefined, bob)
+    ).json();
+    assert.equal(remaining.reactions[type + ":" + target][0].count, 1);
+    assert.equal(remaining.reactions[type + ":" + target][0].reacted, false);
+  }
+  assert.equal(
+    (await react(bob, "message", message.id, true, "<script>")).status,
+    400,
+  );
+  assert.equal((await react(bob, "preview", id())).status, 404);
+  assert.equal((await react("", "message", message.id)).status, 401);
+  assert.equal(
+    (
+      await react(bob, "message", message.id, true, "🔥", {
+        origin: "https://other.example",
+      })
+    ).status,
+    403,
+  );
+  const other = await f.create("Other project"),
+    otherMessage = f.store.get(
+      "SELECT id FROM messages WHERE project_id=? LIMIT 1",
+      other.id,
+    );
+  assert.equal((await react(bob, "message", otherMessage.id)).status, 404);
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${other.id}/reactions`,
+        {
+          targetType: "message",
+          targetId: otherMessage.id,
+          emoji: "🔥",
+          active: true,
+        },
+        bob,
+      )
+    ).status,
+    404,
+  );
+  const reopened = createStore(f.dir);
+  assert.equal(
+    reopened.get("SELECT COUNT(*) AS n FROM reactions WHERE project_id=?", p.id)
+      .n,
+    3,
+  );
+  reopened.close();
+  assert.equal((await react(f.owner, "message", message.id)).status, 200);
+  const source = f.store.get(
+    "SELECT user_id FROM members WHERE id=?",
+    message.member_id,
+  ).user_id;
+  f.store.mergeUsers(
+    source,
+    f.store.get("SELECT owner_id FROM projects WHERE id=?", p.id).owner_id,
+  );
+  assert.equal(
+    f.store.get("SELECT COUNT(*) AS n FROM reactions WHERE project_id=?", p.id)
+      .n,
+    3,
+    "Linking accounts preserves reactions and combines existing votes",
+  );
+});
+
 test("a ready artifact requires its creator to inspect and approve the exact revision before a PR can exist", async (t) => {
   const f = await fixture(t),
     p = await f.create(),

@@ -147,9 +147,18 @@ export function installWorkerApi(app, config, store, provider) {
       if (!jobs.length)
         return res.status(404).json({ error: "Unknown request." });
       store.transaction(() => {
-        for (const job of jobs)
-          for (const e of req.body.events)
-            store.recordEvent(job.id, e.key, e.kind, e.text, e.at || now());
+        for (const e of req.body.events)
+          if (req.params.jobId)
+            store.recordEvent(jobs[0].id, e.key, e.kind, e.text, e.at || now());
+          else
+            store.recordPullEvent(
+              req.project.id,
+              Number(req.params.number),
+              e.key,
+              e.kind,
+              e.text,
+              e.at || now(),
+            );
       });
       res.json({ ok: true });
     },
@@ -169,17 +178,13 @@ export function installWorkerApi(app, config, store, provider) {
         req.project.id,
         pr,
       );
-      for (const job of store.all(
-        "SELECT id FROM jobs WHERE project_id=? AND pr_number=?",
+      store.recordPullEvent(
         req.project.id,
         pr,
-      ))
-        store.recordEvent(
-          job.id,
-          `${req.body.key}:start`,
-          "review",
-          `Reviewing PR #${pr}. Checking the code and app build.`,
-        );
+        `${req.body.key}:start`,
+        "review",
+        `Reviewing PR #${pr}. Checking the code and app build.`,
+      );
     });
     res.json({ ok: true });
   });
@@ -444,17 +449,13 @@ export function installWorkerApi(app, config, store, provider) {
           event: "COMMENT",
           body: b.text.slice(0, 20000),
         });
-        for (const job of store.all(
-          "SELECT id FROM jobs WHERE project_id=? AND pr_number=?",
+        store.recordPullEvent(
           project.id,
           b.number,
-        ))
-          store.recordEvent(
-            job.id,
-            `review-complete:${b.sha}`,
-            "review",
-            `Review passed for PR #${b.number}.\n\n${b.text}`,
-          );
+          `review-complete:${b.sha}`,
+          "review",
+          `Review passed for PR #${b.number}.\n\n${b.text}`,
+        );
         break;
       case "block":
         if (!number(b.number) || typeof b.text !== "string")
@@ -471,17 +472,13 @@ export function installWorkerApi(app, config, store, provider) {
           project.id,
           b.number,
         );
-        for (const job of store.all(
-          "SELECT id FROM jobs WHERE project_id=? AND pr_number=?",
+        store.recordPullEvent(
           project.id,
           b.number,
-        ))
-          store.recordEvent(
-            job.id,
-            `review-block:${digest(b.text)}`,
-            "review",
-            `${b.retryable ? "Review paused" : "Review blocked"} for PR #${b.number}:\n\n${b.text}${b.retryable ? "" : "\n\nAsk your agent to fix these findings, then it will be reviewed again."}`,
-          );
+          `review-block:${digest(b.text)}`,
+          "review",
+          `${b.retryable ? "Review paused" : "Review blocked"} for PR #${b.number}:\n\n${b.text}${b.retryable ? "" : "\n\nAsk your agent to fix these findings, then it will be reviewed again."}`,
+        );
         result = { ok: true };
         break;
       case "repair": {

@@ -25,6 +25,7 @@ const name = (value) =>
   value.trim().length >= 1 &&
   value.trim().length <= 50 &&
   !/[\x00-\x1f]/.test(value);
+const reactionEmojis = new Set(["👍", "❤️", "🔥", "😂", "🎉", "👀", "🤩"]);
 const memberView = (m) => ({
   id: m.id,
   name: m.name,
@@ -536,13 +537,8 @@ export function createPlatform(
         p.id,
         req.account.id,
       ),
-      messages: store.all(
-        `SELECT id,job_id AS jobId,role,text,created_at AS createdAt,'message' AS kind,CASE role WHEN 'user' THEN 0 ELSE 2 END AS position,rowid AS sequence FROM messages WHERE member_id=?
-         UNION ALL SELECT j.id||':'||e.event_key,j.id,'assistant',e.text,e.created_at,e.kind,1,e.rowid FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.member_id=?
-         ORDER BY createdAt,position,sequence`,
-        chat.id,
-        chat.id,
-      ),
+      messages: store.chatMessages(chat.id),
+      reactions: store.reactionSummary(p.id, req.account.id),
       jobs: store.all(
         "SELECT id,member_id AS memberId,request_key AS requestKey,text,state,result,error,pr_number AS prNumber,pr_url AS prUrl,preview_url AS previewUrl,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt,merged_at AS mergedAt,published_at AS publishedAt,change_sha AS changeSha,pr_title AS prTitle,artifact_url AS artifactUrl,artifact_ready_at AS artifactReadyAt,inspected_at AS inspectedAt,approved_at AS approvedAt FROM jobs WHERE member_id=? ORDER BY created_at,rowid",
         chat.id,
@@ -639,6 +635,66 @@ export function createPlatform(
         req.project.id,
       );
       res.json({ ok: true });
+    },
+  );
+  app.post(
+    "/api/projects/:projectId/reactions",
+    signed,
+    membership,
+    (req, res) => {
+      const { targetType, targetId, emoji, active } = req.body || {};
+      if (
+        !["message", "preview"].includes(targetType) ||
+        typeof targetId !== "string" ||
+        !/^[a-zA-Z0-9:._-]{1,200}$/.test(targetId) ||
+        !reactionEmojis.has(emoji) ||
+        typeof active !== "boolean"
+      )
+        return res
+          .status(400)
+          .json({ error: "Choose a message or preview and an emoji." });
+      const target =
+        targetType === "preview"
+          ? store.get(
+              "SELECT id FROM jobs WHERE id=? AND project_id=? AND (artifact_url IS NOT NULL OR preview_url IS NOT NULL)",
+              targetId,
+              req.project.id,
+            )
+          : store.get(
+              `SELECT id FROM messages WHERE id=? AND project_id=?
+           UNION ALL SELECT j.id||':'||e.event_key FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.id||':'||e.event_key=? AND j.project_id=? LIMIT 1`,
+              targetId,
+              req.project.id,
+              targetId,
+              req.project.id,
+            );
+      if (!target)
+        return res
+          .status(404)
+          .json({ error: "This message or preview isn’t in your project." });
+      if (active)
+        store.run(
+          "INSERT OR IGNORE INTO reactions VALUES(?,?,?,?,?,?,?)",
+          req.project.id,
+          targetType,
+          targetId,
+          emoji,
+          req.account.id,
+          req.member.id,
+          now(),
+        );
+      else
+        store.run(
+          "DELETE FROM reactions WHERE project_id=? AND target_type=? AND target_id=? AND emoji=? AND user_id=?",
+          req.project.id,
+          targetType,
+          targetId,
+          emoji,
+          req.account.id,
+        );
+      res.json({
+        reactions: store.reactionSummary(req.project.id, req.account.id),
+      });
     },
   );
   app.post(

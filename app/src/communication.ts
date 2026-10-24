@@ -1,3 +1,34 @@
+export type ChatMessage = {
+  id: string;
+  jobId: string;
+  role: string;
+  text: string;
+  kind?: string;
+  createdAt?: number;
+};
+
+// Several internal steps can have the same plain-English explanation. Display
+// one bubble for adjacent repeats in a request, keeping every distinct diagnostic.
+export function chatBubbles<T extends ChatMessage>(messages: T[]) {
+  const bubbles: (T & { diagnostics: string[] })[] = [];
+  for (const message of messages) {
+    const last = bubbles.at(-1);
+    if (
+      message.role === "assistant" &&
+      last?.role === "assistant" &&
+      last.jobId === message.jobId &&
+      (!(last.kind === "agent" || message.kind === "agent") ||
+        last.text.trim() === message.text.trim()) &&
+      explainButler(last.text, last.kind) ===
+        explainButler(message.text, message.kind)
+    ) {
+      if (!last.diagnostics.includes(message.text))
+        last.diagnostics.push(message.text);
+    } else bubbles.push({ ...message, diagnostics: [message.text] });
+  }
+  return bubbles;
+}
+
 // Older conversations keep their original diagnostic text. Present an explanation
 // first, while retaining those diagnostics for people who choose developer details.
 export function explainButler(text: string, kind = "message") {
@@ -16,6 +47,8 @@ export function explainButler(text: string, kind = "message") {
     return `Your changes haven’t been added yet. ${/starter|placeholder/i.test(raw) ? "The preview still shows the starter page." : "The preview still matches the current website."} Ask Butler to finish your request.`;
   if (/repository creation failed|could not create.*repo/i.test(raw))
     return "Butler couldn’t create your project files. Try again, or check your GitHub connection.";
+  if (/Boat build stopped|couldn.t finish the preview build/i.test(raw))
+    return "Butler couldn’t prepare this preview. Your work is saved. Try preparing it again.";
   if (
     issue &&
     /bwrap|namespace|CODEX_HOME|command sandbox|reviewer.*(?:runtime|process)|could not start.*sandbox/i.test(

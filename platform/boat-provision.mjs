@@ -21,11 +21,12 @@ WORKDIR /build
 ARG BUTLER_COMMIT_SHA=dev
 ENV BUTLER_COMMIT_SHA=$BUTLER_COMMIT_SHA
 COPY . .
-RUN npm ci --no-audit --no-fund && npm run typecheck --if-present && npm run test --if-present && npm run build
+RUN npm ci --no-audit --no-fund && npm run typecheck --if-present && npm run build && npm run test --if-present && npm prune --omit=dev --no-audit --no-fund
 FROM node:22-bookworm-slim
-RUN npm install -g serve@14.2.5
-COPY --from=build /build/dist /site
-CMD ["serve","-s","/site","-l","tcp://0.0.0.0:3000"]
+WORKDIR /app
+ENV NODE_ENV=production PORT=3000
+COPY --from=build /build/ ./
+CMD ["npm","start"]
 `;
 export function createBoatProvisioner(
   config,
@@ -390,17 +391,13 @@ export function createBoatProvisioner(
           p.id,
           prNumber,
         );
-        for (const job of store.all(
-          "SELECT id FROM jobs WHERE project_id=? AND pr_number=?",
+        store.recordPullEvent(
           p.id,
           prNumber,
-        ))
-          store.recordEvent(
-            job.id,
-            `preview:${sha}`,
-            "status",
-            `Preview ready: ${url}`,
-          );
+          `preview:${sha}`,
+          "status",
+          `Preview ready: ${url}`,
+        );
         const marker = `<!-- butler-preview:${prNumber}:${sha} -->`,
           comments = await provider.github(
             p.owner_id,
