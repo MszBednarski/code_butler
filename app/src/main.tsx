@@ -1,6 +1,15 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import ReactDOM from "react-dom/client";
 import "./style.css";
+import { explainButler } from "./communication";
+import { attachWorkspaceViewport } from "./workspace-viewport";
+import LandingTour from "./LandingTour";
 
 type User = {
   id: string;
@@ -94,6 +103,11 @@ type Project = {
   }[];
   tasks: { kind: string; state: string; error?: string; attempts: number }[];
 };
+function jobPreviewUrl(job: Job) {
+  return job.state === "awaiting_approval"
+    ? job.artifactUrl
+    : job.previewUrl || job.artifactUrl;
+}
 type Summary = Pick<
   Project,
   "id" | "name" | "description" | "state" | "appUrl"
@@ -258,8 +272,41 @@ function Alert({ children }: { children: React.ReactNode }) {
   return (
     <div className="notice" role="alert">
       <Icon name="spark" size={17} />
-      <span>{children}</span>
+      <div className="notice-body">
+        {typeof children === "string" ? (
+          <ButlerText text={children} kind="error" />
+        ) : (
+          children
+        )}
+      </div>
     </div>
+  );
+}
+function ButlerText({
+  text,
+  kind = "message",
+  developerUrl,
+}: {
+  text: string;
+  kind?: string;
+  developerUrl?: string;
+}) {
+  const explanation = explainButler(text, kind);
+  return (
+    <>
+      <p>{explanation}</p>
+      {(explanation !== text.trim() || developerUrl) && (
+        <details className="developer-details">
+          <summary>Details for developers</summary>
+          {explanation !== text.trim() && <p>{text}</p>}
+          {developerUrl && (
+            <a href={developerUrl} target="_blank" rel="noopener noreferrer">
+              View code review on GitHub <Icon name="external" size={12} />
+            </a>
+          )}
+        </details>
+      )}
+    </>
   );
 }
 async function copy(text: string) {
@@ -327,11 +374,12 @@ function Landing({ session, error }: { session: Session; error: string }) {
             <br />
             Your people.
             <br />
-            <em>Something real.</em>
+            <em>One website.</em>
           </h1>
           <p className="hero-description">
-            Bring the whole team into building. Share a link, say what you want
-            to change, and watch your website come to life.
+            Building together should be as easy as sharing a link. One person
+            connects the tools. Everyone else scans a QR code and starts
+            creating — by typing or talking, right from their phone.
           </p>
           {error && <Alert>{error}</Alert>}
           <div id="get-started" className="hero-actions">
@@ -349,16 +397,14 @@ function Landing({ session, error }: { session: Session; error: string }) {
               Start with GitHub
               <Icon name="arrow" size={18} />
             </a>
-            <span>
-              One setup for you.
-              <br />
-              One link for everyone else.
-            </span>
+            <a className="button ghost" href="#try-butler">
+              Try the experience <Icon name="arrow" size={16} />
+            </a>
           </div>
           {!session.capabilities.github && (
             <p className="setup-note">
-              Sign-in is being prepared. Your Butler operator needs to connect
-              GitHub.
+              Sign-in is being prepared. You can try the demo while we get
+              ready.
             </p>
           )}
           <div className="hero-proof">
@@ -374,68 +420,7 @@ function Landing({ session, error }: { session: Session; error: string }) {
             </span>
           </div>
         </section>
-        <section
-          className="hero-scene"
-          aria-label="An illustration of collaborating with Butler"
-        >
-          <div className="scene-note">
-            Everyone’s invited.<span>↘</span>
-          </div>
-          <div className="scene-window">
-            <div className="scene-toolbar">
-              <span className="window-dots">
-                <i />
-                <i />
-                <i />
-              </span>
-              <span>the weekend project</span>
-              <span className="live-pill">
-                <i />
-                LIVE
-              </span>
-            </div>
-            <div className="scene-site">
-              <span className="mini-label">A PLACE FOR GOOD COMPANY</span>
-              <h2>
-                More time
-                <br />
-                together.
-              </h2>
-              <div className="scene-arches">
-                <span />
-                <span />
-                <span />
-              </div>
-              <span className="scene-site-button">Make a little room ↗</span>
-            </div>
-            <div className="scene-chat">
-              <Avatar name="Maya" index={2} />
-              <div>
-                <strong>Maya</strong>
-                <p>Can we make it feel a little warmer?</p>
-              </div>
-            </div>
-            <div className="scene-chat answer">
-              <span className="mini-butler">✳</span>
-              <div>
-                <strong>Butler</strong>
-                <p>A softer palette, a friendlier welcome. Done.</p>
-                <span className="published">
-                  <Icon name="check" size={13} /> Change published
-                </span>
-              </div>
-            </div>
-          </div>
-          <div className="floating-request">
-            <Avatar name="Sam" index={3} />
-            <span>“Let’s add a place to RSVP.”</span>
-            <span className="tiny-star">✳</span>
-          </div>
-          <div className="scene-footer">
-            <span>Different people.</span>
-            <span>One shared creation.</span>
-          </div>
-        </section>
+        <LandingTour />
       </main>
       <section className="how-it-works">
         <div>
@@ -456,9 +441,68 @@ function Landing({ session, error }: { session: Session; error: string }) {
           <span>03</span>
           <h3>Make it together</h3>
           <p>
-            Type or dictate a change. Butler builds, reviews, and publishes it.
+            Type or dictate a change. Try the preview. Say “Make this the
+            website” when you’re happy with it.
           </p>
         </div>
+      </section>
+      <section className="landing-benefits" aria-label="Why build with Butler">
+        <div className="landing-benefits-heading">
+          <span className="eyebrow">EVERY VOICE CAN MAKE SOMETHING</span>
+          <h2>
+            One project.
+            <br />
+            <em>Your whole team, building.</em>
+          </h2>
+        </div>
+        <div className="landing-benefit-grid">
+          <article>
+            <span>↗</span>
+            <h3>Invite, don’t install.</h3>
+            <p>
+              One link or QR code is all your teammates need. No terminal, tool
+              setup, or coding experience. Just a name and an idea.
+            </p>
+          </article>
+          <article>
+            <span>✳</span>
+            <h3>See it happen together.</h3>
+            <p>
+              Each person gets a Butler. Follow each other’s chats, see what’s
+              being made, and try changes on the same shared website.
+            </p>
+          </article>
+          <article>
+            <span>✓</span>
+            <h3>Try it. Then make it live.</h3>
+            <p>
+              A preview first, your say next. Butler checks approved changes and
+              updates the website for everyone.
+            </p>
+          </article>
+        </div>
+      </section>
+      <section className="landing-ownership">
+        <div>
+          <span className="eyebrow">QUICK TO START. YOURS TO KEEP.</span>
+          <h2>
+            Start with a little vibe.
+            <br />
+            Take it as far as you like.
+          </h2>
+          <p>
+            Your code stays in your GitHub. Underneath the easy experience are
+            real pull requests, reviews, and automatic publishing. Bring in your
+            usual development tools whenever you’re ready. Butler stays with
+            you.
+          </p>
+        </div>
+        <a
+          className="button primary"
+          href={session.capabilities.github ? "/auth/github" : "#get-started"}
+        >
+          Bring your team <Icon name="arrow" size={17} />
+        </a>
       </section>
       <footer className="site-footer">
         <Brand small />
@@ -759,9 +803,8 @@ function Dashboard({
     setBusy(true);
     try {
       const result = await api<{ id: string }>("/api/projects", {
-        name:
-          description.trim().split(/\s+/).slice(0, 5).join(" ").slice(0, 45) ||
-          "Our next idea",
+        name: "Your new project",
+        generateName: true,
         description,
         requestKey: createKey,
         workspaceId: useBoat ? undefined : workspace,
@@ -836,7 +879,7 @@ function Dashboard({
             {step === 0
               ? "Let Butler create and save your project for you."
               : step === 1
-                ? `Butler uses your ${useBoat ? "Boat" : "Railway"} account to host your app and your team’s agents.`
+                ? `Butler uses your ${useBoat ? "Boat" : "Railway"} account to keep your website and your team’s Butlers running.`
                 : "Describe the idea in your own words. Butler will set everything up."}
           </p>
           {(error || authError) && <Alert>{error || authError}</Alert>}
@@ -1174,6 +1217,72 @@ function Invite({
   );
 }
 
+function ShareWebsite({
+  projectId,
+  onClose,
+}: {
+  projectId: string;
+  onClose: () => void;
+}) {
+  const [share, setShare] = useState<{ url: string; qr: string } | null>(null),
+    [message, setMessage] = useState("");
+  useEffect(() => {
+    api<{ url: string; qr: string }>(`/api/projects/${projectId}/share`)
+      .then(setShare)
+      .catch((e) => setMessage(e.message));
+  }, [projectId]);
+  return (
+    <Modal title="Share the current website." onClose={onClose}>
+      <p>
+        Scan to open the live website on any phone. Anyone can look — they won’t
+        be joining your team.
+      </p>
+      {share ? (
+        <>
+          <span className="share-live-label">CURRENT WEBSITE · LIVE</span>
+          <img
+            className="share-website-qr"
+            src={share.qr}
+            alt="QR code for the current website"
+          />
+          <input
+            className="copy-input"
+            aria-label="Current website link"
+            readOnly
+            value={share.url}
+            onFocus={(event) => event.target.select()}
+          />
+          <button
+            className="button primary full"
+            onClick={() =>
+              copy(share.url)
+                .then(() => setMessage("Website link copied."))
+                .catch((e) => setMessage(e.message))
+            }
+          >
+            <Icon name="copy" size={16} />
+            Copy website link
+          </button>
+          <a
+            className="text-button share-open-link"
+            href={share.url}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Open website <Icon name="external" size={13} />
+          </a>
+        </>
+      ) : (
+        !message && <Spinner />
+      )}
+      {message && (
+        <p className="inline-status" role="status">
+          {message}
+        </p>
+      )}
+    </Modal>
+  );
+}
 function SaveAccess({
   session,
   projectId,
@@ -1388,26 +1497,30 @@ function CodexConnection({
             Connect Codex
           </button>
         )}
-        {connection.message && <small>{connection.message}</small>}
-        {error && <small role="alert">{error}</small>}
+        {connection.message && <ButlerText text={connection.message} />}
+        {error && (
+          <div role="alert">
+            <ButlerText text={error} kind="error" />
+          </div>
+        )}
       </div>
     </div>
   );
 }
 const jobLabel: Record<string, string> = {
-  queued: "Queued",
-  working: "Working",
-  reviewing: "Reviewing",
-  building_preview: "Building preview",
-  awaiting_approval: "Ready to inspect",
-  creating_pr: "Sending for review",
-  deploying: "Publishing",
-  live: "Live",
+  queued: "Waiting to start",
+  working: "Making your changes",
+  reviewing: "Checking your changes",
+  building_preview: "Preparing preview",
+  awaiting_approval: "Ready to try",
+  creating_pr: "Preparing to publish",
+  deploying: "Updating website",
+  live: "On the website",
   unchanged: "Done",
-  failed: "Agent stopped",
-  preview_failed: "Preview failed",
-  publish_failed: "Website update failed",
-  needs_attention: "Review blocked",
+  failed: "Butler paused",
+  preview_failed: "Preview couldn’t load",
+  publish_failed: "Website hasn’t updated",
+  needs_attention: "Changes need more work",
 };
 function elapsed(start: number, end: number) {
   const seconds = Math.max(0, Math.floor((end - start) / 1000));
@@ -1422,8 +1535,8 @@ function statusLabel(job: Pick<Job, "state" | "error">) {
     /bwrap|namespace|Review could not|reviewer process|review.*retry|review.*paused/i.test(
       job.error || "",
     )
-    ? "Review could not run"
-    : jobLabel[job.state] || job.state;
+    ? "Website checks paused"
+    : jobLabel[job.state] || "Getting ready";
 }
 function JobState({ job, clock = Date.now() }: { job: Job; clock?: number }) {
   return (
@@ -1464,8 +1577,10 @@ function Workspace({
   const [project, setProject] = useState<Project | null>(null),
     [error, setError] = useState(""),
     [invite, setInvite] = useState(false),
+    [sharingWebsite, setSharingWebsite] = useState(false),
     [saving, setSaving] = useState(false),
     [tab, setTab] = useState("chat"),
+    [teamSection, setTeamSection] = useState("activity"),
     [sending, setSending] = useState(false),
     [codexReady, setCodexReady] = useState(false),
     [memberId, setMemberId] = useState(""),
@@ -1474,15 +1589,34 @@ function Workspace({
   const [text, setText] = useState(
     () => localStorage.getItem(`butler-draft-${projectId}`) || "",
   );
-  const bottom = useRef<HTMLDivElement>(null),
+  const conversation = useRef<HTMLDivElement>(null),
     textarea = useRef<HTMLTextAreaElement>(null),
     lastMessage = useRef(""),
+    lastChat = useRef(""),
+    scrollAfterSend = useRef(false),
     pendingKey = useRef<{ text: string; key: string } | null>(null),
     lastLive = useRef("");
   const [previewVersion, setPreviewVersion] = useState("");
+  const [frameReload, setFrameReload] = useState(0);
   const [artifact, setArtifact] = useState<Job | null>(null);
   const [approvalBusy, setApprovalBusy] = useState(false);
   const [inspection, setInspection] = useState("");
+  const workspaceVisible = Boolean(
+    project &&
+      !(
+        project.isOwner &&
+        !project.codingReady &&
+        !codexReady &&
+        (project.state !== "ready" ||
+          project.jobs.every(
+            (job) => job.requestKey === "initial" && job.state === "queued",
+          ))
+      ),
+  );
+  useEffect(
+    () => (workspaceVisible ? attachWorkspaceViewport() : undefined),
+    [workspaceVisible],
+  );
   const refresh = useCallback(async () => {
     try {
       const data = await api<Project>(
@@ -1490,7 +1624,9 @@ function Workspace({
       );
       setProject(data);
       setError("");
-      const live = data.jobs.filter((j) => j.state === "live").at(-1)?.id;
+      const live =
+        data.releases?.find((release) => release.isLive)?.sha ||
+        data.jobs.filter((j) => j.state === "live").at(-1)?.id;
       if (live && lastLive.current !== live) {
         lastLive.current = live;
         setPreviewVersion(live);
@@ -1510,6 +1646,11 @@ function Workspace({
       setChatId("");
     } else setChatId(id);
     setTab("chat");
+  }
+  function selectPanel(value: string) {
+    setTab(value);
+    if (value === "team") setTeamSection("activity");
+    if (value === "updates") setTeamSection("updates");
   }
   const connected = useCallback(() => setCodexReady(true), []);
   useEffect(() => {
@@ -1585,16 +1726,24 @@ function Workspace({
         Math.min(textarea.current.scrollHeight, 150) + "px";
     }
   }, [text, projectId]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const latest = project?.messages.at(-1)?.id;
+    const chat = project?.chatMember?.id || project?.member.id;
     if (latest && latest !== lastMessage.current) {
-      const hadPrevious = Boolean(lastMessage.current);
       lastMessage.current = latest;
-      if (hadPrevious && (!project?.isOwner || codexReady))
-        bottom.current?.scrollIntoView({
-          behavior: "smooth",
-          block: "nearest",
+      const panel = conversation.current;
+      if (
+        panel &&
+        (scrollAfterSend.current ||
+          lastChat.current !== chat ||
+          panel.scrollHeight - panel.scrollTop - panel.clientHeight < 140)
+      )
+        panel.scrollTo({
+          top: panel.scrollHeight,
+          behavior: lastChat.current === chat ? "smooth" : "auto",
         });
+      lastChat.current = chat || "";
+      scrollAfterSend.current = false;
     }
   }, [project?.messages]);
   async function send(event?: React.FormEvent) {
@@ -1615,6 +1764,7 @@ function Workspace({
         ? pendingKey.current
         : { text: draft, key: crypto.randomUUID() };
     pendingKey.current = request;
+    scrollAfterSend.current = true;
     try {
       await api(
         `/api/projects/${projectId}/messages${memberId ? "?member=" + memberId : ""}`,
@@ -1640,6 +1790,10 @@ function Workspace({
   function inspect(job: Job) {
     setArtifact(job);
     setInspection("");
+    setTab("preview");
+  }
+  function showCurrentWebsite() {
+    setArtifact(null);
     setTab("preview");
   }
   async function markInspected(job: Job) {
@@ -1719,7 +1873,10 @@ function Workspace({
   const canApprove =
     shownArtifact?.memberId === project.member.id &&
     shownArtifact?.state === "awaiting_approval";
-  const websiteUrl = shownArtifact?.artifactUrl || project.appUrl;
+  const latestPreview = project.jobs.filter((job) => jobPreviewUrl(job)).at(-1);
+  const websiteUrl = shownArtifact
+    ? jobPreviewUrl(shownArtifact)
+    : project.appUrl;
   const firstSetup =
     project.isOwner &&
     !project.codingReady &&
@@ -1748,7 +1905,7 @@ function Workspace({
           <p className="page-description">
             {preparing
               ? "Your idea is saved. Butler is creating your project and getting your team’s workspace ready."
-              : "Use your Codex subscription to give everyone an agent. Then you can invite your team."}
+              : "Connect your Codex subscription once. Then invite everyone to their own Butler."}
           </p>
           <section className="create-card onboarding-card">
             {project.githubAccess ? (
@@ -1816,7 +1973,7 @@ function Workspace({
           <button
             className="avatar-stack team-toggle"
             aria-label="Show your team"
-            onClick={() => setTab(tab === "team" ? "chat" : "team")}
+            onClick={() => selectPanel(tab === "team" ? "chat" : "team")}
           >
             {project.members.slice(0, 4).map((m, i) => (
               <Avatar key={m.id} name={m.name} index={i} />
@@ -1842,7 +1999,7 @@ function Workspace({
       </header>
       <div className="mobile-tabs" role="tablist" aria-label="Workspace panels">
         {[
-          ["chat", "chat", "Your agent"],
+          ["chat", "chat", "Your chat"],
           ["preview", "grid", "Website"],
           ["team", "users", "Team"],
           ["updates", "check", "Updates"],
@@ -1852,7 +2009,7 @@ function Workspace({
             role="tab"
             aria-selected={tab === value}
             className={tab === value ? "selected" : ""}
-            onClick={() => setTab(value)}
+            onClick={() => selectPanel(value)}
           >
             <Icon name={icon} size={16} />
             {label}
@@ -1860,29 +2017,99 @@ function Workspace({
         ))}
       </div>
       <main className={"project-layout tab-" + tab}>
-        <section className="preview-panel">
-          <div className="panel-top">
-            <span>
-              <span
-                className={"status-dot" + (project.appUrl ? " green" : "")}
-              />
-              {shownArtifact
-                ? "Your preview"
-                : project.appUrl
-                  ? "Your shared website"
-                  : "Your website starts here"}
-            </span>
-            {websiteUrl && (
-              <a
-                className="icon-button"
-                href={websiteUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                aria-label="Open website"
+        <section
+          className={
+            "preview-panel" +
+            (shownArtifact ? " showing-preview" : " showing-current")
+          }
+          aria-label="Website viewer"
+        >
+          <div className="website-toolbar">
+            <div
+              className="website-switch"
+              role="tablist"
+              aria-label="Website version"
+            >
+              <button
+                role="tab"
+                aria-selected={!shownArtifact}
+                onClick={showCurrentWebsite}
               >
-                <Icon name="external" size={16} />
-              </a>
-            )}
+                Current website
+              </button>
+              <button
+                role="tab"
+                aria-selected={Boolean(shownArtifact)}
+                disabled={!latestPreview && !shownArtifact}
+                onClick={() => {
+                  const job = shownArtifact || latestPreview;
+                  if (job) inspect(job);
+                }}
+              >
+                Change preview
+              </button>
+            </div>
+            <div className="website-toolbar-actions">
+              <button
+                className="icon-button"
+                disabled={!websiteUrl}
+                onClick={() => setFrameReload((value) => value + 1)}
+                aria-label={
+                  shownArtifact
+                    ? "Refresh change preview"
+                    : "Refresh current website"
+                }
+                title="Refresh website"
+              >
+                <Icon name="refresh" size={16} />
+              </button>
+              {websiteUrl && (
+                <a
+                  className="icon-button"
+                  href={websiteUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={
+                    shownArtifact
+                      ? "Open change preview in new tab"
+                      : "Open current website in new tab"
+                  }
+                  title="Open in new tab"
+                >
+                  <Icon name="external" size={16} />
+                </a>
+              )}
+            </div>
+          </div>
+          <div className="website-context" aria-live="polite">
+            <div>
+              <h2>{shownArtifact ? "Change preview" : "Current website"}</h2>
+              <span className="website-version-badge">
+                {shownArtifact
+                  ? "PREVIEW"
+                  : project.appUrl
+                    ? "LIVE"
+                    : "GETTING READY"}
+              </span>
+              <button
+                className="button ghost compact website-share"
+                disabled={!project.appUrl}
+                onClick={() => setSharingWebsite(true)}
+                aria-label="Share current website"
+              >
+                <Icon name="link" size={14} />
+                Share
+              </button>
+            </div>
+            <p>
+              {shownArtifact
+                ? shownArtifact.state === "live"
+                  ? "Preview copy of a published change."
+                  : canApprove
+                    ? "Draft version · not published to your team’s website."
+                    : "Separate preview · not the current website."
+                : "The published version your team shares."}
+            </p>
           </div>
           {shownArtifact && (
             <div className="artifact-banner">
@@ -1910,9 +2137,6 @@ function Workspace({
                   Make this the website
                 </button>
               )}
-              <button className="text-button" onClick={() => setArtifact(null)}>
-                Back to shared website
-              </button>
               {error && <Alert>{error}</Alert>}
             </div>
           )}
@@ -1921,8 +2145,8 @@ function Workspace({
               <iframe
                 key={
                   shownArtifact
-                    ? shownArtifact.id + shownArtifact.changeSha
-                    : previewVersion
+                    ? shownArtifact.id + shownArtifact.changeSha + frameReload
+                    : previewVersion + frameReload
                 }
                 src={
                   websiteUrl +
@@ -1932,7 +2156,7 @@ function Workspace({
                 }
                 title={
                   project.name +
-                  (shownArtifact ? " change preview" : " live website")
+                  (shownArtifact ? " — change preview" : " — current website")
                 }
                 onLoad={() => {
                   if (shownArtifact) markInspected(shownArtifact);
@@ -2014,7 +2238,7 @@ function Workspace({
               </span>
             )}
           </div>
-          <div className="conversation-scroll">
+          <div className="conversation-scroll" ref={conversation}>
             {preparing && (
               <div className="provision-card">
                 <span className="small-label">MAKING ROOM FOR YOUR TEAM</span>
@@ -2049,7 +2273,9 @@ function Workspace({
                 </div>
                 {project.error && project.isOwner && (
                   <>
-                    <p className="setup-error">{project.error}</p>
+                    <div className="setup-error">
+                      <ButlerText text={project.error} kind="error" />
+                    </div>
                     <button className="text-button" onClick={retry}>
                       Try again <Icon name="refresh" size={13} />
                     </button>
@@ -2066,21 +2292,28 @@ function Workspace({
                   <Alert key={task.kind + index}>
                     <strong>
                       {task.kind === "worker-update"
-                        ? "Agent update failed"
+                        ? "Butler couldn’t update its workspace"
                         : task.kind === "sync-history"
                           ? "Website history could not be loaded"
-                          : "Website publishing failed"}
+                          : task.kind === "artifact"
+                            ? "Your preview isn’t ready yet"
+                            : "Your website hasn’t updated yet"}
                     </strong>
-                    <p>
-                      {task.error || "Your work is saved. Retry this step."}
-                    </p>
+                    <ButlerText
+                      text={
+                        task.error || "Your work is saved. Try this step again."
+                      }
+                      kind="error"
+                    />
                     <button className="text-button" onClick={retry}>
                       Retry{" "}
                       {task.kind === "worker-update"
-                        ? "agent update"
+                        ? "workspace update"
                         : task.kind === "sync-history"
                           ? "history sync"
-                          : "publishing"}{" "}
+                          : task.kind === "artifact"
+                            ? "preview"
+                            : "publishing"}{" "}
                       <Icon name="refresh" size={13} />
                     </button>
                   </Alert>
@@ -2099,7 +2332,7 @@ function Workspace({
                 <small>
                   {readOnly
                     ? "Everyone on this project can follow the work here. Send requests from your own chat."
-                    : "Tell me in your own words. I’ll build a preview. Inspect it, then choose Make this the website to send it for review and publishing."}
+                    : "Tell me in your own words. I’ll make a preview. Try it, then choose Make this the website when you’re happy with it."}
                 </small>
               </div>
             </div>
@@ -2122,7 +2355,7 @@ function Workspace({
                     {message.kind && message.kind !== "message" && (
                       <small className="message-caption">
                         {message.kind === "review"
-                          ? "Reviewer"
+                          ? "Website checks"
                           : message.kind === "error"
                             ? "Update failed"
                             : message.kind === "status"
@@ -2133,7 +2366,11 @@ function Workspace({
                           : ""}
                       </small>
                     )}
-                    <p>{message.text}</p>
+                    {message.role === "user" ? (
+                      <p>{message.text}</p>
+                    ) : (
+                      <ButlerText text={message.text} kind={message.kind} />
+                    )}
                     {message.role === "user" && job && (
                       <JobState job={job} clock={clock} />
                     )}
@@ -2144,16 +2381,17 @@ function Workspace({
             {latestJob?.error && (
               <Alert>
                 <strong>{statusLabel(latestJob)}</strong>
-                <p>{latestJob.error}</p>
+                <ButlerText
+                  text={latestJob.error}
+                  kind="error"
+                  developerUrl={latestJob.prUrl}
+                />
                 {!readOnly && latestJob.state === "preview_failed" ? (
                   <button
                     className="text-button"
                     onClick={() => retryPreview(latestJob)}
                   >
-                    Retry{" "}
-                    {latestJob.approvedAt
-                      ? "opening the pull request"
-                      : "preview"}{" "}
+                    Retry {latestJob.approvedAt ? "publishing" : "preview"}{" "}
                     <Icon name="refresh" size={13} />
                   </button>
                 ) : (
@@ -2163,23 +2401,14 @@ function Workspace({
                       className="text-button"
                       onClick={() => {
                         setText(
-                          `Continue my request and fix this problem: ${latestJob.error}`,
+                          "Please finish my changes and fix the problem you found.",
                         );
-                        textarea.current?.focus();
+                        textarea.current?.focus({ preventScroll: true });
                       }}
                     >
-                      Ask my agent to fix it <Icon name="arrow" size={13} />
+                      Ask Butler to fix this <Icon name="arrow" size={13} />
                     </button>
                   )
-                )}
-                {latestJob.prUrl && (
-                  <a
-                    href={latestJob.prUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    Open pull request
-                  </a>
                 )}
               </Alert>
             )}
@@ -2200,7 +2429,7 @@ function Workspace({
                       : latestJob.state === "building_preview"
                         ? "Building your preview…"
                         : latestJob.state === "creating_pr"
-                          ? "Opening your approved change for review…"
+                          ? "Getting your change ready for the website…"
                           : latestJob.state === "reviewing"
                             ? "Making sure everything works together…"
                             : "Publishing your change…"}
@@ -2213,7 +2442,9 @@ function Workspace({
               .filter((j) => j.state === "awaiting_approval" && j.artifactUrl)
               .map((job) => (
                 <article className="artifact-card" key={job.id}>
-                  <span className="small-label">PREVIEW READY · NO PR YET</span>
+                  <span className="small-label">
+                    PREVIEW READY · NOT PUBLISHED
+                  </span>
                   <strong>{job.prTitle || "Your change is ready"}</strong>
                   <p>
                     {readOnly
@@ -2233,19 +2464,19 @@ function Workspace({
               .filter((j) => j.previewUrl)
               .slice(-1)
               .map((job) => (
-                <a
+                <button
                   key={job.id}
                   className="preview-link"
-                  href={job.previewUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
+                  onClick={() =>
+                    job.state === "live" ? showCurrentWebsite() : inspect(job)
+                  }
                 >
                   <Icon name="grid" size={16} />
                   {job.state === "live"
-                    ? "Your change has been published"
-                    : "Take a look at your change"}
-                  <Icon name="external" size={14} />
-                </a>
+                    ? "View current website"
+                    : "View change preview"}
+                  <Icon name="arrow" size={14} />
+                </button>
               ))}
             {session.user?.isGuest && project.messages.length > 0 && (
               <button
@@ -2261,7 +2492,6 @@ function Workspace({
               </button>
             )}
             {error && <Alert>{error}</Alert>}
-            <div ref={bottom} />
           </div>
           {readOnly ? (
             <div className="composer read-only-notice">
@@ -2313,116 +2543,163 @@ function Workspace({
             </form>
           )}
         </section>
-        <section className="team-panel">
+        <section className="team-panel" aria-label="Team and website updates">
           <div className="panel-top">
             <strong>
-              {tab === "updates" ? "Website updates" : "Your people"}
+              {teamSection === "updates" ? "Website updates" : "Your team"}
             </strong>
             <span>{project.members.length}</span>
           </div>
+          <div
+            className="team-section-switch"
+            role="tablist"
+            aria-label="Team views"
+          >
+            <button
+              role="tab"
+              aria-selected={teamSection === "activity"}
+              onClick={() => selectPanel("team")}
+            >
+              People & activity
+            </button>
+            <button
+              role="tab"
+              aria-selected={teamSection === "updates"}
+              onClick={() => selectPanel("updates")}
+            >
+              Website updates
+            </button>
+          </div>
           <div className="team-content">
-            <div className="team-overview">
-              {project.members.map((member, i) => (
-                <div className="team-member" key={member.id}>
-                  <Avatar name={member.name} index={i} />
-                  <div>
-                    <strong>{member.name}</strong>
-                    <small>
-                      {member.agentState
-                        ? `${statusLabel({ state: member.agentState })}${member.startedAt ? ` · ${elapsed(member.startedAt, member.finishedAt || clock)}` : ""}`
-                        : member.role === "owner"
-                          ? "Team lead"
-                          : "Teammate"}
-                    </small>
+            {teamSection === "activity" ? (
+              <div className="team-overview">
+                <section className="team-roster" aria-label="Team members">
+                  <div className="team-section-heading">
+                    <h3>People</h3>
+                    <p>Your teammates and their Butlers.</p>
                   </div>
-                  <button
-                    className="text-button"
-                    onClick={() => viewChat(member.id)}
-                  >
-                    {project.ownMemberships.some((m) => m.id === member.id)
-                      ? "My chat"
-                      : "View chat"}
-                  </button>
-                </div>
-              ))}
-              {project.isOwner && (
-                <button
-                  className="button ghost full"
-                  onClick={() => setInvite(true)}
-                >
-                  <Icon name="plus" size={16} />
-                  Invite someone
-                </button>
-              )}
-              <h3>Coming together</h3>
-              {project.activity.map((job) => (
-                <div className="activity-item" key={job.id}>
-                  <button
-                    className="text-button"
-                    onClick={() => job.memberId && viewChat(job.memberId)}
-                  >
-                    <strong>{job.name}</strong>
-                  </button>
-                  <p>{job.text}</p>
-                  <JobState job={job} clock={clock} />
-                </div>
-              ))}
-            </div>
-            <div className="release-history">
-              <h3>Website updates</h3>
-              {(!project.releases || project.releases.length === 0) && (
-                <p className="quiet-note">
-                  Merged pull requests and live website updates will appear
-                  here.
-                </p>
-              )}
-              {project.releases?.map((release) => (
-                <article className="release-card" key={release.number}>
-                  <div className="release-top">
-                    <a
-                      href={release.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                  {project.members.map((member, i) => (
+                    <div className="team-member" key={member.id}>
+                      <Avatar name={member.name} index={i} />
+                      <div>
+                        <strong>{member.name}</strong>
+                        <small>
+                          {member.agentState
+                            ? `${statusLabel({ state: member.agentState })}${member.startedAt ? ` · ${elapsed(member.startedAt, member.finishedAt || clock)}` : ""}`
+                            : member.role === "owner"
+                              ? "Team lead"
+                              : "Teammate"}
+                        </small>
+                      </div>
+                      <button
+                        className="text-button"
+                        onClick={() => viewChat(member.id)}
+                      >
+                        {project.ownMemberships.some((m) => m.id === member.id)
+                          ? "My chat"
+                          : "View chat"}
+                      </button>
+                    </div>
+                  ))}
+                  {project.isOwner && (
+                    <button
+                      className="button ghost full"
+                      onClick={() => setInvite(true)}
                     >
-                      PR #{release.number} <Icon name="external" size={12} />
-                    </a>
-                    <span
-                      className={
-                        release.isLive ? "release-live" : "release-pending"
-                      }
-                    >
-                      {release.isLive ? "Live" : "Merged · publishing"}
-                    </span>
+                      <Icon name="plus" size={16} />
+                      Invite someone
+                    </button>
+                  )}
+                </section>
+                <section className="team-activity" aria-label="Team activity">
+                  <div className="team-section-heading">
+                    <h3>Team activity</h3>
+                    <p>Requests and work in progress.</p>
                   </div>
-                  <strong>{release.title}</strong>
-                  <small>
-                    {release.author}
-                    {release.mergedAt
-                      ? ` · Merged ${new Date(release.mergedAt).toLocaleString()}`
-                      : " · Previously merged"}
-                  </small>
-                  {release.publishedAt && (
+                  {project.activity.length === 0 && (
+                    <p className="quiet-note">
+                      Your team’s requests will appear here.
+                    </p>
+                  )}
+                  {project.activity.map((job) => (
+                    <div className="activity-item" key={job.id}>
+                      <button
+                        className="text-button"
+                        onClick={() => job.memberId && viewChat(job.memberId)}
+                      >
+                        <strong>{job.name}</strong>
+                      </button>
+                      <p>{job.text}</p>
+                      <JobState job={job} clock={clock} />
+                    </div>
+                  ))}
+                </section>
+              </div>
+            ) : (
+              <div className="release-history">
+                <div className="team-section-heading">
+                  <h3>Website updates</h3>
+                  <p>What changed, who made it, and when it went live.</p>
+                </div>
+                {(!project.releases || project.releases.length === 0) && (
+                  <p className="quiet-note">
+                    Follow your team’s changes as they’re added to the website.
+                  </p>
+                )}
+                {project.releases?.map((release) => (
+                  <article className="release-card" key={release.number}>
+                    <div className="release-top">
+                      <a
+                        href={release.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        Change #{release.number}{" "}
+                        <Icon name="external" size={12} />
+                      </a>
+                      <span
+                        className={
+                          release.isLive ? "release-live" : "release-pending"
+                        }
+                      >
+                        {release.isLive ? "Live" : "Publishing"}
+                      </span>
+                    </div>
+                    <strong>{release.title}</strong>
                     <small>
-                      Published {new Date(release.publishedAt).toLocaleString()}
+                      {release.author}
+                      {release.mergedAt
+                        ? ` · Checked ${new Date(release.mergedAt).toLocaleString()}`
+                        : " · Checked"}
                     </small>
-                  )}
-                  {release.isLive && project.appUrl && (
-                    <a
-                      className="text-button"
-                      href={project.appUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                    >
-                      Open website <Icon name="external" size={12} />
-                    </a>
-                  )}
-                </article>
-              ))}
-            </div>
+                    {release.publishedAt && (
+                      <small>
+                        Published{" "}
+                        {new Date(release.publishedAt).toLocaleString()}
+                      </small>
+                    )}
+                    {release.isLive && project.appUrl && (
+                      <button
+                        className="text-button"
+                        onClick={showCurrentWebsite}
+                      >
+                        View current website <Icon name="arrow" size={12} />
+                      </button>
+                    )}
+                  </article>
+                ))}
+              </div>
+            )}
           </div>
         </section>
       </main>
       {invite && <Invite project={project} onClose={() => setInvite(false)} />}{" "}
+      {sharingWebsite && (
+        <ShareWebsite
+          projectId={projectId}
+          onClose={() => setSharingWebsite(false)}
+        />
+      )}
       {saving && (
         <SaveAccess
           session={session}
@@ -2858,14 +3135,6 @@ function App() {
       setAuthError(value);
       history.replaceState({}, "", location.pathname + location.hash);
     }
-    const resize = () =>
-      document.documentElement.style.setProperty(
-        "--app-height",
-        `${window.visualViewport?.height || innerHeight}px`,
-      );
-    resize();
-    window.visualViewport?.addEventListener("resize", resize);
-    return () => window.visualViewport?.removeEventListener("resize", resize);
   }, [refresh]);
   useEffect(() => {
     refresh();

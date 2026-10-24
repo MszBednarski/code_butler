@@ -136,6 +136,94 @@ function workerCall(f, project, path, body) {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 }
+test("sharing the website returns its canonical public URL and QR, without granting team access", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    other = await f.create("Other project"),
+    inv = await f.invite(p.id),
+    alice = await f.join(inv.url, "Alice");
+  assert.equal(
+    (await f.call(`/api/projects/${p.id}/share`, undefined, alice)).status,
+    409,
+  );
+  f.store.run(
+    "UPDATE projects SET app_url='https://current.example.test' WHERE id=?",
+    p.id,
+  );
+  const share = await (
+    await f.call(
+      `/api/projects/${p.id}/share?url=https://preview.example.test`,
+      undefined,
+      alice,
+    )
+  ).json();
+  assert.equal(share.url, "https://current.example.test");
+  assert.match(share.qr, /^data:image\/png;base64,/);
+  assert.deepEqual(Object.keys(share).sort(), ["qr", "url"]);
+  assert.ok(!JSON.stringify(share).includes(inv.url));
+  assert.equal(
+    (await f.call(`/api/projects/${other.id}/share`, undefined, alice)).status,
+    404,
+  );
+  assert.equal(
+    (await f.call(`/api/projects/${p.id}/share`, undefined, "")).status,
+    401,
+  );
+});
+test("automatic project names are scoped, persistent and never replace an explicit name", async (t) => {
+  const f = await fixture(t);
+  const created = await (
+    await f.call("/api/projects", {
+      name: "Your new project",
+      description: "A phone-friendly tap racing game",
+      generateName: true,
+      requestKey: id(),
+    })
+  ).json();
+  let project = f.store.get("SELECT * FROM projects WHERE id=?", created.id);
+  assert.equal(project.name_source, "pending");
+  const originalSlug = project.slug;
+  const cfg = await (await workerCall(f, project, "/config")).json();
+  assert.equal(cfg.description, "A phone-friendly tap racing game");
+  assert.equal(cfg.nameSource, "pending");
+  assert.equal(
+    (
+      await workerCall(f, project, "/name", {
+        name: "https://wrong.example.test",
+      })
+    ).status,
+    400,
+  );
+  assert.equal(
+    (await workerCall(f, project, "/name", { name: "TapSprint" })).status,
+    200,
+  );
+  project = f.store.get("SELECT * FROM projects WHERE id=?", created.id);
+  assert.equal(project.name, "TapSprint");
+  assert.equal(project.name_source, "generated");
+  assert.equal(project.slug, originalSlug);
+  await workerCall(f, project, "/name", { name: "Accidental rename" });
+  assert.equal(
+    f.store.get("SELECT name FROM projects WHERE id=?", created.id).name,
+    "TapSprint",
+  );
+  const explicit = await f.create("Sunday Table"),
+    manual = f.store.get("SELECT * FROM projects WHERE id=?", explicit.id);
+  await workerCall(f, manual, "/name", { name: "Different name" });
+  assert.equal(
+    f.store.get("SELECT name FROM projects WHERE id=?", explicit.id).name,
+    "Sunday Table",
+  );
+  const page = await (await f.call(`/api/projects/${created.id}`)).json();
+  assert.equal(page.name, "TapSprint");
+  const reopened = createStore(f.dir);
+  assert.equal(
+    reopened.get("SELECT name,name_source FROM projects WHERE id=?", created.id)
+      .name,
+    "TapSprint",
+  );
+  reopened.close();
+});
 test("team chat reads expose live durable progress while writes and worker events remain scoped", async (t) => {
   const f = await fixture(t),
     p = await f.create(),

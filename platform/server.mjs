@@ -388,6 +388,11 @@ export function createPlatform(
         "owner",
         now(),
       );
+      if (b.generateName === true)
+        store.run(
+          "UPDATE projects SET name_source='pending' WHERE id=?",
+          projectId,
+        );
       store.enqueue(projectId, "provision", `provision:${projectId}`);
       const jobId = id();
       store.run(
@@ -574,6 +579,33 @@ export function createPlatform(
     res.json({ ok: true });
   });
   app.get(
+    "/api/projects/:projectId/share",
+    signed,
+    membership,
+    async (req, res) => {
+      const link = req.project.app_url;
+      if (!link)
+        return res.status(409).json({
+          error:
+            "Your website isn’t live yet. You can share it once it’s ready.",
+        });
+      const url = new URL(link);
+      if (url.protocol !== "https:" || url.username || url.password)
+        return res.status(409).json({
+          error: "The website link isn’t ready yet. Please try again shortly.",
+        });
+      res.json({
+        url: link,
+        qr: await QRCode.toDataURL(link, {
+          width: 320,
+          margin: 2,
+          color: { dark: "#153e35", light: "#ffffff" },
+          errorCorrectionLevel: "M",
+        }),
+      });
+    },
+  );
+  app.get(
     "/api/projects/:projectId/invite",
     signed,
     membership,
@@ -634,12 +666,10 @@ export function createPlatform(
           req.member.id,
         );
         if (!job)
-          return res
-            .status(409)
-            .json({
-              error:
-                "Inspect a ready preview first, then choose Make this the website.",
-            });
+          return res.status(409).json({
+            error:
+              "Inspect a ready preview first, then choose Make this the website.",
+          });
         return approveJob(req, res, job, job.change_sha);
       }
       const jobId = store.transaction(() => {
@@ -717,11 +747,9 @@ export function createPlatform(
   );
   function approveJob(req, res, job, sha) {
     if (sha !== job.change_sha)
-      return res
-        .status(409)
-        .json({
-          error: "The preview changed. Inspect the latest version first.",
-        });
+      return res.status(409).json({
+        error: "The preview changed. Inspect the latest version first.",
+      });
     if (job.approved_at) return res.json({ ok: true, jobId: job.id });
     if (
       job.state !== "awaiting_approval" ||
@@ -731,12 +759,9 @@ export function createPlatform(
       !job.pr_title ||
       !job.branch
     )
-      return res
-        .status(409)
-        .json({
-          error:
-            "Inspect your preview first, then choose Make this the website.",
-        });
+      return res.status(409).json({
+        error: "Inspect your preview first, then choose Make this the website.",
+      });
     store.transaction(() => {
       store.run(
         "UPDATE jobs SET state='creating_pr',approved_at=?,updated_at=? WHERE id=?",

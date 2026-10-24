@@ -4,7 +4,10 @@
   "required": ["decision", "summary", "findings"],
   "properties": {
     "decision": { "type": "string", "enum": ["approve", "block"] },
-    "summary": { "type": "string" },
+    "summary": {
+      "type": "string",
+      "description": "One short plain-English explanation for a teammate who has never programmed. Say what they would notice, why the change is or is not ready, and what happens next. Do not include code paths, IDs, PR or git terminology. Keep precise technical evidence in findings."
+    },
     "findings": { "type": "array", "items": { "type": "string" } }
   }
 }

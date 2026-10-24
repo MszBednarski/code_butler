@@ -27,11 +27,30 @@ export function installWorkerApi(app, config, store, provider) {
     res.json({
       id: req.project.id,
       name: req.project.name,
+      description: req.project.description,
+      nameSource: req.project.name_source,
       repo: req.project.repo,
       appUrl: req.project.app_url,
       state: req.project.state,
     }),
   );
+  app.post("/api/worker/name", (req, res) => {
+    const name =
+      typeof req.body.name === "string"
+        ? req.body.name.trim().replace(/\s+/g, " ")
+        : "";
+    if (!name || name.length > 50 || /[\x00-\x1f<>/\\]|https?:/i.test(name))
+      return res.status(400).json({ error: "Choose a short project name." });
+    store.run(
+      "UPDATE projects SET name=?,name_source='generated' WHERE id=? AND name_source='pending'",
+      name,
+      req.project.id,
+    );
+    res.json({
+      name: store.get("SELECT name FROM projects WHERE id=?", req.project.id)
+        .name,
+    });
+  });
   app.post("/api/worker/auth", (req, res) => {
     if (typeof req.body.connected !== "boolean")
       return res.status(400).json({ error: "Invalid connection state." });
@@ -184,12 +203,10 @@ export function installWorkerApi(app, config, store, provider) {
       req.body.state === "reviewing" &&
       !job.approved_at
     )
-      return res
-        .status(409)
-        .json({
-          error:
-            "The user must inspect and approve the preview before a PR is created.",
-        });
+      return res.status(409).json({
+        error:
+          "The user must inspect and approve the preview before a PR is created.",
+      });
     if (
       req.body.state === "building_preview" &&
       (!SHA.test(req.body.sha || "") ||
@@ -199,12 +216,10 @@ export function installWorkerApi(app, config, store, provider) {
         typeof req.body.description !== "string" ||
         req.body.description.length > 20000)
     )
-      return res
-        .status(400)
-        .json({
-          error:
-            "A preview needs a revision and an agent-written title and description.",
-        });
+      return res.status(400).json({
+        error:
+          "A preview needs a revision and an agent-written title and description.",
+      });
     const branch =
       typeof req.body.branch === "string" &&
       /^[a-z0-9-]+\/[a-z0-9-]+$/.test(req.body.branch)
@@ -343,11 +358,9 @@ export function installWorkerApi(app, config, store, provider) {
         )
           return res.status(400).json({ error: "Invalid request branch." });
         if (job.approval_required && !job.approved_at)
-          return res
-            .status(409)
-            .json({
-              error: "Inspect and approve the preview before opening a PR.",
-            });
+          return res.status(409).json({
+            error: "Inspect and approve the preview before opening a PR.",
+          });
         const open = await github(
           `/pulls?state=open&head=${encodeURIComponent(project.repo.split("/")[0] + ":" + b.branch)}`,
         );

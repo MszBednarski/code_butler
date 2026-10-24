@@ -12,6 +12,7 @@ export async function workerSource(directory) {
           "package-lock.json",
           "verdict.schema.json",
           "change.schema.json",
+          "name.schema.json",
         ].includes(name) || /\.mjs$/.test(name),
     )
     .sort();

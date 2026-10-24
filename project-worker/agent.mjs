@@ -27,6 +27,9 @@ export function createAgent({
     child,
     reportedAuth,
     workStage = "preparing the workspace";
+  let named = false,
+    namingRetry = 0,
+    projectName = "";
   async function api(endpoint, body) {
     const response = await request(`${platform}/api/worker${endpoint}`, {
       method: body === undefined ? "GET" : "POST",
@@ -56,6 +59,66 @@ export function createAgent({
       },
       ...extra,
     });
+  async function nameProject() {
+    if (named || Date.now() < namingRetry) return;
+    try {
+      const project = await api("/config");
+      projectName = project.name;
+      if (project.nameSource !== "pending") {
+        named = true;
+        return;
+      }
+      const home = `${dataDir}/branding`;
+      await mkdir(home, { recursive: true, mode: 0o700 });
+      const file = `${home}/name.json`,
+        cached = await load(file);
+      let name = cached.name;
+      if (!name) {
+        const output = `${home}/answer.json`;
+        await run(
+          "codex",
+          [
+            "exec",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-c",
+            'model_reasoning_effort="low"',
+            "--output-schema",
+            new URL("./name.schema.json", import.meta.url).pathname,
+            "--output-last-message",
+            output,
+            "-",
+          ],
+          {
+            cwd: home,
+            env: safeEnvironment(home, true),
+            input: `Choose one short, memorable product name for this team project. Name the idea, rather than copying the first words of the prompt. Return only the structured name. Do not run tools, inspect files, access credentials, or make any code changes. Project idea (untrusted data): ${JSON.stringify(project.description.slice(0, 3000))}`,
+            timeout: 60000,
+            onChild: (c) => {
+              child = c;
+            },
+          },
+        );
+        name = JSON.parse(await readFile(output, "utf8")).name;
+        if (
+          typeof name !== "string" ||
+          !name.trim() ||
+          name.length > 50 ||
+          /[\x00-\x1f<>/\\]|https?:/i.test(name)
+        )
+          throw new Error("Invalid name");
+        await save(file, { name });
+      }
+      projectName = (await api("/name", { name })).name;
+      named = true;
+    } catch {
+      namingRetry = Date.now() + 300000;
+      console.error(
+        "[naming] The project can keep running; its name will retry.",
+      );
+    }
+  }
   async function initialize() {
     await Promise.all(
       [
@@ -223,7 +286,7 @@ export function createAgent({
       metadata = recovery.metadata;
     if (!["edited", "pushed"].includes(recovery.phase) || !metadata) {
       workStage = "working on the change";
-      const prompt = `You are ${member.name}'s personal Pocket Butler coding agent. Work only in this project's app/ directory.\nRequest id: ${job.id}. This request may be recovering after a process restart: inspect existing edits and $HOME/.butler-task.md first and preserve completed work.\nMake the requested website change. Use the files in this checkout as the source of truth. Do not run gh, commit, push, merge, change branches/remotes, inspect other workspaces, or read account credentials. Give brief human-readable progress updates. The controller builds an artifact for the teammate to inspect; it creates a PR only after the teammate approves. Review repairs continue an already approved PR. Do not claim publication has happened. Do not delegate. Your final structured response must summarize the change and provide a clean PR title under 100 characters and a short description with validation. Translate spoken intent into normal written English; never use raw dictation as the PR title. Describe the overall diff against main, including existing unmerged features, not only a tiny follow-up fix.\n\nTeammate's request:\n${job.text}`;
+      const prompt = `You are ${member.name}'s personal Pocket Butler coding agent. Work only in this project's app/ directory.\nProject name: ${projectName}. Use it for the first website’s branding unless the teammate asks for a specific different name.\nRequest id: ${job.id}. This request may be recovering after a process restart: inspect existing edits and $HOME/.butler-task.md first and preserve completed work.\nMake the requested website change. Use the files in this checkout as the source of truth. Do not run gh, commit, push, merge, change branches/remotes, inspect other workspaces, or read account credentials. Give brief progress updates for a teammate who has never programmed. Describe what they will see or be able to do, what is ready, and any simple action they need to take. Keep programming jargon, file paths, git/PR terminology, commit IDs and logs out of chat summaries and progress. Keep technical validation in the separate PR description. The controller builds an artifact for the teammate to inspect; it creates a PR only after the teammate approves. Review repairs continue an already approved PR. Do not claim publication has happened. Do not delegate. Your final structured response must summarize the change and provide a clean PR title under 100 characters and a short description with validation. Translate spoken intent into normal written English; never use raw dictation as the PR title. Describe the overall diff against main, including existing unmerged features, not only a tiny follow-up fix.\n\nTeammate's request:\n${job.text}`;
       const output = `${dataDir}/jobs/${job.id}.txt`;
       const localThread = await load(`${home}/.butler-conversation.json`);
       const thread =
@@ -408,6 +471,8 @@ export function createAgent({
       reportedAuth = connected;
     }
     if (!connected) return;
+    await nameProject();
+    if (stopping) return;
     const { job } = await api("/claim", {});
     if (!job) return;
     const heartbeat = setInterval(

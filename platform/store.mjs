@@ -109,6 +109,25 @@ export function createStore(directory) {
     );
   const all = (sql, ...args) => db.prepare(sql).all(...args);
   const run = (sql, ...args) => db.prepare(sql).run(...args);
+  if (
+    !all("PRAGMA table_info(projects)").some(
+      (column) => column.name === "name_source",
+    )
+  ) {
+    db.exec(
+      "ALTER TABLE projects ADD COLUMN name_source TEXT NOT NULL DEFAULT 'manual'",
+    );
+    for (const project of all("SELECT id,name,description FROM projects")) {
+      const oldName = project.description
+        .trim()
+        .split(/\s+/)
+        .slice(0, 5)
+        .join(" ")
+        .slice(0, 45);
+      if (project.name === oldName || project.name === "Our next idea")
+        run("UPDATE projects SET name_source='pending' WHERE id=?", project.id);
+    }
+  }
   const jobColumns = new Set(
     db
       .prepare("PRAGMA table_info(jobs)")

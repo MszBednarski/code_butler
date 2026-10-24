@@ -3,7 +3,7 @@
   "properties": {
     "summary": {
       "type": "string",
-      "description": "A concise human-readable summary of the finished website changes."
+      "description": "A short summary for someone who has never programmed. Explain what they will see or can do, what is ready, and the next action. Avoid code paths, commit IDs, branches, PRs, build logs and programming jargon."
     },
     "title": {
       "type": "string",

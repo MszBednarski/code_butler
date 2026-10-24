@@ -203,7 +203,8 @@ test("real git transport and app builds carry a teammate request through PR revi
       await call(
         "/api/projects",
         {
-          name: "Together",
+          name: "Your new project",
+          generateName: true,
           description: "A friendly team website",
           requestKey: id(),
         },
@@ -234,7 +235,7 @@ test("real git transport and app builds carry a teammate request through PR revi
   );
   const bin = path.join(dir, "bin");
   await mkdir(bin);
-  const fakeCodex = `#!${process.execPath}\nconst fs=require('fs'),crypto=require('crypto');const args=process.argv.slice(2),out=args[args.indexOf('--output-last-message')+1];if(args[args.indexOf('--output-schema')+1]?.endsWith('verdict.schema.json')){fs.writeFileSync(out,JSON.stringify({decision:'approve',summary:'No blocking findings in the test review.',findings:[]}));}else{let p=fs.readFileSync('app/src/main.tsx','utf8');fs.writeFileSync('app/src/main.tsx',p.replace('__PROJECT_NAME__','Hello Team'));const resume=args.indexOf('resume'),thread=resume>=0?args[resume+1]:crypto.randomUUID();fs.appendFileSync(process.env.HOME+'/invocations.jsonl',JSON.stringify(args)+'\\n');console.log(JSON.stringify({type:'thread.started',thread_id:thread}));fs.writeFileSync(out,JSON.stringify({summary:'Changed the heading to Hello Team.',title:'Update the homepage heading to Hello Team',description:'Show Hello Team as the homepage heading. Validated with the app production build.'}));}\n`;
+  const fakeCodex = `#!${process.execPath}\nconst fs=require('fs'),crypto=require('crypto');const args=process.argv.slice(2),out=args[args.indexOf('--output-last-message')+1];if(args[args.indexOf('--output-schema')+1]?.endsWith('name.schema.json')){fs.writeFileSync(out,JSON.stringify({name:'Team Canvas'}));}else if(args[args.indexOf('--output-schema')+1]?.endsWith('verdict.schema.json')){fs.writeFileSync(out,JSON.stringify({decision:'approve',summary:'No blocking findings in the test review.',findings:[]}));}else{let p=fs.readFileSync('app/src/main.tsx','utf8');fs.writeFileSync('app/src/main.tsx',p.replace('__PROJECT_NAME__','Hello Team'));const resume=args.indexOf('resume'),thread=resume>=0?args[resume+1]:crypto.randomUUID();fs.appendFileSync(process.env.HOME+'/invocations.jsonl',JSON.stringify(args)+'\\n');console.log(JSON.stringify({type:'thread.started',thread_id:thread}));fs.writeFileSync(out,JSON.stringify({summary:'Changed the heading to Hello Team.',title:'Update the homepage heading to Hello Team',description:'Show Hello Team as the homepage heading. Validated with the app production build.'}));}\n`;
   const streamingCodex = fakeCodex.replace(
     "let p=fs.readFileSync",
     `console.log(JSON.stringify({type:'item.completed',item:{id:'item_progress',type:'agent_message',text:'I am updating the heading now.'}}));console.log(JSON.stringify({type:'item.completed',item:{id:'private_item',type:'reasoning',text:'private-reasoning-fixture'}}));let p=fs.readFileSync`,
@@ -288,6 +289,15 @@ test("real git transport and app builds carry a teammate request through PR revi
     ),
   );
   await coding;
+  assert.equal(
+    store.get("SELECT name FROM projects WHERE id=?", projectId).name,
+    "Team Canvas",
+  );
+  assert.equal(
+    JSON.parse(await readFile(path.join(data, "branding/name.json"), "utf8"))
+      .name,
+    "Team Canvas",
+  );
   const job = store.get(
     "SELECT * FROM jobs WHERE project_id=? AND state=?",
     projectId,
