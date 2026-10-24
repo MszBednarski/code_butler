@@ -799,7 +799,7 @@ export function createProvisioner(
   }
   async function openPull(project, { jobId, sha }) {
     const job = store.get(
-      "SELECT j.*,m.name FROM jobs j JOIN members m ON m.id=j.member_id WHERE j.id=? AND j.project_id=?",
+      "SELECT j.*,m.name,COALESCE(u.name,m.name) AS approverName FROM jobs j JOIN members m ON m.id=j.member_id LEFT JOIN users u ON u.id=j.approved_by WHERE j.id=? AND j.project_id=?",
       jobId,
       project.id,
     );
@@ -832,7 +832,7 @@ export function createProvisioner(
         base: "main",
         head: job.branch,
         title: job.pr_title,
-        body: `${job.pr_body}\n\nApproved by **${job.name}** after inspecting the preview.\n\n<!-- butler-job:${job.id} -->`,
+        body: `${job.pr_body}\n\nApproved by **${job.approverName}** after inspecting the preview.\n\n<!-- butler-job:${job.id} -->`,
       });
     }
     if (pr.state === "closed" && !pr.merged)

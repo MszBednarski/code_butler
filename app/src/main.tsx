@@ -13,6 +13,8 @@ import { attachWorkspaceViewport } from "./workspace-viewport";
 import LandingTour from "./LandingTour";
 import Reactions from "./Reactions";
 import type { ReactionSummary, ReactionTarget } from "./Reactions";
+import GroupChat from "./GroupChat";
+import type { GroupMessage } from "./GroupChat";
 
 type User = {
   id: string;
@@ -82,10 +84,12 @@ type Project = {
   member: Member;
   chatMember?: Member;
   readOnly?: boolean;
+  canSteerChat?: boolean;
   members: Member[];
   ownMemberships: Member[];
   messages: ChatMessage[];
   reactions?: ReactionSummary;
+  groupMessages?: GroupMessage[];
   jobs: Job[];
   activity: Job[];
   releases?: {
@@ -1675,7 +1679,21 @@ function Workspace({
   }, []);
   function viewChat(id: string) {
     if (!project) return;
-    if (project.ownMemberships.some((m) => m.id === id)) {
+    const own = project.ownMemberships.some((m) => m.id === id);
+    if (project.isOwner) {
+      const currentKey = chatId
+        ? `butler-draft-${projectId}-chat-${chatId}`
+        : `butler-draft-${projectId}`;
+      const nextKey = own
+        ? `butler-draft-${projectId}`
+        : `butler-draft-${projectId}-chat-${id}`;
+      if (currentKey !== nextKey) {
+        localStorage.setItem(currentKey, text);
+        setText(localStorage.getItem(nextKey) || "");
+        pendingKey.current = null;
+      }
+    }
+    if (own) {
       setMemberId(id);
       setChatId("");
     } else setChatId(id);
@@ -1755,13 +1773,18 @@ function Workspace({
     };
   }, [refresh, refreshSession]);
   useEffect(() => {
-    localStorage.setItem(`butler-draft-${projectId}`, text);
+    localStorage.setItem(
+      chatId && project?.isOwner
+        ? `butler-draft-${projectId}-chat-${chatId}`
+        : `butler-draft-${projectId}`,
+      text,
+    );
     if (textarea.current) {
       textarea.current.style.height = "auto";
       textarea.current.style.height =
         Math.min(textarea.current.scrollHeight, 150) + "px";
     }
-  }, [text, projectId]);
+  }, [text, projectId, chatId, project?.isOwner]);
   useLayoutEffect(() => {
     const latest = project?.messages.at(-1)?.id;
     const chat = project?.chatMember?.id || project?.member.id;
@@ -1788,8 +1811,8 @@ function Workspace({
       !text.trim() ||
       sending ||
       !project ||
-      project.readOnly ||
-      (chatId && chatId !== project.member.id)
+      (project.readOnly && !project.canSteerChat) ||
+      (chatId && chatId !== project.member.id && !project.canSteerChat)
     )
       return;
     setSending(true);
@@ -1803,7 +1826,7 @@ function Workspace({
     scrollAfterSend.current = true;
     try {
       await api(
-        `/api/projects/${projectId}/messages${memberId ? "?member=" + memberId : ""}`,
+        `/api/projects/${projectId}/messages?${new URLSearchParams({ ...(memberId ? { member: memberId } : {}), ...(chatId && project.canSteerChat ? { chat: chatId } : {}) })}`,
         { text: draft, requestKey: request.key },
       );
       setText("");
@@ -1835,7 +1858,7 @@ function Workspace({
   async function markInspected(job: Job) {
     if (
       !project ||
-      job.memberId !== project.member.id ||
+      (job.memberId !== project.member.id && !project.isOwner) ||
       job.state !== "awaiting_approval"
     )
       return;
@@ -1899,6 +1922,25 @@ function Workspace({
       throw error;
     }
   }
+  async function sendGroupMessage(text: string, requestKey: string) {
+    const response = await api<{ message: GroupMessage }>(
+      `/api/projects/${projectId}/group/messages${memberId ? "?member=" + memberId : ""}`,
+      { text, requestKey },
+    );
+    setProject((current) =>
+      current?.id === projectId
+        ? {
+            ...current,
+            groupMessages: [
+              ...(current.groupMessages || []).filter(
+                (message) => message.id !== response.message.id,
+              ),
+              response.message,
+            ],
+          }
+        : current,
+    );
+  }
   if (!project)
     return (
       <div className="loading-page">
@@ -1923,12 +1965,13 @@ function Workspace({
     ].indexOf(project.state),
     latestJob = project.jobs.at(-1);
   const chatMember = project.chatMember || project.member,
-    readOnly = Boolean(project.readOnly);
+    readOnly = Boolean(project.readOnly && !project.canSteerChat),
+    steering = Boolean(project.readOnly && project.canSteerChat);
   const shownArtifact = artifact
     ? project.jobs.find((j) => j.id === artifact.id) || artifact
     : null;
   const canApprove =
-    shownArtifact?.memberId === project.member.id &&
+    (shownArtifact?.memberId === project.member.id || project.isOwner) &&
     shownArtifact?.state === "awaiting_approval";
   const latestPreview = project.jobs.filter((job) => jobPreviewUrl(job)).at(-1);
   const websiteUrl = shownArtifact
@@ -2035,6 +2078,7 @@ function Workspace({
         <nav className="desktop-workspace-nav" aria-label="Workspace panels">
           {[
             ["chat", "chat", "Chat"],
+            ["group", "chat", "Group chat"],
             ["team", "users", "Team"],
             ["updates", "check", "Updates"],
           ].map(([value, icon, label]) => (
@@ -2043,7 +2087,7 @@ function Workspace({
               aria-pressed={
                 sidebarOpen &&
                 (value === "chat"
-                  ? !["team", "updates"].includes(tab)
+                  ? !["team", "updates", "group"].includes(tab)
                   : tab === value)
               }
               onClick={() => selectPanel(value)}
@@ -2084,6 +2128,7 @@ function Workspace({
       <div className="mobile-tabs" role="tablist" aria-label="Workspace panels">
         {[
           ["chat", "chat", "Your chat"],
+          ["group", "chat", "Group"],
           ["preview", "grid", "Website"],
           ["team", "users", "Team"],
           ["updates", "check", "Updates"],
@@ -2091,6 +2136,7 @@ function Workspace({
           <button
             key={value}
             role="tab"
+            aria-label={value === "group" ? "Group chat" : undefined}
             aria-selected={tab === value}
             className={tab === value ? "selected" : ""}
             onClick={() => selectPanel(value)}
@@ -2124,30 +2170,37 @@ function Workspace({
             >
               <Icon name="arrow" size={18} />
             </button>
-            <select
-              className="website-version-picker"
+            <div
+              className="website-version-tabs"
+              role="tablist"
               aria-label="Website version"
-              title={shownArtifact?.prTitle || "Choose which website to view"}
-              value={shownArtifact ? "preview" : "current"}
-              onChange={(event) => {
-                if (event.target.value === "current") showCurrentWebsite();
-                else {
+            >
+              <button
+                role="tab"
+                aria-label="Current website"
+                aria-selected={!shownArtifact}
+                onClick={showCurrentWebsite}
+              >
+                <span>Current website</span>
+                <small>{project.appUrl ? "Live" : "Getting ready"}</small>
+              </button>
+              <button
+                role="tab"
+                aria-label="Preview"
+                aria-selected={Boolean(shownArtifact)}
+                disabled={!latestPreview && !shownArtifact}
+                title={shownArtifact?.prTitle || "Inspect a change preview"}
+                onClick={() => {
                   const job = shownArtifact || latestPreview;
                   if (job) inspect(job);
-                }
-              }}
-            >
-              <option value="current">
-                Current website · {project.appUrl ? "Live" : "Getting ready"}
-              </option>
-              <option
-                value="preview"
-                disabled={!latestPreview && !shownArtifact}
+                }}
               >
-                Change preview ·{" "}
-                {shownArtifact?.state === "live" ? "Copy" : "Not live"}
-              </option>
-            </select>
+                <span>Preview</span>
+                <small>
+                  {shownArtifact?.state === "live" ? "Copy" : "Not live"}
+                </small>
+              </button>
+            </div>
             <div className="website-toolbar-actions">
               <button
                 className="icon-button"
@@ -2296,9 +2349,11 @@ function Workspace({
               <div>
                 <strong>{chatMember.name}’s Butler</strong>
                 <small>
-                  {readOnly
-                    ? "Watching your teammate’s chat"
-                    : "Your chat · visible to your team"}
+                  {steering
+                    ? "Team lead · guiding this agent"
+                    : readOnly
+                      ? "Watching your teammate’s chat"
+                      : "Your chat · visible to your team"}
                 </small>
               </div>
             </div>
@@ -2422,9 +2477,11 @@ function Workspace({
               <span className="mini-butler">✳</span>
               <div>
                 <p>
-                  {readOnly
-                    ? `You’re watching ${chatMember.name}’s conversation.`
-                    : `Hi ${project.member.name.split(" ")[0]}. What would you like to make?`}
+                  {steering
+                    ? `You can guide ${chatMember.name}’s agent and approve their previews.`
+                    : readOnly
+                      ? `You’re watching ${chatMember.name}’s conversation.`
+                      : `Hi ${project.member.name.split(" ")[0]}. What would you like to make?`}
                 </p>
                 <small>
                   {readOnly
@@ -2449,6 +2506,12 @@ function Workspace({
                     <span className="mini-butler">✳</span>
                   )}
                   <div className="message-content">
+                    {message.authorName && (
+                      <small className="message-caption">
+                        {message.authorName}
+                        {message.authorRole === "lead" ? " · team lead" : ""}
+                      </small>
+                    )}
                     {message.kind && message.kind !== "message" && (
                       <small className="message-caption">
                         {message.kind === "review"
@@ -2554,9 +2617,11 @@ function Workspace({
                   </span>
                   <strong>{job.prTitle || "Your change is ready"}</strong>
                   <p>
-                    {readOnly
-                      ? "Your teammate can inspect and approve this change."
-                      : "Try your change before it goes to the shared website."}
+                    {steering
+                      ? "Inspect this change, then approve it for the shared website."
+                      : readOnly
+                        ? "Your teammate can inspect and approve this change."
+                        : "Try your change before it goes to the shared website."}
                   </p>
                   <button
                     className="button primary compact"
@@ -2621,8 +2686,16 @@ function Workspace({
               <div className="composer-input">
                 <textarea
                   ref={textarea}
-                  placeholder="What would you like to change?"
-                  aria-label="Tell your agent what to change"
+                  placeholder={
+                    steering
+                      ? `Guide ${chatMember.name}’s agent…`
+                      : "What would you like to change?"
+                  }
+                  aria-label={
+                    steering
+                      ? `Guide ${chatMember.name}’s agent`
+                      : "Tell your agent what to change"
+                  }
                   value={text}
                   onChange={(e) => setText(e.target.value)}
                   maxLength={20000}
@@ -2656,6 +2729,18 @@ function Workspace({
             </form>
           )}
         </section>
+        {tab === "group" && sidebarOpen && !websiteExpanded && (
+          <GroupChat
+            key={project.id + project.member.id}
+            projectId={project.id}
+            memberId={project.member.id}
+            messages={project.groupMessages || []}
+            reactions={project.reactions}
+            onSend={sendGroupMessage}
+            onReact={react}
+            onClose={() => setSidebarOpen(false)}
+          />
+        )}
         <section className="team-panel" aria-label="Team and website updates">
           <div className="panel-top">
             <strong>

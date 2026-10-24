@@ -245,7 +245,20 @@ export function createPlatform(
     if (
       !["GET", "HEAD"].includes(req.method) &&
       req.query.chat &&
-      req.query.chat !== req.member.id
+      req.query.chat !== req.member.id &&
+      ![
+        "/api/projects/:projectId/reactions",
+        "/api/projects/:projectId/group/messages",
+      ].includes(req.route?.path) &&
+      !(
+        req.project.owner_id === req.account.id &&
+        [
+          "/api/projects/:projectId/messages",
+          "/api/projects/:projectId/jobs/:jobId/inspect",
+          "/api/projects/:projectId/jobs/:jobId/approve",
+          "/api/projects/:projectId/jobs/:jobId/retry",
+        ].includes(req.route?.path)
+      )
     )
       return res.status(403).json({
         error:
@@ -528,6 +541,8 @@ export function createPlatform(
       member: memberView(req.member),
       chatMember: memberView(chat),
       readOnly: chat.id !== req.member.id,
+      canSteerChat:
+        p.owner_id === req.account.id || chat.user_id === req.account.id,
       members: store.all(
         "SELECT m.id,m.name,m.prefix,m.role,j.state AS agentState,j.started_at AS startedAt,j.finished_at AS finishedAt FROM members m LEFT JOIN jobs j ON j.id=(SELECT id FROM jobs WHERE member_id=m.id ORDER BY created_at DESC,rowid DESC LIMIT 1) WHERE m.project_id=? ORDER BY m.created_at",
         p.id,
@@ -539,8 +554,10 @@ export function createPlatform(
       ),
       messages: store.chatMessages(chat.id),
       reactions: store.reactionSummary(p.id, req.account.id),
+      groupMessages: store.groupMessages(p.id, req.account.id),
       jobs: store.all(
-        "SELECT id,member_id AS memberId,request_key AS requestKey,text,state,result,error,pr_number AS prNumber,pr_url AS prUrl,preview_url AS previewUrl,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt,merged_at AS mergedAt,published_at AS publishedAt,change_sha AS changeSha,pr_title AS prTitle,artifact_url AS artifactUrl,artifact_ready_at AS artifactReadyAt,inspected_at AS inspectedAt,approved_at AS approvedAt FROM jobs WHERE member_id=? ORDER BY created_at,rowid",
+        "SELECT id,member_id AS memberId,request_key AS requestKey,text,state,result,error,pr_number AS prNumber,pr_url AS prUrl,preview_url AS previewUrl,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt,merged_at AS mergedAt,published_at AS publishedAt,change_sha AS changeSha,pr_title AS prTitle,artifact_url AS artifactUrl,artifact_ready_at AS artifactReadyAt,(SELECT inspected_at FROM preview_inspections i WHERE i.job_id=jobs.id AND i.user_id=? AND i.sha=jobs.change_sha) AS inspectedAt,approved_at AS approvedAt FROM jobs WHERE member_id=? ORDER BY created_at,rowid",
+        req.account.id,
         chat.id,
       ),
       activity: store.all(
@@ -638,6 +655,43 @@ export function createPlatform(
     },
   );
   app.post(
+    "/api/projects/:projectId/group/messages",
+    signed,
+    membership,
+    (req, res) => {
+      const { text, requestKey } = req.body || {};
+      if (
+        typeof text !== "string" ||
+        !text.trim() ||
+        text.length > 4000 ||
+        text.includes("\0") ||
+        !uuid(requestKey)
+      )
+        return res
+          .status(400)
+          .json({ error: "Send a message between 1 and 4,000 characters." });
+      store.run(
+        "INSERT OR IGNORE INTO group_messages VALUES(?,?,?,?,?,?)",
+        id(),
+        req.project.id,
+        req.member.id,
+        requestKey,
+        text.trim(),
+        now(),
+      );
+      const message = store.get(
+        "SELECT id FROM group_messages WHERE member_id=? AND request_key=?",
+        req.member.id,
+        requestKey,
+      );
+      res.json({
+        message: store
+          .groupMessages(req.project.id, req.account.id)
+          .find((value) => value.id === message.id),
+      });
+    },
+  );
+  app.post(
     "/api/projects/:projectId/reactions",
     signed,
     membership,
@@ -662,7 +716,10 @@ export function createPlatform(
             )
           : store.get(
               `SELECT id FROM messages WHERE id=? AND project_id=?
-           UNION ALL SELECT j.id||':'||e.event_key FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.id||':'||e.event_key=? AND j.project_id=? LIMIT 1`,
+           UNION ALL SELECT j.id||':'||e.event_key FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.id||':'||e.event_key=? AND j.project_id=?
+           UNION ALL SELECT id FROM group_messages WHERE id=? AND project_id=? LIMIT 1`,
+              targetId,
+              req.project.id,
               targetId,
               req.project.id,
               targetId,
@@ -702,6 +759,17 @@ export function createPlatform(
     signed,
     membership,
     (req, res) => {
+      const chat = req.query.chat
+        ? store.get(
+            "SELECT * FROM members WHERE id=? AND project_id=?",
+            String(req.query.chat),
+            req.project.id,
+          )
+        : req.member;
+      if (!chat)
+        return res
+          .status(404)
+          .json({ error: "This chat isn’t in your project." });
       const text = req.body?.text;
       if (
         typeof text !== "string" ||
@@ -721,7 +789,7 @@ export function createPlatform(
         const job = store.get(
           "SELECT * FROM jobs WHERE project_id=? AND member_id=? AND state='awaiting_approval' ORDER BY inspected_at DESC,created_at DESC LIMIT 1",
           req.project.id,
-          req.member.id,
+          chat.id,
         );
         if (!job)
           return res.status(409).json({
@@ -733,7 +801,7 @@ export function createPlatform(
       const jobId = store.transaction(() => {
         const existing = store.get(
           "SELECT id FROM jobs WHERE member_id=? AND request_key=?",
-          req.member.id,
+          chat.id,
           req.body.requestKey,
         );
         if (existing) return existing.id;
@@ -742,21 +810,18 @@ export function createPlatform(
           "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at,approval_required) VALUES(?,?,?,?,?,?,?,1)",
           value,
           req.project.id,
-          req.member.id,
+          chat.id,
           req.body.requestKey,
           text.trim(),
           now(),
           now(),
         );
-        store.run(
-          "INSERT INTO messages VALUES(?,?,?,?,?,?,?)",
-          id(),
+        store.humanMessage(
           req.project.id,
-          req.member.id,
+          chat.id,
           value,
-          "user",
+          req.account,
           text.trim(),
-          now(),
         );
         return value;
       });
@@ -765,10 +830,11 @@ export function createPlatform(
   );
   function ownedJob(req, res, next) {
     req.job = store.get(
-      "SELECT * FROM jobs WHERE id=? AND project_id=? AND member_id=?",
+      "SELECT * FROM jobs WHERE id=? AND project_id=? AND (member_id=? OR ?=1)",
       req.params.jobId,
       req.project.id,
       req.member.id,
+      req.project.owner_id === req.account.id ? 1 : 0,
     );
     if (!req.job)
       return res
@@ -791,6 +857,13 @@ export function createPlatform(
           .status(409)
           .json({ error: "Open the latest ready preview before applying it." });
       store.run("UPDATE jobs SET inspected_at=? WHERE id=?", now(), req.job.id);
+      store.run(
+        "INSERT INTO preview_inspections VALUES(?,?,?,?) ON CONFLICT(job_id,user_id) DO UPDATE SET sha=excluded.sha,inspected_at=excluded.inspected_at",
+        req.job.id,
+        req.account.id,
+        req.job.change_sha,
+        now(),
+      );
       res.json({ ok: true });
     },
   );
@@ -811,7 +884,12 @@ export function createPlatform(
     if (job.approved_at) return res.json({ ok: true, jobId: job.id });
     if (
       job.state !== "awaiting_approval" ||
-      !job.inspected_at ||
+      !store.get(
+        "SELECT 1 FROM preview_inspections WHERE job_id=? AND user_id=? AND sha=?",
+        job.id,
+        req.account.id,
+        sha,
+      ) ||
       !job.artifact_url ||
       !job.artifact_ready_at ||
       !job.pr_title ||
@@ -822,26 +900,24 @@ export function createPlatform(
       });
     store.transaction(() => {
       store.run(
-        "UPDATE jobs SET state='creating_pr',approved_at=?,updated_at=? WHERE id=?",
+        "UPDATE jobs SET state='creating_pr',approved_at=?,approved_by=?,updated_at=? WHERE id=?",
         now(),
+        req.account.id,
         now(),
         job.id,
       );
-      store.run(
-        "INSERT INTO messages VALUES(?,?,?,?,?,?,?)",
-        id(),
+      store.humanMessage(
         req.project.id,
-        req.member.id,
+        job.member_id,
         job.id,
-        "user",
+        req.account,
         "Make this the website.",
-        now(),
       );
       store.recordEvent(
         job.id,
         "approved",
         "status",
-        "You approved this preview. Creating the pull request for review.",
+        `${req.account.name} approved this preview. Creating the pull request for review.`,
       );
       store.enqueue(
         req.project.id,

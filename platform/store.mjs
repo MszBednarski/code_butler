@@ -92,6 +92,17 @@ export function createStore(directory) {
       target_id TEXT NOT NULL, emoji TEXT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id),
       member_id TEXT NOT NULL REFERENCES members(id), created_at INTEGER NOT NULL,
       PRIMARY KEY(project_id,target_type,target_id,emoji,user_id));
+    CREATE TABLE IF NOT EXISTS group_messages (
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+      member_id TEXT NOT NULL REFERENCES members(id), request_key TEXT NOT NULL,
+      text TEXT NOT NULL, created_at INTEGER NOT NULL, UNIQUE(member_id,request_key));
+    CREATE INDEX IF NOT EXISTS group_messages_project ON group_messages(project_id,created_at);
+    CREATE TABLE IF NOT EXISTS message_authors (
+      message_id TEXT PRIMARY KEY REFERENCES messages(id),
+      user_id TEXT NOT NULL REFERENCES users(id), role TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS preview_inspections (
+      job_id TEXT NOT NULL REFERENCES jobs(id), user_id TEXT NOT NULL REFERENCES users(id),
+      sha TEXT NOT NULL, inspected_at INTEGER NOT NULL, PRIMARY KEY(job_id,user_id));
   `);
   if (
     !db
@@ -158,6 +169,7 @@ export function createStore(directory) {
     artifact_ready_at: "INTEGER",
     inspected_at: "INTEGER",
     approved_at: "INTEGER",
+    approved_by: "TEXT",
   }))
     if (!jobColumns.has(column))
       db.exec(`ALTER TABLE jobs ADD COLUMN ${column} ${type}`);
@@ -288,6 +300,14 @@ export function createStore(directory) {
       run("UPDATE members SET user_id=? WHERE user_id=?", to, from);
       run("UPDATE OR IGNORE reactions SET user_id=? WHERE user_id=?", to, from);
       run("DELETE FROM reactions WHERE user_id=?", from);
+      run("UPDATE message_authors SET user_id=? WHERE user_id=?", to, from);
+      run(
+        "UPDATE OR IGNORE preview_inspections SET user_id=? WHERE user_id=?",
+        to,
+        from,
+      );
+      run("DELETE FROM preview_inspections WHERE user_id=?", from);
+      run("UPDATE jobs SET approved_by=? WHERE approved_by=?", to, from);
       run("UPDATE projects SET owner_id=? WHERE owner_id=?", to, from);
       revokeAccess(from);
       run(
@@ -386,8 +406,8 @@ export function createStore(directory) {
   }
   function chatMessages(member) {
     const rows = all(
-      `SELECT id,job_id AS jobId,role,text,created_at AS createdAt,'message' AS kind,CASE role WHEN 'user' THEN 0 ELSE 2 END AS position,rowid AS sequence,NULL AS eventKey,NULL AS prNumber FROM messages WHERE member_id=?
-       UNION ALL SELECT j.id||':'||e.event_key,j.id,'assistant',e.text,e.created_at,e.kind,1,e.rowid,e.event_key,j.pr_number FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.member_id=?
+      `SELECT m.id,m.job_id AS jobId,m.role,m.text,m.created_at AS createdAt,'message' AS kind,CASE m.role WHEN 'user' THEN 0 ELSE 2 END AS position,m.rowid AS sequence,NULL AS eventKey,NULL AS prNumber,u.name AS authorName,a.role AS authorRole FROM messages m LEFT JOIN message_authors a ON a.message_id=m.id LEFT JOIN users u ON u.id=a.user_id WHERE m.member_id=?
+       UNION ALL SELECT j.id||':'||e.event_key,j.id,'assistant',e.text,e.created_at,e.kind,1,e.rowid,e.event_key,j.pr_number,NULL,NULL FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.member_id=?
        ORDER BY createdAt,position,sequence`,
       member,
       member,
@@ -457,6 +477,37 @@ export function createStore(directory) {
     }
     return summary;
   }
+  function groupMessages(project, user) {
+    return all(
+      `SELECT g.id,g.member_id AS memberId,m.name,g.text,g.created_at AS createdAt,
+       (m.user_id=?) AS isOwn FROM group_messages g JOIN members m ON m.id=g.member_id
+       WHERE g.project_id=? ORDER BY g.created_at,g.rowid`,
+      user,
+      project,
+    ).map((message) => ({ ...message, isOwn: Boolean(message.isOwn) }));
+  }
+  function humanMessage(project, memberId, jobId, actor, text) {
+    const messageId = id();
+    run(
+      "INSERT INTO messages VALUES(?,?,?,?,?,?,?)",
+      messageId,
+      project,
+      memberId,
+      jobId,
+      "user",
+      text,
+      now(),
+    );
+    if (
+      actor.id !==
+      get("SELECT user_id FROM members WHERE id=?", memberId).user_id
+    )
+      run(
+        "INSERT INTO message_authors VALUES(?,?,'lead')",
+        messageId,
+        actor.id,
+      );
+  }
   function recordMerge(project, number, sha, metadata = {}) {
     return transaction(() => {
       recordRelease(project, number, sha, metadata);
@@ -521,6 +572,8 @@ export function createStore(directory) {
     recordPullEvent,
     chatMessages,
     reactionSummary,
+    groupMessages,
+    humanMessage,
     recordRelease,
     close: () => db.close(),
   };

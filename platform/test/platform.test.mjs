@@ -739,7 +739,248 @@ test("teammates can react to each other's chat and previews with durable, scoped
   );
 });
 
-test("a ready artifact requires its creator to inspect and approve the exact revision before a PR can exist", async (t) => {
+test("group chat persists human messages for the project without creating agent work, supports reactions, and rejects outsiders", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    inv = await f.invite(p.id);
+  const alice = await f.join(inv.url, "Alice"),
+    bob = await f.join(inv.url, "Bob");
+  const before = f.store.get("SELECT COUNT(*) AS n FROM jobs").n;
+  const requestKey = id(),
+    endpoint = `/api/projects/${p.id}/group/messages`;
+  const send = (
+    cookie,
+    text = "Let's inspect the preview together",
+    key = requestKey,
+    headers = {},
+  ) => f.call(endpoint, { text, requestKey: key }, cookie, headers);
+  const first = await (await send(alice)).json(),
+    retry = await (await send(alice)).json();
+  assert.equal(first.message.id, retry.message.id);
+  assert.equal(first.message.name, "Alice");
+  assert.equal(first.message.isOwn, true);
+  const view = await (
+    await f.call(`/api/projects/${p.id}`, undefined, bob)
+  ).json();
+  assert.equal(view.groupMessages.length, 1);
+  assert.equal(view.groupMessages[0].isOwn, false);
+  assert.equal(
+    view.groupMessages[0].text,
+    "Let's inspect the preview together",
+  );
+  // Looking at a teammate's agent chat does not prevent talking in the shared room.
+  assert.equal(
+    (
+      await f.call(
+        endpoint + `?chat=${first.message.memberId}`,
+        { text: "Looks good, Alice!", requestKey: id() },
+        bob,
+      )
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${p.id}/reactions?chat=${first.message.memberId}`,
+        {
+          targetType: "message",
+          targetId: first.message.id,
+          emoji: "🎉",
+          active: true,
+        },
+        bob,
+      )
+    ).status,
+    200,
+  );
+  assert.equal(
+    (await send(alice, "make the change", id())).status,
+    200,
+    "Human conversation must never approve a preview",
+  );
+  assert.equal(f.store.get("SELECT COUNT(*) AS n FROM jobs").n, before);
+  assert.equal(
+    f.store.get("SELECT COUNT(*) AS n FROM messages WHERE project_id=?", p.id)
+      .n,
+    1,
+    "Human chat must not be added to an agent conversation",
+  );
+  const refreshed = await (
+    await f.call(`/api/projects/${p.id}`, undefined, alice)
+  ).json();
+  assert.equal(refreshed.groupMessages.length, 3);
+  assert.equal(refreshed.reactions["message:" + first.message.id][0].count, 1);
+  assert.equal((await send(alice, "   ", id())).status, 400);
+  assert.equal((await send(alice, "x".repeat(4001), id())).status, 400);
+  assert.equal((await send(alice, "hello", "invalid-key")).status, 400);
+  assert.equal((await send("", "hello", id())).status, 401);
+  assert.equal(
+    (await send(alice, "hello", id(), { origin: "https://elsewhere.example" }))
+      .status,
+    403,
+  );
+  const other = await f.create("Other project");
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${other.id}/group/messages`,
+        { text: "intrude", requestKey: id() },
+        bob,
+      )
+    ).status,
+    404,
+  );
+  assert.equal(
+    (
+      await f.call(`/api/projects/${other.id}/reactions`, {
+        targetType: "message",
+        targetId: first.message.id,
+        emoji: "🎉",
+        active: true,
+      })
+    ).status,
+    404,
+  );
+  const reopened = createStore(f.dir);
+  assert.equal(reopened.groupMessages(p.id, f.lead.id).length, 3);
+  const aliceUser = f.store.get(
+    "SELECT user_id FROM members WHERE id=?",
+    first.message.memberId,
+  ).user_id;
+  reopened.mergeUsers(aliceUser, f.lead.id);
+  assert.ok(
+    reopened
+      .groupMessages(p.id, f.lead.id)
+      .filter((m) => m.memberId === first.message.memberId)
+      .every((m) => m.isOwn),
+  );
+  reopened.close();
+});
+
+test("the lead can steer a teammate and approve their preview after personally inspecting it", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    inv = await f.invite(p.id);
+  const alice = await f.join(inv.url, "Alice"),
+    bob = await f.join(inv.url, "Bob");
+  f.store.run(
+    "UPDATE projects SET state='ready',repo='lead/site' WHERE id=?",
+    p.id,
+  );
+  f.store.run("UPDATE jobs SET state='unchanged' WHERE project_id=?", p.id);
+  const sent = await (
+    await f.call(
+      `/api/projects/${p.id}/messages`,
+      { text: "Make a race", requestKey: id() },
+      alice,
+    )
+  ).json();
+  const job = f.store.get("SELECT * FROM jobs WHERE id=?", sent.jobId),
+    sha = "a".repeat(40);
+  f.store.run(
+    "UPDATE jobs SET state='awaiting_approval',change_sha=?,branch='alice/draft',pr_title='Make a race',pr_body='Add racing.',artifact_url='https://preview.example.test',artifact_ready_at=? WHERE id=?",
+    sha,
+    now(),
+    job.id,
+  );
+  const base = `/api/projects/${p.id}/jobs/${job.id}`;
+  assert.equal((await f.call(base + "/inspect", { sha }, alice)).status, 200);
+  const watched = await (
+    await f.call(`/api/projects/${p.id}?chat=${job.member_id}`)
+  ).json();
+  assert.equal(watched.canSteerChat, true);
+  assert.equal(
+    watched.jobs[0].inspectedAt,
+    null,
+    "Someone else's inspection cannot satisfy the lead's gate",
+  );
+  assert.equal((await f.call(base + "/approve", { sha })).status, 409);
+  const instruction = { text: "Make the countdown clearer", requestKey: id() };
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${p.id}/messages?chat=${job.member_id}`,
+        instruction,
+        bob,
+      )
+    ).status,
+    403,
+  );
+  const steered = await (
+    await f.call(
+      `/api/projects/${p.id}/messages?chat=${job.member_id}`,
+      instruction,
+    )
+  ).json();
+  assert.equal(
+    f.store.get("SELECT member_id FROM jobs WHERE id=?", steered.jobId)
+      .member_id,
+    job.member_id,
+  );
+  const messages = await (
+    await f.call(`/api/projects/${p.id}`, undefined, alice)
+  ).json();
+  const leadMessage = messages.messages.find(
+    (m) => m.jobId === steered.jobId && m.role === "user",
+  );
+  assert.equal(leadMessage.text, instruction.text);
+  assert.equal(leadMessage.authorName, "Test Lead");
+  assert.equal(leadMessage.authorRole, "lead");
+  const project = f.store.get("SELECT * FROM projects WHERE id=?", p.id);
+  const claimed = await (await workerCall(f, project, "/claim", {})).json();
+  assert.equal(
+    claimed.job.member.id,
+    job.member_id,
+    "Steering keeps the teammate's agent and worktree",
+  );
+  assert.equal((await f.call(base + "/inspect", { sha }, bob)).status, 404);
+  assert.equal((await f.call(base + "/approve", { sha }, bob)).status, 404);
+  assert.equal(
+    (await f.call(base + "/inspect", { sha: "b".repeat(40) })).status,
+    409,
+  );
+  assert.equal((await f.call(base + "/inspect", { sha })).status, 200);
+  assert.equal((await f.call(base + "/approve", { sha })).status, 202);
+  assert.equal((await f.call(base + "/approve", { sha })).status, 200);
+  assert.equal(
+    f.store.get("SELECT approved_by FROM jobs WHERE id=?", job.id).approved_by,
+    f.lead.id,
+  );
+  const approved = f.store
+    .chatMessages(job.member_id)
+    .find((m) => m.text === "Make this the website.");
+  assert.equal(approved.authorRole, "lead");
+  assert.equal(approved.authorName, "Test Lead");
+  assert.equal(
+    f.store.get(
+      "SELECT COUNT(*) AS n FROM tasks WHERE project_id=? AND kind='open-pr'",
+      p.id,
+    ).n,
+    1,
+  );
+  const other = await f.create("Other project"),
+    otherMember = f.store.get(
+      "SELECT id FROM members WHERE project_id=?",
+      other.id,
+    );
+  assert.equal(
+    (
+      await f.call(`/api/projects/${p.id}/messages?chat=${otherMember.id}`, {
+        text: "Cross project",
+        requestKey: id(),
+      })
+    ).status,
+    404,
+  );
+  assert.equal(
+    (await f.call(`/api/projects/${other.id}/jobs/${job.id}/approve`, { sha }))
+      .status,
+    404,
+  );
+});
+
+test("a ready artifact requires its creator or lead to inspect and approve the exact revision before a PR can exist", async (t) => {
   const f = await fixture(t),
     p = await f.create(),
     inv = await f.invite(p.id),
@@ -862,8 +1103,8 @@ test("a ready artifact requires its creator to inspect and approve the exact rev
   assert.equal((await f.call(base + "/inspect", { sha }, bob)).status, 404);
   assert.equal(
     (await f.call(base + "/approve", { sha }, f.owner)).status,
-    404,
-    "The team lead cannot approve another member’s work",
+    409,
+    "The team lead must personally inspect before approving another member’s work",
   );
   assert.equal(
     (await f.call(base + "/inspect", { sha: "b".repeat(40) }, alice)).status,

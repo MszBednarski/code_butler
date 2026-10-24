@@ -5,6 +5,8 @@ export type ChatMessage = {
   text: string;
   kind?: string;
   createdAt?: number;
+  authorName?: string;
+  authorRole?: string;
 };
 
 // Several internal steps can have the same plain-English explanation. Display
