@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, cp, writeFile } from "node:fs/promises";
 import { createStore, id, token, digest, now } from "../store.mjs";
 import { createBoat, boatActions } from "../boat.mjs";
+import { createProvisioner } from "../provision.mjs";
 import { createBoatProvisioner } from "../boat-provision.mjs";
 import { createPlatform } from "../server.mjs";
 import { configuration } from "../config.mjs";
@@ -587,5 +588,106 @@ test("Boat provisioning retries reuse one VM and previews never fork or copy age
   assert.equal(
     f.store.get("SELECT app_url FROM projects WHERE id=?", project.id).app_url,
     appUrl,
+  );
+});
+
+test("live Boat websites renew and resume without an open Butler tab or waiting for builds", async (t) => {
+  const f = await fixture(t),
+    projectId = id(),
+    calls = [];
+  const insert = (state, hosting, appUrl, vm) =>
+    f.store.run(
+      "INSERT INTO projects(id,owner_id,name,description,slug,invite_hash,invite_secret,worker_secret,worker_hash,webhook_secret,repo,resources,hosting_provider,state,app_url,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      id(),
+      f.user.id,
+      "A saved project",
+      "A website",
+      id(),
+      digest(token()),
+      f.store.seal(token()),
+      f.store.seal(token()),
+      digest(token()),
+      f.store.seal(token()),
+      "team/site",
+      JSON.stringify({ boat: { id: vm, ttlSeconds: 7200 } }),
+      hosting,
+      state,
+      appUrl,
+      now(),
+    );
+  insert("ready", "boat", "https://live.example.test", "bx_leaseactive");
+  insert("failed", "boat", "https://failed.example.test", "bx_inactive");
+  insert("ready", "railway", "https://railway.example.test", "bx_notboat");
+  const active = f.store.get(
+    "SELECT * FROM projects WHERE state='ready' AND hosting_provider='boat'",
+  );
+  let vmState = "ready",
+    expires = Date.now() + 600000,
+    releaseBuild,
+    startedBuild;
+  const buildHeld = new Promise((resolve) => {
+    releaseBuild = resolve;
+  });
+  const buildStarted = new Promise((resolve) => {
+    startedBuild = resolve;
+  });
+  const provider = {
+    github: async () => {
+      startedBuild();
+      await buildHeld;
+      return [];
+    },
+    boat: async (_owner, url, method = "GET", body) => {
+      calls.push({ url, method, body });
+      assert.ok(url.startsWith("/sandboxes/bx_leaseactive"));
+      if (method === "PATCH") {
+        assert.equal(body.ttlSeconds, 7200);
+        expires = Date.now() + 7200000;
+        return { sandbox: { state: vmState } };
+      }
+      if (url.endsWith("/resume")) {
+        assert.equal(body.noEnv, true);
+        assert.equal(body.ttlSeconds, 7200);
+        vmState = "ready";
+        return { sandbox: { state: vmState } };
+      }
+      return {
+        sandbox: {
+          state: vmState,
+          archiveAfter: new Date(expires).toISOString(),
+        },
+      };
+    },
+  };
+  const manager = createProvisioner(f.config, f.store, provider, {
+    pause: async () => {},
+  });
+  f.store.enqueue(active.id, "sync-history", "held-build", {});
+  const busy = manager.tick();
+  await buildStarted;
+  // The regular task queue remains occupied while hosting maintenance completes.
+  await Promise.all([manager.maintainHosting(), manager.maintainHosting()]);
+  assert.equal(calls.filter((c) => c.method === "PATCH").length, 1);
+  assert.equal(calls.filter((c) => c.method === "GET").length, 1);
+  assert.equal(
+    f.store.get("SELECT state FROM tasks WHERE dedupe_key='held-build'").state,
+    "running",
+  );
+  assert.equal(
+    JSON.parse(
+      f.store.get("SELECT resources FROM projects WHERE id=?", active.id)
+        .resources,
+    ).hostingCheck.state,
+    "ready",
+  );
+  releaseBuild();
+  await busy;
+  vmState = "archived";
+  await manager.maintainHosting();
+  assert.equal(calls.filter((c) => c.url.endsWith("/resume")).length, 1);
+  assert.equal(vmState, "ready");
+  assert.ok(
+    !calls.some((c) => c.url.includes("/commands") || c.url.includes("/files")),
+    "Waking must not rebuild or replace the app or agent",
   );
 });

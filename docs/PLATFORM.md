@@ -119,3 +119,5 @@ persisted before waiting for installation so retries reuse the same repository.
 Provider-free tests cover this sequence, credential boundaries, and lost responses.
 A fresh GitHub account must still exercise the live scoped-token and installation
 consent flow before deployment is considered verified.
+
+Live Boat projects are checked at startup and every five minutes, independently of the build queue and open Butler tabs. Butler extends expiring workspace leases and resumes archived workspaces through the existing scoped hosting connection. These checks reuse the same VM and disk; they do not rebuild the app or restart an active coding agent. Provider quota and billing limits still apply. The latest check is recorded in the project's private resource metadata for diagnostics.

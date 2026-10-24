@@ -42,7 +42,8 @@ export function createProvisioner(
   { execute = exec, pause = delay } = {},
 ) {
   let stopped = false,
-    active = false;
+    active = false,
+    checkingHosting = false;
   const boat = createBoatProvisioner(config, store, provider, {
     source,
     markPublished,
@@ -1101,8 +1102,47 @@ export function createProvisioner(
       active = false;
     }
   }
+  async function maintainHosting() {
+    if (stopped || checkingHosting) return;
+    checkingHosting = true;
+    try {
+      // This runs independently of builds: a long preview build must not let
+      // another live site's lease expire, even when nobody has Butler open.
+      await Promise.allSettled(
+        store
+          .all(
+            "SELECT * FROM projects WHERE state='ready' AND hosting_provider='boat' AND app_url IS NOT NULL",
+          )
+          .map(async (project) => {
+            let state = "ready";
+            try {
+              await boat.ensure(project);
+            } catch (error) {
+              state = "unavailable";
+              console.error(`[hosting] ${project.id}: ${error.name}`);
+            }
+            const current = store.get(
+              "SELECT resources,state FROM projects WHERE id=?",
+              project.id,
+            );
+            if (stopped || current?.state !== "ready") return;
+            store.run(
+              "UPDATE projects SET resources=? WHERE id=?",
+              JSON.stringify({
+                ...JSON.parse(current.resources),
+                hostingCheck: { at: now(), state },
+              }),
+              project.id,
+            );
+          }),
+      );
+    } finally {
+      checkingHosting = false;
+    }
+  }
   return {
     tick,
+    maintainHosting,
     provision,
     deploy,
     artifact,
@@ -1134,10 +1174,17 @@ export function createProvisioner(
         () => tick().catch((error) => console.error(`[tasks] ${error.name}`)),
         2000,
       );
+      const checkHosting = () =>
+        maintainHosting().catch((error) =>
+          console.error(`[hosting] ${error.name}`),
+        );
+      const hostingTimer = setInterval(checkHosting, 5 * 60000);
+      checkHosting();
       tick().catch((error) => console.error(`[tasks] ${error.name}`));
       return () => {
         stopped = true;
         clearInterval(timer);
+        clearInterval(hostingTimer);
       };
     },
   };

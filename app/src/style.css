@@ -3746,3 +3746,5 @@ html.workspace-open,
     display: none;
   }
 }
+.tour-context > div { min-width: 0; }
+.tour-context small { display: block; font-size: 9px; line-height: 1.5; margin-top: 3px; color: #7d755f; }

@@ -1,4 +1,22 @@
-export function horseDemoWebsite(colorful: boolean) {
+export type DemoWebsiteFeatures = {
+  colorful?: boolean;
+  touchControls?: boolean;
+  sunset?: boolean;
+};
+
+export function horseDemoWebsite(features: DemoWebsiteFeatures | boolean = {}) {
+  const {
+    colorful = false,
+    touchControls = false,
+    sunset = false,
+  } = typeof features === "boolean" ? { colorful: features } : features;
+  const featureLabel = touchControls
+    ? "PHONE FRIENDLY CONTROLS"
+    : sunset
+      ? "SUNSET SESSIONS"
+      : colorful
+        ? "COLOURFUL FENCES"
+        : "A LITTLE LEAP OF FAITH";
   return String.raw`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;font-family:system-ui,sans-serif;color:#234334;background:#deeee1}
@@ -6,14 +24,16 @@ canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none;outlin
 h1{font-size:20px;letter-spacing:-.8px;margin:0}header small{font-size:8px;letter-spacing:1.8px;font-weight:700;color:#6f8c73;display:block;margin-bottom:3px}.score{background:#ffffffbd;border:1px solid #fff;border-radius:10px;padding:7px 11px;text-align:center;font-size:9px;min-width:58px}.score b{font-size:21px;display:block;line-height:1.1}
 #overlay{position:absolute;z-index:2;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;padding:25px}.card{pointer-events:auto;text-align:center;background:#fffdf4ef;border:1px solid #fff;border-radius:16px;padding:20px 24px;box-shadow:0 12px 35px #244e3320;max-width:275px}.card h2{font-family:Georgia,serif;font-weight:400;font-size:31px;letter-spacing:-1px;line-height:1.1;margin:0 0 10px}.card p{font-size:11px;line-height:1.7;color:#708169;margin:0 0 13px}
 button{font:600 12px system-ui,sans-serif;background:#254f3a;color:#fff;border:0;border-radius:8px;padding:11px 18px;cursor:pointer;touch-action:manipulation}button:focus-visible{outline:3px solid #dda962;outline-offset:3px}#overlay[hidden]{display:none}footer{position:absolute;bottom:10px;left:12px;right:12px;display:flex;justify-content:space-between;gap:8px;font-size:9px;font-weight:600;color:#48673e;pointer-events:none}#best{font-weight:400;color:#647d59}
+#jump{position:absolute;z-index:1;bottom:32px;left:50%;transform:translateX(-50%);width:min(230px,70%);background:#dce9f6;color:#234e6a;border:2px solid #fff;box-shadow:0 4px 15px #234e6a20;font-size:14px;padding:12px 18px}
 </style></head><body>
 <canvas id="game" tabindex="0" aria-label="Horse showjumping game. Tap or press Space to jump over fences.">Tap or press Space to help the horse jump over the fences.</canvas>
-<header><div><small>A LITTLE LEAP OF FAITH</small><h1>Jump Club</h1></div><div class="score">JUMPS<b id="score" aria-live="polite">0</b></div></header>
+<header><div><small>${featureLabel}</small><h1>Jump Club</h1></div><div class="score">JUMPS<b id="score" aria-live="polite">0</b></div></header>
 <div id="overlay"><div class="card"><h2 id="message">Ready, rider?</h2><p id="hint">Tap or press Space to hop.<br>Keep hopping to clear the fences.</p><button id="start">Let’s jump →</button></div></div>
+${touchControls ? '<button id="jump" aria-label="Tap to jump">Tap to jump ↑</button>' : ""}
 <footer><span id="status" role="status">Tap or Space to jump</span><span id="best">Best this visit: 0</span></footer>
 <script>
 (()=>{
- const colorful=${JSON.stringify(colorful)},canvas=document.getElementById('game'),ctx=canvas.getContext('2d');
+ const colorful=${JSON.stringify(colorful)},sunset=${JSON.stringify(sunset)},canvas=document.getElementById('game'),ctx=canvas.getContext('2d');
  const overlay=document.getElementById('overlay'),scoreLabel=document.getElementById('score'),status=document.getElementById('status'),bestLabel=document.getElementById('best');
  let width=400,height=340,ground=280,x=95,y=280,velocity=0,mode='ready',fences=[],score=0,best=0,clock=0,last=0,travel=0,spawn=0,flash=0;
  function resize(){const rect=canvas.getBoundingClientRect(),oldGround=ground;width=rect.width;height=rect.height;ground=height-52;x=Math.min(112,width*.25);y=Math.min(y+ground-oldGround,ground);const dpr=Math.min(devicePixelRatio||1,2);canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);}
@@ -21,6 +41,7 @@ button{font:600 12px system-ui,sans-serif;background:#254f3a;color:#fff;border:0
  function start(){mode='playing';score=0;fences=[];y=ground;velocity=0;spawn=1.5;travel=0;scoreLabel.textContent='0';overlay.hidden=true;}
  function hop(){if(mode!=='playing')start();velocity=-355;flash=.35;status.textContent='Jump!';}
  canvas.addEventListener('pointerdown',event=>{event.preventDefault();canvas.focus({preventScroll:true});hop();});
+ document.getElementById('jump')?.addEventListener('click',hop);
  document.getElementById('start').addEventListener('click',()=>{canvas.focus({preventScroll:true});hop();});
  window.addEventListener('keydown',event=>{if(['Space','ArrowUp'].includes(event.code)){event.preventDefault();if(!event.repeat)hop();}});
  document.addEventListener('visibilitychange',()=>{last=0;});
@@ -46,9 +67,9 @@ button{font:600 12px system-ui,sans-serif;background:#254f3a;color:#fff;border:0
   ctx.strokeStyle='#394d36';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(6,-53);ctx.lineTo(34,-59);ctx.stroke();ctx.restore();
  }
  function draw(){
-  const sky=ctx.createLinearGradient(0,0,0,height);sky.addColorStop(0,'#d9ece5');sky.addColorStop(1,'#f2edcb');ctx.fillStyle=sky;ctx.fillRect(0,0,width,height);
+  const sky=ctx.createLinearGradient(0,0,0,height);sky.addColorStop(0,sunset?'#c7b1d2':'#d9ece5');sky.addColorStop(1,sunset?'#f6c397':'#f2edcb');ctx.fillStyle=sky;ctx.fillRect(0,0,width,height);
   ctx.fillStyle='#fff9df';ctx.beginPath();ctx.arc(width*.76,79,26,0,Math.PI*2);ctx.fill();ctx.fillStyle='#ffffff75';for(let n=0;n<3;n++){const at=((n*190+65-travel*.12)%(width+170)+width+170)%(width+170)-60;ctx.beginPath();ctx.ellipse(at,92+n*17,36,9,0,0,Math.PI*2);ctx.fill();}
-  hill(ground-45,'#b8d1b0',travel*.14);hill(ground-20,'#9fbd8a',travel*.3);ctx.fillStyle='#f5f1da';ctx.fillRect(0,ground-20,width,3);for(let at=-travel*.5%65;at<width;at+=65)ctx.fillRect(at,ground-31,3,34);
+  hill(ground-45,sunset?'#ad9da9':'#b8d1b0',travel*.14);hill(ground-20,sunset?'#7e9b86':'#9fbd8a',travel*.3);ctx.fillStyle='#f5f1da';ctx.fillRect(0,ground-20,width,3);for(let at=-travel*.5%65;at<width;at+=65)ctx.fillRect(at,ground-31,3,34);
   ctx.fillStyle='#c4d499';ctx.fillRect(0,ground,width,height-ground);ctx.fillStyle='#a4ba79';ctx.fillRect(0,ground,width,4);ctx.fillStyle='#91aa66';for(let n=0;n<width/24+3;n++){const at=(n*27-travel)%(width+54);ctx.fillRect(at,ground+15+(n%3)*8,6,2);}
   ctx.fillStyle='#49663824';ctx.beginPath();ctx.ellipse(x+3,ground+5,26,5,0,0,Math.PI*2);ctx.fill();(mode==='ready'?[{x:width*.69,h:45,variant:0},{x:width+10,h:50,variant:1}]:fences).forEach(fence);horse();
  }
