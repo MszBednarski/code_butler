@@ -35,7 +35,7 @@ test("real git transport and app builds carry a teammate request through PR revi
   const upstream = createServer((req, res) => {
     if (
       req.headers.authorization !==
-      `Basic ${Buffer.from("x-access-token:owner-github-fixture").toString("base64")}`
+      `Basic ${Buffer.from("x-access-token:project-installation-fixture").toString("base64")}`
     ) {
       res.writeHead(401);
       res.end();
@@ -99,10 +99,7 @@ test("real git transport and app builds carry a teammate request through PR revi
     "team",
     lead.id,
   );
-  store.connection(lead.id, "github", {
-    access_token: "owner-github-fixture",
-    scope: "repo",
-  });
+  store.connection(lead.id, "github_installation", { id: 99, accountId: 42 });
   store.connection(lead.id, "railway", {
     access_token: "owner-railway-fixture",
   });
@@ -113,6 +110,7 @@ test("real git transport and app builds carry a teammate request through PR revi
   const currentPull = async () =>
     pr ? { ...pr, head: { ...pr.head, sha: await sha(pr.head.ref) } } : null;
   const provider = {
+    repositoryToken: async () => "project-installation-fixture",
     github: async (_user, endpoint, method = "GET", body) => {
       const suffix = endpoint.replace("/repos/team/project", "");
       if (suffix === "/git/ref/heads/main")
@@ -165,6 +163,10 @@ test("real git transport and app builds carry a teammate request through PR revi
     frontend: "/missing",
     dataDir: path.join(dir, "platform"),
     commit: "test",
+    githubAppId: 123,
+    githubAppSlug: "butler-test",
+    githubAppPrivateKey: "fixture-key",
+    githubAppWebhookSecret: "fixture-hook-secret",
   };
   const platform = createPlatform(config, {
     store,
@@ -264,7 +266,7 @@ test("real git transport and app builds carry a teammate request through PR revi
   assert.ok(authorizedGitRequests > 0);
   assert.ok(
     !(await readFile(path.join(data, "repo/.git/config"), "utf8")).includes(
-      "owner-github-fixture",
+      "project-installation-fixture",
     ),
   );
   const page = await (

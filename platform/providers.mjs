@@ -1,3 +1,4 @@
+import { createGithubAccess } from "./github-app.mjs";
 export class ProviderError extends Error {
   constructor(provider, status, message) {
     super(`${provider}: ${message}`);
@@ -56,34 +57,7 @@ export function providers(config, store, { fetch: request = fetch } = {}) {
       );
     return refreshes.get(userId);
   }
-  async function github(userId, endpoint, method = "GET", body, raw = false) {
-    if (!endpoint.startsWith("/") || endpoint.startsWith("//"))
-      throw new Error("Invalid GitHub endpoint");
-    const saved = store.connection(userId, "github");
-    if (!saved)
-      throw new ProviderError("GitHub", 401, "Reconnect GitHub to continue.");
-    const response = await request(`${config.githubApi}${endpoint}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${saved.access_token}`,
-        Accept: "application/vnd.github+json",
-        "Content-Type": "application/json",
-        "User-Agent": "Pocket-Butler",
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(raw ? 120000 : 30000),
-    });
-    if (!response.ok) {
-      const detail = await response.json().catch(() => ({}));
-      throw new ProviderError(
-        "GitHub",
-        response.status,
-        detail.message || "Request failed.",
-      );
-    }
-    if (raw) return response;
-    return response.status === 204 ? null : response.json();
-  }
+  const githubAccess = createGithubAccess(config, store, request);
   async function railway(userId, query, variables = {}) {
     const response = await request(config.railwayApi, {
       method: "POST",
@@ -122,5 +96,5 @@ export function providers(config, store, { fetch: request = fetch } = {}) {
       );
     return response.json();
   }
-  return { github, railway, railwayToken, worker, request };
+  return { ...githubAccess, railway, railwayToken, worker, request };
 }

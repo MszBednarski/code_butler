@@ -1,3 +1,4 @@
+import { githubAppReady, githubLoginClient } from "./github-app.mjs";
 import { token, digest, now, id } from "./store.mjs";
 
 export function cookies(req) {
@@ -49,7 +50,8 @@ export function installAuth(app, config, store, provider) {
     next();
   });
   const begin = (name, clientId, authorize, scopes) => (req, res) => {
-    clientId = config[name === "github" ? "githubClientId" : "railwayClientId"];
+    clientId =
+      name === "github" ? githubLoginClient(config).id : config.railwayClientId;
     if (!clientId)
       return res.status(503).json({
         error: `${name === "github" ? "GitHub" : "Railway"} connection has not been configured by the Butler operator yet.`,
@@ -76,10 +78,9 @@ export function installAuth(app, config, store, provider) {
       client_id: clientId,
       redirect_uri: `${config.publicUrl}/auth/${name}/callback`,
       state,
-      scope:
-        name === "github" && req.query.purpose === "account"
-          ? "read:user"
-          : scopes,
+      ...(name === "github" && githubLoginClient(config).app
+        ? {}
+        : { scope: scopes }),
       ...(name === "railway"
         ? { response_type: "code", prompt: "consent" }
         : {}),
@@ -92,7 +93,7 @@ export function installAuth(app, config, store, provider) {
       "github",
       config.githubClientId,
       "https://github.com/login/oauth/authorize",
-      "read:user repo",
+      "read:user",
     ),
   );
   app.get(
@@ -150,8 +151,8 @@ export function installAuth(app, config, store, provider) {
               redirect_uri: `${config.publicUrl}/auth/${name}/callback`,
               ...(name === "github"
                 ? {
-                    client_id: config.githubClientId,
-                    client_secret: config.githubClientSecret,
+                    client_id: githubLoginClient(config).id,
+                    client_secret: githubLoginClient(config).secret,
                   }
                 : { grant_type: "authorization_code" }),
             }),
@@ -163,6 +164,34 @@ export function installAuth(app, config, store, provider) {
           throw new Error("Authorization was not completed. Please try again.");
         let userId = state.user_id;
         if (name === "github") {
+          if (
+            String(credentials.scope || "")
+              .split(/[ ,]/)
+              .some((scope) =>
+                /^(repo|public_repo|admin:|write:|delete_repo|workflow)/.test(
+                  scope,
+                ),
+              )
+          ) {
+            await provider.request(
+              `${config.githubApi}/applications/${githubLoginClient(config).id}/grant`,
+              {
+                method: "DELETE",
+                headers: {
+                  Authorization: `Basic ${Buffer.from(`${githubLoginClient(config).id}:${githubLoginClient(config).secret}`).toString("base64")}`,
+                  "Content-Type": "application/json",
+                  "User-Agent": "Pocket-Butler",
+                },
+                body: JSON.stringify({
+                  access_token: credentials.access_token,
+                }),
+                signal: AbortSignal.timeout(15000),
+              },
+            );
+            throw new Error(
+              "An older broad GitHub grant was removed. Sign in again for profile-only access.",
+            );
+          }
           const me = await provider.request("https://api.github.com/user", {
             headers: {
               Authorization: `Bearer ${credentials.access_token}`,
@@ -200,14 +229,7 @@ export function installAuth(app, config, store, provider) {
               userId,
             );
           }
-          const previous = store.connection(userId, name);
-          // An identity-only sign-in must not discard an existing repository grant.
-          if (
-            !previous ||
-            String(credentials.scope).split(/[ ,]/).includes("repo") ||
-            !String(previous.scope).split(/[ ,]/).includes("repo")
-          )
-            store.connection(userId, name, credentials);
+          // Sign-in identifies the person; its token is never stored or used for repositories.
         } else {
           if (!userId) throw new Error("Sign in with GitHub first.");
           store.connection(userId, name, {
@@ -224,6 +246,79 @@ export function installAuth(app, config, store, provider) {
         );
       }
     });
+  app.get("/auth/github/install", async (req, res) => {
+    if (!req.account?.github_id) return res.redirect("/auth/github");
+    if (!githubAppReady(config))
+      return res
+        .status(503)
+        .send("Butler’s repository integration is being configured.");
+    try {
+      const current = await provider.app(
+        `/users/${encodeURIComponent(req.account.github_login)}/installation`,
+      );
+      await provider.connect(req.account.id, current.id);
+      return res.redirect(safeReturn(req.query.returnTo));
+    } catch (error) {
+      if (error.status !== 404) {
+        if (error.provider)
+          return res.redirect(
+            `/?auth_error=${encodeURIComponent(error.message + " Update the installation on GitHub, then return to Butler and connect again.")}`,
+          );
+        throw error;
+      }
+    }
+    const state = token(),
+      browser = token();
+    store.run("DELETE FROM oauth_states WHERE created_at<?", now() - 600000);
+    store.run(
+      "INSERT INTO oauth_states VALUES(?,?,?,?,?,?)",
+      digest(state),
+      digest(browser),
+      req.account.id,
+      "github-install",
+      safeReturn(req.query.returnTo),
+      now(),
+    );
+    cookie(res, config, "butler_oauth_github_install", browser, 600);
+    const url = new URL(
+      `https://github.com/apps/${config.githubAppSlug}/installations/new`,
+    );
+    url.searchParams.set("state", state);
+    url.searchParams.set("suggested_target_id", req.account.github_id);
+    res.redirect(url.href);
+  });
+  app.get("/auth/github/install/callback", async (req, res) => {
+    const state =
+      typeof req.query.state === "string"
+        ? store.get(
+            "SELECT * FROM oauth_states WHERE hash=? AND provider='github-install' AND created_at>?",
+            digest(req.query.state),
+            now() - 600000,
+          )
+        : null;
+    if (
+      !state ||
+      state.user_id !== req.account?.id ||
+      digest(cookies(req).butler_oauth_github_install || "") !==
+        state.browser_hash
+    )
+      return res
+        .status(400)
+        .send("Connection expired. Return to Butler and connect GitHub again.");
+    store.run("DELETE FROM oauth_states WHERE hash=?", state.hash);
+    cookie(res, config, "butler_oauth_github_install", "", 0);
+    const installationId = Number(req.query.installation_id);
+    if (!Number.isSafeInteger(installationId) || installationId <= 0)
+      return res.status(400).send("Invalid GitHub installation.");
+    try {
+      await provider.connect(req.account.id, installationId);
+      res.redirect(state.return_to);
+    } catch (error) {
+      res.redirect(
+        `${state.return_to}?auth_error=${encodeURIComponent(error.provider ? error.message : "GitHub connection failed. Try again.")}`,
+      );
+    }
+  });
   app.post("/api/auth/logout", (req, res) => {
     if (cookies(req).butler_account)
       store.run(

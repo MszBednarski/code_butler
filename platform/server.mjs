@@ -1,3 +1,8 @@
+import {
+  githubAppReady,
+  githubLoginClient,
+  retireLegacyGithub,
+} from "./github-app.mjs";
 import express from "express";
 import { createServer } from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
@@ -59,32 +64,62 @@ export function createPlatform(
   });
   app.get("/healthz", (_req, res) => res.type("text").send("ok"));
   app.post(
-    "/api/hooks/github/:projectId",
+    ["/api/hooks/github/:projectId", "/api/hooks/github-app"],
     express.raw({ type: "application/json", limit: "1mb" }),
     (req, res) => {
-      const project = store.get(
-        "SELECT * FROM projects WHERE id=?",
-        req.params.projectId,
-      );
-      if (!project || !Buffer.isBuffer(req.body)) return res.sendStatus(403);
-      const actual = Buffer.from(req.headers["x-hub-signature-256"] || ""),
-        expected = Buffer.from(
-          "sha256=" +
-            createHmac("sha256", store.open(project.webhook_secret))
-              .update(req.body)
-              .digest("hex"),
-        );
-      if (
-        actual.length !== expected.length ||
-        !timingSafeEqual(actual, expected)
-      )
-        return res.sendStatus(403);
+      const appHook = req.path === "/api/hooks/github-app";
+      if (!Buffer.isBuffer(req.body)) return res.sendStatus(403);
       let event;
       try {
         event = JSON.parse(req.body.toString());
       } catch {
         return res.sendStatus(400);
       }
+      const project = appHook
+        ? store.get(
+            "SELECT * FROM projects WHERE repo=? COLLATE NOCASE",
+            String(event.repository?.full_name || ""),
+          )
+        : store.get("SELECT * FROM projects WHERE id=?", req.params.projectId);
+      const secret = appHook
+        ? config.githubAppWebhookSecret
+        : project && store.open(project.webhook_secret);
+      if (!secret) return res.sendStatus(403);
+      const actual = Buffer.from(req.headers["x-hub-signature-256"] || ""),
+        expected = Buffer.from(
+          "sha256=" +
+            createHmac("sha256", secret).update(req.body).digest("hex"),
+        );
+      if (
+        actual.length !== expected.length ||
+        !timingSafeEqual(actual, expected)
+      )
+        return res.sendStatus(403);
+      if (
+        appHook &&
+        req.headers["x-github-event"] === "installation" &&
+        ["deleted", "suspend"].includes(event.action)
+      ) {
+        for (const row of store.all(
+          "SELECT user_id FROM connections WHERE provider='github_installation'",
+        ))
+          if (
+            store.connection(row.user_id, "github_installation")?.id ===
+            event.installation?.id
+          )
+            store.run(
+              "DELETE FROM connections WHERE user_id=? AND provider='github_installation'",
+              row.user_id,
+            );
+        return res.sendStatus(202);
+      }
+      if (!project) return res.sendStatus(202);
+      if (
+        appHook &&
+        JSON.parse(project.resources).githubInstallationId !==
+          event.installation?.id
+      )
+        return res.sendStatus(403);
       if (
         event.repository?.full_name?.toLowerCase() !==
         project.repo?.toLowerCase()
@@ -142,7 +177,10 @@ export function createPlatform(
       res.sendStatus(202);
     },
   );
-  installGitProxy(app, store, gitOptions);
+  installGitProxy(app, store, {
+    repositoryToken: provider.repositoryToken,
+    ...gitOptions,
+  });
   app.use(express.json({ limit: "128kb" }));
   app.use("/api", (req, res, next) => {
     if (req.path.startsWith("/worker/")) return next();
@@ -169,7 +207,7 @@ export function createPlatform(
         if (value.until < now()) limits.delete(k);
     next();
   });
-  installSetup(app, config, store);
+  installSetup(app, config, store, provider.request);
   installWorkerApi(app, config, store, provider);
   installAuth(app, config, store, provider);
   const signed = (req, res, next) =>
@@ -203,19 +241,21 @@ export function createPlatform(
       ? next()
       : res.status(403).json({ error: "Only the project lead can do that." });
   app.get("/api/session", (req, res) => {
-    const github = req.account && store.connection(req.account.id, "github");
+    const github =
+      req.account && store.connection(req.account.id, "github_installation");
     res.json({
       user: publicUser(req.account),
       connections: {
-        github: Boolean(
-          github && String(github.scope).split(/[ ,]/).includes("repo"),
-        ),
+        github: Boolean(github && githubAppReady(config)),
         railway: Boolean(
           req.account && store.connection(req.account.id, "railway"),
         ),
       },
       capabilities: {
-        github: Boolean(config.githubClientId && config.githubClientSecret),
+        github: Boolean(
+          githubLoginClient(config).id && githubLoginClient(config).secret,
+        ),
+        githubRepositories: githubAppReady(config),
         railway: Boolean(config.railwayClientId && config.railwayClientSecret),
         email: Boolean(config.emailKey && config.emailFrom),
       },
@@ -224,10 +264,13 @@ export function createPlatform(
   });
   app.get("/api/projects", signed, (req, res) =>
     res.json({
-      projects: store.all(
-        "SELECT DISTINCT p.id,p.name,p.description,p.state,p.app_url AS appUrl,p.created_at AS createdAt FROM projects p JOIN members m ON m.project_id=p.id WHERE m.user_id=? ORDER BY p.created_at DESC",
-        req.account.id,
-      ),
+      projects: store
+        .all(
+          "SELECT DISTINCT p.id,p.name,p.description,p.state,p.app_url AS appUrl,p.created_at AS createdAt,(p.owner_id=?) AS isOwner FROM projects p JOIN members m ON m.project_id=p.id WHERE m.user_id=? ORDER BY p.created_at DESC",
+          req.account.id,
+          req.account.id,
+        )
+        .map((project) => ({ ...project, isOwner: Boolean(project.isOwner) })),
     }),
   );
   app.get("/api/railway/workspaces", signed, async (req, res) =>
@@ -239,7 +282,8 @@ export function createPlatform(
   app.post("/api/projects", signed, (req, res) => {
     if (
       !req.account.github_id ||
-      !store.connection(req.account.id, "github") ||
+      !githubAppReady(config) ||
+      !store.connection(req.account.id, "github_installation") ||
       !store.connection(req.account.id, "railway")
     )
       return res
@@ -608,6 +652,21 @@ if (process.argv[1] && import.meta.filename === path.resolve(process.argv[1])) {
   process.umask(0o077);
   const config = configuration(),
     platform = createPlatform(config);
+  const retire = async () => {
+    const legacy = await retireLegacyGithub(config, platform.store);
+    console.log(
+      `[github] Legacy grants revoked: ${legacy.revoked}; quarantined pending revocation: ${legacy.pending}`,
+    );
+  };
+  await retire();
+  const retireTimer = setInterval(
+    () =>
+      retire().catch(() =>
+        console.error("[github] Legacy grant cleanup will retry."),
+      ),
+    60000,
+  );
+  retireTimer.unref();
   const stop = platform.provisioner.start();
   platform.server.listen(config.port, "0.0.0.0", () =>
     console.log(`Butler portal listening on ${config.port}`),
@@ -615,6 +674,7 @@ if (process.argv[1] && import.meta.filename === path.resolve(process.argv[1])) {
   for (const signal of ["SIGTERM", "SIGINT"])
     process.once(signal, () => {
       stop();
+      clearInterval(retireTimer);
       platform.server.close(() => {
         platform.store.close();
         process.exit(0);

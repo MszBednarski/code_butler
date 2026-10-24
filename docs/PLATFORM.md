@@ -34,12 +34,17 @@ These steps are performed once for the Butler installation, never by each team. 
 
 ### GitHub
 
-1. GitHub → Settings → Developer settings → OAuth Apps → New OAuth App.
-2. Homepage URL: the Butler `PUBLIC_URL`.
-3. Authorization callback URL: `PUBLIC_URL/auth/github/callback`.
-4. Generate a client secret. Paste the client ID and secret into the GitHub card on Butler’s private installation page and click Save GitHub.
+On Butler’s private operator page, click **Register limited repository app**, then confirm **Create GitHub App** on GitHub. Butler supplies the manifest, callback and webhook URLs, exchanges the returned code, encrypts the app credentials on the persistent volume and applies them immediately. No app key, client secret, or PEM file needs to be copied manually. This registration happens once for the hosted service.
 
-The lead's project setup requests `read:user repo`; teammates who optionally save access with GitHub request only `read:user`. Repository creation, hooks and PRs happen through the backend. The current MVP uses an OAuth app; the `repo` scope is broad. Tokens are encrypted in the platform database, never returned to browsers or copied into project workers. A GitHub App with repository-scoped grants remains a future hardening path; teammates must never be asked for PATs.
+The app requests exactly these repository permissions: Metadata read, Contents write, Pull requests write, Commit statuses write, Checks read, and Repository creation write. It requests no repository administration, organization permissions, Issues permission, Workflows permission, deploy keys or collaborator management. Repository creation is a dedicated permission; GitHub automatically gives the app access to repositories it creates. App-level push/PR webhooks avoid granting permission to manage repository hooks.
+
+Each lead signs into Butler with their own GitHub account and installs the app using **Only select repositories**. Butler rejects all-repository installations and verifies that the personal installation belongs to the signed-in lead. The MVP provisions new repositories under that personal account; organization installations are not accepted. Invited teammates need no GitHub account.
+
+Profile sign-in tokens are discarded after reading identity and never used for repository operations. Repository work uses renewable installation tokens valid for at most an hour, with `repository_ids` restricted to the single project repository. Metadata lookup and repository creation use separate tokens without Contents permission. A worker still receives only its Butler project credential; the git bridge obtains its short-lived repository token centrally.
+
+Legacy OAuth `repo` grants are never used as a fallback. On migration, persisted OAuth credentials are quarantined and revoked at GitHub; interrupted revocations remain encrypted for retry. Previously authorized users may also revoke the old OAuth application in GitHub Settings → Applications → Authorized OAuth Apps. The old OAuth client is retained only for migration and temporary profile-only sign-in until the scoped app is registered. New app registration configures its own identity flow automatically.
+
+Butler deliberately does not request repository Administration solely to manage branch protection. It still validates exact head/current main, compiles the proposed merge, checks other statuses and waits for a live preview. For protection against concurrent external manual pushes, the repository owner can enable a branch rule; Butler agents never bypass it.
 
 ### Railway
 
@@ -55,10 +60,10 @@ Optional email sign-in uses `RESEND_API_KEY` and `EMAIL_FROM`. Without it, teamm
 
 ## What happens for each team
 
-1. The lead signs into Butler with GitHub, connects Railway and describes a new project.
+1. The lead follows one guided flow: sign in with GitHub, authorize Butler to create the project automatically, connect Railway, then describe an idea. Each screen offers one primary next action. A Railway workspace choice appears only when more than one was granted. Existing repositories never need to be selected in Butler. Drafts and the project creation key survive redirects and refreshes.
 2. Butler creates a private GitHub repo containing the web-app template. It creates separate Railway **app** and **agents** projects. The agent service has its own persistent volume; only the app project receives preview environments.
 3. The lead can share the QR immediately. Requests are durably queued while infrastructure is building.
-4. In the project, the lead clicks **Connect Codex**. The worker runs `codex login --device-auth`; Butler shows its authorization link and code. The lead completes sign-in in their browser. If necessary, enable device-code login in ChatGPT Settings → Security first.
+4. The same setup flow waits while Butler creates the private repository and hosting. Its final screen asks the lead to **Connect Codex**; the collaboration workspace opens after sign-in. The worker runs `codex login --device-auth`; Butler shows its authorization link and code. The lead completes sign-in in their browser. If necessary, enable device-code login in ChatGPT Settings → Security first.
 5. The login is stored under the worker's persistent `/data/codex`. Coding and reviewing use that project host's subscription login, not an OpenAI API key. GitHub and Railway connections are remembered at the account level; Codex is authorized for each newly provisioned host and retained across visits/redeploys.
 6. Each member has a persistent identity, home, git worktree and explicit Codex conversation ID. The small MVP worker runs coding and review jobs sequentially within a project. This keeps subscription use bounded by one active coding/review task and avoids conversation/auth-refresh races.
 7. The controller builds the app, commits and opens a PR. A separate reviewer conversation checks the proposed merge into current main, builds it, publishes the tested merge candidate to the PR without force-pushing, waits for a working preview and other checks, and squash-merges.
@@ -74,7 +79,7 @@ Only the lead can retrieve team invitations or start/view device authentication.
 
 Project workers are separate containers and volumes for different teams. Within one team, agents run as root in a shared container and are suitable for trusted teammates, not hostile users. Separate worktrees are not an OS security boundary. All coding/review usage shares the signed-in subscription's applicable limits; exhausted limits or revoked authentication may require the lead to reconnect or wait. No claim of unlimited subscription use is made.
 
-Where the GitHub plan permits it, Butler installs strict/up-to-date validation protection on `main`. For private repos on plans without that feature, Butler still serializes its merges and rechecks head/base, but cannot atomically prevent an external manual push to main racing a merge. Keep main changes through Butler.
+Butler serializes its own merges and rechecks head/base. Without an owner-configured branch rule, it cannot atomically prevent an external manual push to main racing a merge. Keep main changes through Butler or enable a branch rule in GitHub.
 
 ## Verification
 
