@@ -484,7 +484,8 @@ function Landing({ session, error }: { session: Session; error: string }) {
               Each person gets a Butler. Follow each other’s chats, see what’s
               being made, and talk in the group chat. Tag @Butler to give your
               shared agent a task while everyone keeps building. React to
-              messages and previews so your team knows what you love.
+              messages and previews so your team knows what you love. Your chats
+              and drafts are saved, ready to pick up when you return.
             </p>
           </article>
           <article>

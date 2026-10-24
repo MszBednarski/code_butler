@@ -283,10 +283,22 @@ export function createAgent({
       };
       await save(file, recovery);
     }
-    if ((await git(["branch", "--show-current"], cwd)).stdout.trim() !== branch)
-      throw new Error(
-        "Your workspace branch changed. Existing work was preserved; ask the lead to inspect it.",
-      );
+    if (
+      (await git(["branch", "--show-current"], cwd)).stdout.trim() !== branch
+    ) {
+      if (!branch.startsWith(`${member.prefix}/`))
+        throw new Error("Invalid saved workspace branch.");
+      if ((await git(["status", "--porcelain"], cwd)).stdout.trim())
+        throw Object.assign(
+          new Error(
+            "Another saved change has unfinished edits. They were preserved; the lead needs to reopen this request in its own workspace.",
+          ),
+          { code: "WORKSPACE_HAS_EDITS" },
+        );
+      // Another request or review repair may have used this person's worktree.
+      // A clean checkout can safely return to this request's saved branch.
+      await git(["switch", branch], cwd);
+    }
     if (
       recovery.phase === "started" &&
       !(await git(["status", "--porcelain"], cwd)).stdout.trim()

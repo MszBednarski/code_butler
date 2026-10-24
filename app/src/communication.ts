@@ -38,6 +38,8 @@ export function chatBubbles<T extends ChatMessage>(messages: T[]) {
 export function explainButler(text: string, kind = "message") {
   const raw = text.trim();
   if (!raw) return raw;
+  if (/agent stopped while preparing the workspace/i.test(raw))
+    return "Butler couldn’t reopen your saved change. Your edits and chat are safe. Ask the team lead to help resume it.";
   const issue =
     kind === "error" ||
     /review blocked|review paused|\[P[0-3]\]|could not|couldn.t|does not|doesn.t|cannot|can.t|failed|failure|not work|absent|unresolved|needs (?:an? |to )|need.*fix|broken|missing/i.test(
@@ -97,6 +99,7 @@ export function explainButler(text: string, kind = "message") {
   )
     return "Checking that your changes work with the current website.";
   if (
+    !issue &&
     /^PR #\d+ is open|sent it for review|pull request for review|creating the pull request|opening.*pull request|preparing the pull request/i.test(
       raw,
     )

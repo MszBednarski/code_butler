@@ -320,7 +320,7 @@ export function installWorkerApi(app, config, store, provider) {
         store.recordEvent(
           job.id,
           `result:${job.request_revision}`,
-          "message",
+          req.body.state === "failed" ? "error" : "message",
           text,
         );
       if (pr && SHA.test(req.body.sha || ""))

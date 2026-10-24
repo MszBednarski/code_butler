@@ -2865,3 +2865,98 @@ test("chat APIs return only the end and page older personal and mixed group hist
     404,
   );
 });
+
+test("Continue retries recover the unfinished instruction, including old overwritten requests and group mentions", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    inv = await f.invite(p.id),
+    alice = await f.join(inv.url, "Alice");
+  const url = `/api/projects/${p.id}/messages`;
+  const sent = await (
+    await f.call(
+      url,
+      { text: "Make the desk decorations fit the scene", requestKey: id() },
+      alice,
+    )
+  ).json();
+  f.store.run(
+    "UPDATE jobs SET state='failed',text='cont' WHERE id=?",
+    sent.jobId,
+  );
+  const retry = { text: "contine", requestKey: id() };
+  const resumed = await (await f.call(url, retry, alice)).json();
+  assert.equal(resumed.jobId, sent.jobId);
+  assert.equal(
+    f.store.get("SELECT text FROM jobs WHERE id=?", sent.jobId).text,
+    "Make the desk decorations fit the scene",
+  );
+  const revision = f.store.get(
+    "SELECT request_revision FROM jobs WHERE id=?",
+    sent.jobId,
+  ).request_revision;
+  await f.call(url, retry, alice);
+  assert.equal(
+    f.store.get("SELECT request_revision FROM jobs WHERE id=?", sent.jobId)
+      .request_revision,
+    revision,
+  );
+  f.store.run("UPDATE jobs SET state='failed' WHERE id=?", sent.jobId);
+  await f.call(
+    url,
+    {
+      text: "Also give bonuses for posting in the prompt party",
+      requestKey: id(),
+    },
+    alice,
+  );
+  const saved = f.store.get(
+    "SELECT text FROM jobs WHERE id=?",
+    sent.jobId,
+  ).text;
+  assert.match(saved, /desk decorations fit the scene/);
+  assert.match(saved, /bonuses for posting/);
+  f.store.run("UPDATE jobs SET state='working' WHERE id=?", sent.jobId);
+  await f.call(url, { text: "Continue", requestKey: id() }, alice);
+  f.store.resumeFollowups(sent.jobId);
+  assert.equal(
+    f.store.get("SELECT text FROM jobs WHERE id=?", sent.jobId).text,
+    saved,
+  );
+  f.store.run(
+    "UPDATE jobs SET state='failed',pending_text='Show the points separately' WHERE id=?",
+    sent.jobId,
+  );
+  f.store.resumeFollowups(sent.jobId);
+  const recoveredPending = f.store.get(
+    "SELECT text FROM jobs WHERE id=?",
+    sent.jobId,
+  ).text;
+  assert.match(recoveredPending, /desk decorations fit the scene/);
+  assert.match(recoveredPending, /Show the points separately/);
+  const group = `/api/projects/${p.id}/group/messages`;
+  const shared = await (
+    await f.call(
+      group,
+      { text: "@Butler make the shared lobby", requestKey: id() },
+      alice,
+    )
+  ).json();
+  f.store.run(
+    "UPDATE jobs SET state='failed' WHERE id=?",
+    shared.message.jobId,
+  );
+  await f.call(group, { text: "@Butler contine", requestKey: id() }, alice);
+  const sharedText = f.store.get(
+    "SELECT text FROM jobs WHERE id=?",
+    shared.message.jobId,
+  ).text;
+  assert.match(sharedText, /Group request from Alice:\nmake the shared lobby/);
+  assert.doesNotMatch(sharedText, /Group request from Alice:\ncontine/);
+  assert.equal(
+    f.store.get(
+      "SELECT COUNT(*) AS n FROM tasks WHERE project_id=? AND kind='open-pr'",
+      p.id,
+    ).n,
+    0,
+  );
+});

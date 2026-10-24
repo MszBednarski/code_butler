@@ -340,6 +340,38 @@ test("real git transport and app builds carry a teammate request through PR revi
     )
   ).json();
   assert.equal(followup.jobId, job.id);
+  const savedWorkspace = path.join(data, "wt", job.member_id);
+  const separateBranch = job.branch.split("/")[0] + "/separate-saved-change";
+  await git(["switch", "-c", separateBranch], savedWorkspace);
+  const separateEdit = path.join(savedWorkspace, "unfinished-other-change.txt");
+  await writeFile(
+    separateEdit,
+    "Preserve edits belonging to the other change.\n",
+  );
+  await agent.codeOne();
+  assert.equal(
+    store.get("SELECT state FROM jobs WHERE id=?", job.id).state,
+    "failed",
+  );
+  assert.equal(
+    await git(["branch", "--show-current"], savedWorkspace),
+    separateBranch,
+  );
+  assert.equal(
+    await readFile(separateEdit, "utf8"),
+    "Preserve edits belonging to the other change.\n",
+  );
+  // Once clean, retrying must return to this preview's saved branch automatically.
+  await rm(separateEdit);
+  await call(
+    `/api/projects/${projectId}/messages`,
+    { text: "contine", requestKey: id() },
+    memberCookie,
+  );
+  assert.match(
+    store.get("SELECT text FROM jobs WHERE id=?", job.id).text,
+    /heading the default/,
+  );
   await agent.codeOne();
   const updated = store.get("SELECT * FROM jobs WHERE id=?", job.id);
   assert.equal(updated.state, "building_preview");
@@ -353,7 +385,7 @@ test("real git transport and app builds carry a teammate request through PR revi
     -1,
     "A follow-up retains the preview URL and hosting port",
   );
-  assert.equal(updated.request_revision, 1);
+  assert.equal(updated.request_revision, 2);
   assert.equal(
     store.get("SELECT COUNT(*) AS n FROM jobs WHERE member_id=?", job.member_id)
       .n,

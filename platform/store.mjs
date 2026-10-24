@@ -15,6 +15,16 @@ export const digest = (value) =>
   createHash("sha256").update(value).digest("hex");
 export const now = () => Date.now();
 
+function isContinuation(text) {
+  const instruction =
+    text.match(
+      /^Group request from [^\n]+:\n([\s\S]*?)\n\nRecent group conversation/,
+    )?.[1] || text;
+  return /^(?:please\s+)?(?:cont(?:inue|ine)?|resume|retry|try again)[.!?]*$/i.test(
+    instruction.trim(),
+  );
+}
+
 export function createStore(directory) {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const keyFile = path.join(directory, "master.key");
@@ -661,9 +671,15 @@ export function createStore(directory) {
   function resumeFollowups(jobId) {
     const job = get("SELECT * FROM jobs WHERE id=?", jobId);
     if (!job?.pending_text) return false;
+    const nextText = isContinuation(job.pending_text)
+      ? recoveryInstruction(job)
+      : job.state === "failed"
+        ? recoveryInstruction(job) + "\n\nFollow-up:\n" + job.pending_text
+        : job.pending_text;
     run("DELETE FROM preview_inspections WHERE job_id=?", job.id);
     run(
-      "UPDATE jobs SET text=pending_text,pending_text=NULL,request_revision=request_revision+1,state='queued',error=NULL,result=NULL,started_at=NULL,finished_at=NULL,lease_until=NULL,inspected_at=NULL,artifact_ready_at=NULL,updated_at=? WHERE id=?",
+      "UPDATE jobs SET text=?,pending_text=NULL,request_revision=request_revision+1,state='queued',error=NULL,result=NULL,started_at=NULL,finished_at=NULL,lease_until=NULL,inspected_at=NULL,artifact_ready_at=NULL,updated_at=? WHERE id=?",
+      nextText,
       now(),
       job.id,
     );
@@ -674,6 +690,15 @@ export function createStore(directory) {
       "I’m updating your existing preview with your follow-up.",
     );
     return true;
+  }
+  function recoveryInstruction(job) {
+    if (!isContinuation(job.text)) return job.text;
+    return (
+      all(
+        "SELECT text FROM messages WHERE job_id=? AND role='user' ORDER BY created_at DESC,rowid DESC LIMIT 30",
+        job.id,
+      ).find((message) => !isContinuation(message.text))?.text || job.text
+    );
   }
   function requestChange(project, member, actor, text, requestKey) {
     return transaction(() => {
@@ -705,9 +730,10 @@ export function createStore(directory) {
             job.id,
           );
         else {
-          const nextText =
-            job.state === "queued"
-              ? job.text + "\n\nFollow-up:\n" + text
+          const nextText = isContinuation(text)
+            ? recoveryInstruction(job)
+            : ["queued", "failed"].includes(job.state)
+              ? recoveryInstruction(job) + "\n\nFollow-up:\n" + text
               : text;
           run(
             "UPDATE jobs SET text=?,state='queued',request_revision=request_revision+1,pending_text=NULL,result=NULL,error=NULL,started_at=NULL,finished_at=NULL,lease_until=NULL,inspected_at=NULL,artifact_ready_at=NULL,updated_at=? WHERE id=?",

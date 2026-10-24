@@ -16,6 +16,8 @@ export function assistantUpdate(event) {
 }
 export function readableFailure(error, stage = "working on the change") {
   const output = String(error.output || error.message || "");
+  if (error.code === "WORKSPACE_HAS_EDITS")
+    return "Another change has unfinished work in this workspace. Everything is saved. Ask the team lead to help reopen this request; sending Continue again won’t resolve it.";
   if (/bwrap:|No permissions to create a new namespace/.test(output))
     return "The agent could not start its command sandbox. Your work is saved; the team lead needs to update the worker runtime.";
   if (/usage limit|rate limit|quota|too many requests|429/i.test(output))

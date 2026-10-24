@@ -2,6 +2,23 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chatBubbles, explainButler } from "../src/communication.ts";
 
+test("a failure mentioning PR creation never claims the change is ready to publish", () => {
+  const text = "Creating the pull request failed. Your work is saved.";
+  const explanation = explainButler(text, "error");
+  assert.doesNotMatch(explanation, /ready for its final checks|will publish/);
+  assert.match(explanation, /saved|problem|couldn.t/);
+});
+
+test("a workspace failure does not send people into a repeated Continue loop", () => {
+  const explanation = explainButler(
+    "The agent stopped while preparing the workspace. Your edits and conversation are saved. Send Continue to resume, or ask the lead to inspect this request.",
+    "error",
+  );
+  assert.doesNotMatch(explanation, /Continue/);
+  assert.match(explanation, /safe/);
+  assert.match(explanation, /team lead/);
+});
+
 test("saved preview controls remain in history next to matching assistant text", () => {
   const messages = [
     { id: "reply", jobId: "job", role: "assistant", text: "Colourful jumps" },
