@@ -57,7 +57,9 @@ export function createPlatform(
       !req.path.startsWith("/api/worker/") &&
       !req.path.startsWith("/api/git/") &&
       !req.path.startsWith("/api/hooks/") &&
-      req.headers.origin !== config.publicUrl
+      ![config.publicUrl, ...(config.publicAliases || [])].includes(
+        req.headers.origin,
+      )
     )
       return res.status(403).json({ error: "Invalid request origin." });
     next();

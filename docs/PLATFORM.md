@@ -25,6 +25,8 @@ For development, start the backend with `DATA_DIR=/tmp/butler-dev PUBLIC_URL=htt
 
 Create a **separate** Railway project called `butler-platform`, with one service `web` and a persistent volume mounted at `/data`. Use the repo root as the build context. The root `Dockerfile` builds the platform; `platform/Dockerfile` is the equivalent explicit build path. `platform/railway.json` documents the equivalent build settings. Configure one replica, healthcheck `/healthz`, and sleeping off. Generate a public domain and set `PUBLIC_URL=https://<domain>` with no trailing slash. `PORT=3000` is a safe default; set the generated domain's target port to match.
 
+When changing domains, register the new GitHub App callback at `PUBLIC_URL/auth/github/callback` and update its Setup URL to `PUBLIC_URL/auth/github/install/callback` before switching `PUBLIC_URL`. Keep the old callback registered and list the old HTTPS origin in `PUBLIC_URL_ALIASES` (comma-separated) so existing sessions continue working there. Only these explicit origins can submit browser requests; new invitations and recovery links use `PUBLIC_URL`.
+
 The platform keeps its database and encryption key on `/data`. Both must survive redeploys. Its mount guard refuses to start on Railway without that volume. Back up the complete volume, including `master.key` and the SQLite/WAL files. Do not copy keys into git or deployment logs.
 
 A deployment can serve the landing page before provider integrations have been configured. The API reports which connections are available; unavailable connections are disabled in the interface.

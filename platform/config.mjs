@@ -14,6 +14,15 @@ export function configuration(env = process.env) {
       !["localhost", "127.0.0.1"].includes(url.hostname))
   )
     throw new Error("PUBLIC_URL must be an HTTPS origin");
+  const publicAliases = (env.PUBLIC_URL_ALIASES || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  for (const alias of publicAliases) {
+    const parsed = new URL(alias);
+    if (parsed.origin !== alias || parsed.protocol !== "https:")
+      throw new Error("PUBLIC_URL_ALIASES must contain HTTPS origins");
+  }
   if (
     env.RAILWAY_ENVIRONMENT_ID &&
     !readFileSync("/proc/self/mountinfo", "utf8")
@@ -23,6 +32,7 @@ export function configuration(env = process.env) {
     throw new Error("Platform requires a persistent Railway volume at /data");
   return {
     publicUrl,
+    publicAliases,
     secure: url.protocol === "https:",
     port: Number(env.PORT || 3000),
     dataDir: env.DATA_DIR || "/data",

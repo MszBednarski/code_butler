@@ -181,6 +181,13 @@ function Icon({ name, size = 20 }: { name: string; size?: number }) {
         <path d="M14 3h7v7m0-7L10 14M10 3H4v17h17v-6" />
       </>
     ),
+    share: (
+      <>
+        <path d="M12 15V3m-4 4 4-4 4 4" />
+        <path d="M5 11H4v10h16V11h-1" />
+      </>
+    ),
+    expand: <path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5" />,
     users: (
       <>
         <circle cx="9" cy="8" r="3" />
@@ -351,6 +358,11 @@ function Modal({
 }
 
 function Landing({ session, error }: { session: Session; error: string }) {
+  const startUrl = session.user
+    ? "/start"
+    : session.capabilities.github
+      ? "/auth/github?returnTo=%2Fstart"
+      : "#get-started";
   return (
     <div className="landing">
       <header className="site-header">
@@ -358,9 +370,10 @@ function Landing({ session, error }: { session: Session; error: string }) {
         <span className="header-note">Good ideas are a team sport.</span>
         <a
           className="button ghost compact"
-          href={session.capabilities.github ? "/auth/github" : "#get-started"}
+          href={session.user ? "/projects" : startUrl}
         >
-          Get started <Icon name="arrow" size={16} />
+          {session.user ? "My projects" : "Get started"}{" "}
+          <Icon name="arrow" size={16} />
         </a>
       </header>
       <main className="landing-main">
@@ -386,24 +399,24 @@ function Landing({ session, error }: { session: Session; error: string }) {
             <a
               className={
                 "button primary" +
-                (!session.capabilities.github ? " disabled" : "")
+                (!session.user && !session.capabilities.github
+                  ? " disabled"
+                  : "")
               }
-              href={
-                session.capabilities.github ? "/auth/github" : "#get-started"
-              }
-              aria-disabled={!session.capabilities.github}
+              href={startUrl}
+              aria-disabled={!session.user && !session.capabilities.github}
             >
               <Icon name="github" />
-              Start with GitHub
+              {session.user ? "Start a project" : "Start with GitHub"}
               <Icon name="arrow" size={18} />
             </a>
             <a className="button ghost" href="#try-butler">
-              Try the experience <Icon name="arrow" size={16} />
+              See how it works <Icon name="arrow" size={16} />
             </a>
           </div>
           {!session.capabilities.github && (
             <p className="setup-note">
-              Sign-in is being prepared. You can try the demo while we get
+              Sign-in is being prepared. Watch the product demo while we get
               ready.
             </p>
           )}
@@ -497,10 +510,7 @@ function Landing({ session, error }: { session: Session; error: string }) {
             you.
           </p>
         </div>
-        <a
-          className="button primary"
-          href={session.capabilities.github ? "/auth/github" : "#get-started"}
-        >
+        <a className="button primary" href={startUrl}>
           Bring your team <Icon name="arrow" size={17} />
         </a>
       </section>
@@ -697,10 +707,12 @@ function Dashboard({
   session,
   refresh,
   authError,
+  listOnly = false,
 }: {
   session: Session;
   refresh: () => Promise<void>;
   authError: string;
+  listOnly?: boolean;
 }) {
   const [projectsLoaded, setProjectsLoaded] = useState(false),
     [memberSaving, setMemberSaving] = useState(false);
@@ -733,11 +745,6 @@ function Dashboard({
       .then(({ projects: found }) => {
         if (!alive) return;
         setProjects(found);
-        if (
-          found.length === 1 &&
-          (!session.user?.githubLogin || found[0].isOwner === false)
-        )
-          navigate(`/p/${found[0].id}`, true);
       })
       .catch((e) => alive && setError(e.message))
       .finally(() => alive && setProjectsLoaded(true));
@@ -749,7 +756,7 @@ function Dashboard({
     localStorage.setItem("butler-project-idea", description);
   }, [description]);
   useEffect(() => {
-    if (useBoat || !session.connections.railway) return;
+    if (listOnly || useBoat || !session.connections.railway) return;
     let alive = true;
     setHostingLoaded(false);
     setHostingFailed(false);
@@ -779,10 +786,14 @@ function Dashboard({
     return () => {
       alive = false;
     };
-  }, [useBoat, session.connections.railway, workspaceKey, hostingAttempt]);
-  const memberOnly =
-    projects.length > 0 &&
-    (!session.user?.githubLogin || projects.every((p) => p.isOwner === false));
+  }, [
+    listOnly,
+    useBoat,
+    session.connections.railway,
+    workspaceKey,
+    hostingAttempt,
+  ]);
+  const memberOnly = listOnly;
   const step =
     !session.user?.githubLogin || !session.connections.github
       ? 0
@@ -821,6 +832,7 @@ function Dashboard({
   async function logout() {
     await api("/api/auth/logout", {});
     await refresh();
+    navigate("/", true);
   }
   if (!projectsLoaded)
     return (
@@ -835,9 +847,15 @@ function Dashboard({
       <header className="site-header">
         <Brand />
         <div className="account-menu">
+          {listOnly && (
+            <a className="button ghost compact" href="/start">
+              <Icon name="plus" size={15} />
+              New project
+            </a>
+          )}
           <Avatar name={session.user!.name} />
           <span>{session.user!.name.split(" ")[0]}</span>
-          {memberOnly ? (
+          {session.user?.isGuest ? (
             <button
               className="icon-button"
               aria-label="Save your access"
@@ -858,7 +876,7 @@ function Dashboard({
       </header>
       {memberOnly ? (
         <main className="dashboard-main">
-          <h1>Welcome back.</h1>
+          <h1>Your projects.</h1>
           <p className="page-description">
             Pick up your conversation and keep making things together.
           </p>
@@ -902,8 +920,8 @@ function Dashboard({
                 href={
                   githubAvailable
                     ? session.user?.githubLogin
-                      ? "/auth/github/install"
-                      : "/auth/github"
+                      ? "/auth/github/install?returnTo=%2Fstart"
+                      : "/auth/github?returnTo=%2Fstart"
                     : undefined
                 }
               >
@@ -953,7 +971,9 @@ function Dashboard({
                     }
                     aria-disabled={!session.capabilities.railway}
                     href={
-                      session.capabilities.railway ? "/auth/railway" : undefined
+                      session.capabilities.railway
+                        ? "/auth/railway?returnTo=%2Fstart"
+                        : undefined
                     }
                   >
                     Continue with Railway
@@ -1581,6 +1601,8 @@ function Workspace({
     [saving, setSaving] = useState(false),
     [tab, setTab] = useState("chat"),
     [teamSection, setTeamSection] = useState("activity"),
+    [sidebarOpen, setSidebarOpen] = useState(true),
+    [websiteExpanded, setWebsiteExpanded] = useState(false),
     [sending, setSending] = useState(false),
     [codexReady, setCodexReady] = useState(false),
     [memberId, setMemberId] = useState(""),
@@ -1617,6 +1639,14 @@ function Workspace({
     () => (workspaceVisible ? attachWorkspaceViewport() : undefined),
     [workspaceVisible],
   );
+  useEffect(() => {
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !document.querySelector("dialog[open]"))
+        setWebsiteExpanded(false);
+    };
+    window.addEventListener("keydown", escape);
+    return () => window.removeEventListener("keydown", escape);
+  }, []);
   const refresh = useCallback(async () => {
     try {
       const data = await api<Project>(
@@ -1646,9 +1676,11 @@ function Workspace({
       setChatId("");
     } else setChatId(id);
     setTab("chat");
+    setSidebarOpen(true);
   }
   function selectPanel(value: string) {
     setTab(value);
+    setSidebarOpen(true);
     if (value === "team") setTeamSection("activity");
     if (value === "updates") setTeamSection("updates");
   }
@@ -1961,7 +1993,13 @@ function Workspace({
       </div>
     );
   return (
-    <div className="workspace-shell">
+    <div
+      className={
+        "workspace-shell" +
+        (tab === "preview" ? " viewing-website" : "") +
+        (websiteExpanded ? " website-expanded" : "")
+      }
+    >
       <header className="workspace-header">
         <Brand small />
         <span className="header-divider" />
@@ -1969,6 +2007,27 @@ function Workspace({
           <strong>{project.name}</strong>
           <small>Your shared creation</small>
         </div>
+        <nav className="desktop-workspace-nav" aria-label="Workspace panels">
+          {[
+            ["chat", "chat", "Chat"],
+            ["team", "users", "Team"],
+            ["updates", "check", "Updates"],
+          ].map(([value, icon, label]) => (
+            <button
+              key={value}
+              aria-pressed={
+                sidebarOpen &&
+                (value === "chat"
+                  ? !["team", "updates"].includes(tab)
+                  : tab === value)
+              }
+              onClick={() => selectPanel(value)}
+            >
+              <Icon name={icon} size={15} />
+              {label}
+            </button>
+          ))}
+        </nav>
         <div className="workspace-header-actions">
           <button
             className="avatar-stack team-toggle"
@@ -2016,7 +2075,11 @@ function Workspace({
           </button>
         ))}
       </div>
-      <main className={"project-layout tab-" + tab}>
+      <main
+        className={
+          "project-layout tab-" + tab + (sidebarOpen ? "" : " sidebar-closed")
+        }
+      >
         <section
           className={
             "preview-panel" +
@@ -2025,30 +2088,41 @@ function Workspace({
           aria-label="Website viewer"
         >
           <div className="website-toolbar">
-            <div
-              className="website-switch"
-              role="tablist"
-              aria-label="Website version"
+            <button
+              className="icon-button viewer-back"
+              aria-label="Back to chat"
+              title="Back to chat"
+              onClick={() => {
+                setWebsiteExpanded(false);
+                selectPanel("chat");
+              }}
             >
-              <button
-                role="tab"
-                aria-selected={!shownArtifact}
-                onClick={showCurrentWebsite}
-              >
-                Current website
-              </button>
-              <button
-                role="tab"
-                aria-selected={Boolean(shownArtifact)}
-                disabled={!latestPreview && !shownArtifact}
-                onClick={() => {
+              <Icon name="arrow" size={18} />
+            </button>
+            <select
+              className="website-version-picker"
+              aria-label="Website version"
+              title={shownArtifact?.prTitle || "Choose which website to view"}
+              value={shownArtifact ? "preview" : "current"}
+              onChange={(event) => {
+                if (event.target.value === "current") showCurrentWebsite();
+                else {
                   const job = shownArtifact || latestPreview;
                   if (job) inspect(job);
-                }}
+                }
+              }}
+            >
+              <option value="current">
+                Current website · {project.appUrl ? "Live" : "Getting ready"}
+              </option>
+              <option
+                value="preview"
+                disabled={!latestPreview && !shownArtifact}
               >
-                Change preview
-              </button>
-            </div>
+                Change preview ·{" "}
+                {shownArtifact?.state === "live" ? "Copy" : "Not live"}
+              </option>
+            </select>
             <div className="website-toolbar-actions">
               <button
                 className="icon-button"
@@ -2062,6 +2136,15 @@ function Workspace({
                 title="Refresh website"
               >
                 <Icon name="refresh" size={16} />
+              </button>
+              <button
+                className="icon-button"
+                disabled={!project.appUrl}
+                onClick={() => setSharingWebsite(true)}
+                aria-label="Share current website"
+                title="Share current website"
+              >
+                <Icon name="share" size={16} />
               </button>
               {websiteUrl && (
                 <a
@@ -2079,65 +2162,30 @@ function Workspace({
                   <Icon name="external" size={16} />
                 </a>
               )}
-            </div>
-          </div>
-          <div className="website-context" aria-live="polite">
-            <div>
-              <h2>{shownArtifact ? "Change preview" : "Current website"}</h2>
-              <span className="website-version-badge">
-                {shownArtifact
-                  ? "PREVIEW"
-                  : project.appUrl
-                    ? "LIVE"
-                    : "GETTING READY"}
-              </span>
               <button
-                className="button ghost compact website-share"
-                disabled={!project.appUrl}
-                onClick={() => setSharingWebsite(true)}
-                aria-label="Share current website"
+                className="icon-button viewer-expand"
+                onClick={() => setWebsiteExpanded((value) => !value)}
+                aria-label={
+                  websiteExpanded ? "Exit expanded website" : "Expand website"
+                }
+                title={
+                  websiteExpanded ? "Exit expanded website" : "Expand website"
+                }
               >
-                <Icon name="link" size={14} />
-                Share
+                <Icon name={websiteExpanded ? "close" : "expand"} size={17} />
               </button>
             </div>
-            <p>
-              {shownArtifact
-                ? shownArtifact.state === "live"
-                  ? "Preview copy of a published change."
-                  : canApprove
-                    ? "Draft version · not published to your team’s website."
-                    : "Separate preview · not the current website."
-                : "The published version your team shares."}
-            </p>
           </div>
-          {shownArtifact && (
-            <div className="artifact-banner">
-              <div>
-                <strong>
-                  {shownArtifact.prTitle || "Inspect your change"}
-                </strong>
-                <small>
-                  {canApprove
-                    ? "Try it here. When you’re happy, send it for review and publishing."
-                    : "A preview of this change. The shared website is separate."}
-                </small>
-              </div>
-              {canApprove && (
-                <button
-                  className="button primary compact"
-                  disabled={
-                    approvalBusy ||
-                    (!shownArtifact.inspectedAt &&
-                      inspection !== shownArtifact.id)
-                  }
-                  onClick={() => approve(shownArtifact)}
-                >
-                  {approvalBusy ? <Spinner /> : <Icon name="check" size={16} />}
-                  Make this the website
-                </button>
-              )}
-              {error && <Alert>{error}</Alert>}
+          {error && (
+            <div className="viewer-error">
+              <Alert>{error}</Alert>
+              <button
+                className="icon-button"
+                aria-label="Dismiss website notice"
+                onClick={() => setError("")}
+              >
+                <Icon name="close" size={14} />
+              </button>
             </div>
           )}
           <div className="preview-surface">
@@ -2185,22 +2233,25 @@ function Workspace({
               </div>
             )}
           </div>
-          <div className="preview-bottom">
-            <span>
-              <Icon name="users" size={14} />
-              {project.members.length} person
-              {project.members.length === 1 ? "" : "s"} making this together
-            </span>
-            {project.isOwner && project.repoUrl && (
-              <a
-                href={project.repoUrl}
-                target="_blank"
-                rel="noopener noreferrer"
+          {canApprove && shownArtifact && (
+            <div className="preview-approval">
+              <span title={shownArtifact.prTitle}>
+                {shownArtifact.prTitle || "Your change is ready to try"}
+              </span>
+              <button
+                className="button primary compact"
+                disabled={
+                  approvalBusy ||
+                  (!shownArtifact.inspectedAt &&
+                    inspection !== shownArtifact.id)
+                }
+                onClick={() => approve(shownArtifact)}
               >
-                Project files ↗
-              </a>
-            )}
-          </div>
+                {approvalBusy ? <Spinner /> : <Icon name="check" size={16} />}
+                Make this the website
+              </button>
+            </div>
+          )}
         </section>
         <section className="conversation-panel">
           <div className="panel-top">
@@ -2215,28 +2266,38 @@ function Workspace({
                 </small>
               </div>
             </div>
-            {project.members.length > 1 ? (
-              <select
-                className="workspace-picker"
-                aria-label="Choose a team chat"
-                value={chatMember.id}
-                onChange={(e) => viewChat(e.target.value)}
+            <div className="side-panel-actions">
+              {project.members.length > 1 ? (
+                <select
+                  className="workspace-picker"
+                  aria-label="Choose a team chat"
+                  value={chatMember.id}
+                  onChange={(e) => viewChat(e.target.value)}
+                >
+                  {project.members.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name}
+                      {project.ownMemberships.some((own) => own.id === m.id)
+                        ? " (you)"
+                        : ""}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <span className="saved-label">
+                  <Icon name="check" size={12} />
+                  Saved
+                </span>
+              )}
+              <button
+                className="icon-button close-side-panel"
+                aria-label="Hide chat"
+                title="Hide chat"
+                onClick={() => setSidebarOpen(false)}
               >
-                {project.members.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name}
-                    {project.ownMemberships.some((own) => own.id === m.id)
-                      ? " (you)"
-                      : ""}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <span className="saved-label">
-                <Icon name="check" size={12} />
-                Saved
-              </span>
-            )}
+                <Icon name="close" size={16} />
+              </button>
+            </div>
           </div>
           <div className="conversation-scroll" ref={conversation}>
             {preparing && (
@@ -2549,6 +2610,14 @@ function Workspace({
               {teamSection === "updates" ? "Website updates" : "Your team"}
             </strong>
             <span>{project.members.length}</span>
+            <button
+              className="icon-button close-side-panel"
+              aria-label="Hide team panel"
+              title="Hide team panel"
+              onClick={() => setSidebarOpen(false)}
+            >
+              <Icon name="close" size={16} />
+            </button>
           </div>
           <div
             className="team-section-switch"
@@ -2691,6 +2760,17 @@ function Workspace({
               </div>
             )}
           </div>
+          {project.isOwner && project.repoUrl && (
+            <a
+              className="team-project-files"
+              href={project.repoUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              <Icon name="github" size={13} />
+              Project files <Icon name="external" size={11} />
+            </a>
+          )}
         </section>
       </main>
       {invite && <Invite project={project} onClose={() => setInvite(false)} />}{" "}
@@ -2722,7 +2802,7 @@ function Recover({ refresh }: { refresh: () => Promise<void> }) {
     api("/api/auth/recover", { token: secret })
       .then(async () => {
         await refresh();
-        navigate("/", true);
+        navigate("/projects", true);
       })
       .catch((e) => setError(e.message));
   }, [refresh]);
@@ -3092,7 +3172,7 @@ function InstallationSetup() {
               Sign in with GitHub, connect your Boat account, and create a
               project. Codex sign-in happens inside the project.
             </p>
-            <a className="button primary" href="/auth/github">
+            <a className="button primary" href="/auth/github?returnTo=%2Fstart">
               Start your first project
               <Icon name="arrow" size={17} />
             </a>
@@ -3127,7 +3207,7 @@ function App() {
   }, []);
   const boatConnected = useCallback(async () => {
     await refresh();
-    navigate("/", true);
+    navigate("/start", true);
   }, [refresh]);
   useEffect(() => {
     const value = new URLSearchParams(location.search).get("auth_error");
@@ -3190,11 +3270,38 @@ function App() {
         </main>
       </div>
     );
-  return session.user ? (
-    <Dashboard session={session} refresh={refresh} authError={authError} />
-  ) : (
-    <Landing session={session} error={error || authError} />
-  );
+  if (route === "/start" || route === "/projects")
+    return session.user ? (
+      <Dashboard
+        key={route}
+        session={session}
+        refresh={refresh}
+        authError={authError}
+        listOnly={route === "/projects"}
+      />
+    ) : (
+      <div className="join-page">
+        <Brand />
+        <main className="join-card">
+          <h1>Come on in.</h1>
+          <p>
+            Sign in to{" "}
+            {route === "/start"
+              ? "start a project with your team"
+              : "return to your projects"}
+            .
+          </p>
+          <a
+            className="button primary full"
+            href={`/auth/github?returnTo=${encodeURIComponent(route)}`}
+          >
+            <Icon name="github" />
+            Continue with GitHub
+          </a>
+        </main>
+      </div>
+    );
+  return <Landing session={session} error={error || authError} />;
 }
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

@@ -1,8 +1,6 @@
 import { useState } from "react";
 
-function sampleWebsite(rsvp: boolean) {
-  return `<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{box-sizing:border-box}body{margin:0;padding:24px;font-family:system-ui,sans-serif;color:#293e32;background:#f8f3e9}header{display:flex;justify-content:space-between;font-size:10px;letter-spacing:1px}header span{color:#8d7455}h1{font-family:Georgia,serif;font-weight:400;font-size:42px;line-height:1.06;letter-spacing:-2px;margin:30px 0 12px}p{font-size:12px;line-height:1.7;color:#707b6a;max-width:250px}.date{display:flex;align-items:center;gap:14px;border-top:1px solid #dfe0d2;padding-top:18px;margin-top:24px;font-size:11px}.date b{font-family:Georgia,serif;font-size:30px;font-weight:400}.date span{display:block;color:#79816c;font-size:10px;margin-top:4px}button{background:#294b3a;border:0;border-radius:8px;padding:12px 18px;color:white;font-size:12px;margin-top:16px;cursor:pointer}#thanks{color:#456c45;font-size:11px}footer{margin-top:24px;color:#9b9e8d;font-size:9px}@media(max-width:350px){body{padding:20px}h1{font-size:36px}}</style><header><strong>THE SUNDAY TABLE</strong><span>GOOD COMPANY CLUB</span></header><h1>Good food.<br>Better company.</h1><p>A little supper club for our favorite people. Pull up a chair. There’s always room for one more.</p>${rsvp ? '<button onclick="this.hidden=true;document.getElementById(\'thanks\').hidden=false">Save me a seat →</button><p id="thanks" hidden>You’re on the list! (This is a demo.)</p>' : ""}<div class="date"><b>26</b><div>Our next get-together<span>Sunday · 6 pm · bring something to share</span></div></div><footer>Made together. Everyone brought something.</footer></html>`;
-}
+import { horseDemoWebsite } from "./horse-demo";
 
 export default function LandingTour() {
   const [panel, setPanel] = useState(() =>
@@ -35,15 +33,15 @@ export default function LandingTour() {
     <section
       id="try-butler"
       className="landing-tour"
-      aria-label="Try the Butler experience"
+      aria-label="Butler product demo"
     >
       <div className="tour-top">
         <span className="tour-project-mark">✳</span>
         <div>
-          <strong>The Sunday Table</strong>
-          <small>A sample team project · try it below</small>
+          <strong>Jump Club</strong>
+          <small>A sample project · no live AI</small>
         </div>
-        <span className="tour-demo-tag">INTERACTIVE DEMO</span>
+        <span className="tour-demo-tag">PRODUCT DEMO</span>
       </div>
       <div className="tour-nav" role="tablist" aria-label="Demo workspace">
         {[
@@ -96,7 +94,7 @@ export default function LandingTour() {
           </div>
           <iframe
             key={`${preview}:${published}:${refresh}`}
-            srcDoc={sampleWebsite(preview || published)}
+            srcDoc={horseDemoWebsite(preview || published)}
             title={
               preview
                 ? "Butler demo — change preview"
@@ -107,7 +105,10 @@ export default function LandingTour() {
           <div className="tour-next" aria-live="polite">
             {preview ? (
               <>
-                <p>Maya’s new RSVP button is ready to try. Happy with it?</p>
+                <p>
+                  The colourful jumps are ready. Try a round, then make them
+                  live.
+                </p>
                 <button
                   className="button primary compact"
                   onClick={() => {
@@ -115,14 +116,15 @@ export default function LandingTour() {
                     setPreview(false);
                   }}
                 >
-                  Make this the website <span>→</span>
+                  Apply change in demo <span>→</span>
                 </button>
               </>
             ) : published ? (
               <>
                 <p>
                   <strong>That’s it. Your whole team sees the change.</strong>{" "}
-                  This was a demo. Imagine what your team could make.
+                  This is a demo. Connect your accounts to make something with
+                  your team.
                 </p>
                 <button
                   className="text-button"
@@ -133,12 +135,15 @@ export default function LandingTour() {
               </>
             ) : (
               <>
-                <p>This is what everyone sees. Let’s make a change together.</p>
+                <p>
+                  A sample website and conversation. Connect your accounts to
+                  build your own.
+                </p>
                 <button
                   className="button primary compact"
                   onClick={() => setPanel("chat")}
                 >
-                  Try asking Butler for a change <span>→</span>
+                  See a sample conversation <span>→</span>
                 </button>
               </>
             )}
@@ -176,7 +181,7 @@ export default function LandingTour() {
             <small>{person}</small>
             <p>
               {person === "Maya"
-                ? "Can people save a seat for dinner?"
+                ? "Can the horse jump colourful showjumping fences?"
                 : "Can we make this easy to use on a phone?"}
             </p>
           </div>
@@ -185,9 +190,9 @@ export default function LandingTour() {
             <p>
               {person === "Maya"
                 ? draft
-                  ? "Your RSVP button is ready. Try the preview, then tell me when to add it to the website."
-                  : "Of course. I’ll add a button so your friends can save a seat. You’ll get to try it before everyone sees it."
-                : "I’m making the text easier to read and the buttons easier to tap. You can keep chatting while I work."}
+                  ? "The new jumps are ready. Play the preview, then tell me when to add them to the game."
+                  : "Absolutely. I’ll add colourful poles and little flags. You can play a round before everyone sees the change."
+                : "I’m making it work with a tap on your phone or Space on your keyboard. You can keep chatting while I work."}
             </p>
             <span className="tour-chat-progress">
               {person === "Maya" && draft
@@ -196,9 +201,9 @@ export default function LandingTour() {
             </span>
           </div>
           <div className="tour-chat-composer">
-            <span>No special commands. Just your own words.</span>
+            <span>Sample conversation · no live AI is running.</span>
             <button className="button primary compact" onClick={requestChange}>
-              {draft ? "Try the RSVP preview" : "Try: add an RSVP button"} →
+              {draft ? "View the sample preview" : "See the sample preview"} →
             </button>
           </div>
         </div>

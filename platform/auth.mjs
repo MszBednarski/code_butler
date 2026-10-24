@@ -28,9 +28,18 @@ export function publicUser(user) {
     : null;
 }
 export function safeReturn(value) {
-  return typeof value === "string" && /^\/(?:p\/[a-f0-9-]{36}|connect\/boat)?$/.test(value)
+  return typeof value === "string" &&
+    /^\/(?:p\/[a-f0-9-]{36}|connect\/boat|start|projects)?$/.test(value)
     ? value
     : "/";
+}
+function callbackOrigin(req, config) {
+  const host = req.get("host");
+  return (
+    (config.publicAliases || []).find(
+      (origin) => new URL(origin).host === host,
+    ) || config.publicUrl
+  );
 }
 
 export function accountForRequest(req, store) {
@@ -50,6 +59,9 @@ export function installAuth(app, config, store, provider) {
     next();
   });
   const begin = (name, clientId, authorize, scopes) => (req, res) => {
+    const origin = callbackOrigin(req, config);
+    if (new URL(origin).host !== req.get("host"))
+      return res.redirect(origin + req.originalUrl);
     clientId =
       name === "github" ? githubLoginClient(config).id : config.railwayClientId;
     if (!clientId)
@@ -76,7 +88,7 @@ export function installAuth(app, config, store, provider) {
     const url = new URL(authorize);
     url.search = new URLSearchParams({
       client_id: clientId,
-      redirect_uri: `${config.publicUrl}/auth/${name}/callback`,
+      redirect_uri: `${callbackOrigin(req, config)}/auth/${name}/callback`,
       state,
       ...(name === "github" && githubLoginClient(config).app
         ? {}
@@ -148,7 +160,7 @@ export function installAuth(app, config, store, provider) {
             },
             body: new URLSearchParams({
               code: req.query.code,
-              redirect_uri: `${config.publicUrl}/auth/${name}/callback`,
+              redirect_uri: `${callbackOrigin(req, config)}/auth/${name}/callback`,
               ...(name === "github"
                 ? {
                     client_id: githubLoginClient(config).id,
@@ -247,7 +259,12 @@ export function installAuth(app, config, store, provider) {
       }
     });
   app.get("/auth/github/install", async (req, res) => {
-    if (!req.account?.github_id) return res.redirect("/auth/github");
+    if (new URL(config.publicUrl).host !== req.get("host"))
+      return res.redirect(config.publicUrl + req.originalUrl);
+    if (!req.account?.github_id)
+      return res.redirect(
+        `/auth/github?returnTo=${encodeURIComponent(safeReturn(req.query.returnTo))}`,
+      );
     if (!githubAppReady(config))
       return res
         .status(503)

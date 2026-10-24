@@ -224,6 +224,108 @@ test("automatic project names are scoped, persistent and never replace an explic
   );
   reopened.close();
 });
+test("an explicit domain alias keeps old sessions working without accepting arbitrary origins or callback hosts", async (t) => {
+  const f = await fixture(t, { publicAliases: ["https://old.butler.example"] }),
+    p = await f.create();
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${p.id}/messages`,
+        { text: "A change from the existing address", requestKey: id() },
+        f.owner,
+        { origin: "https://old.butler.example" },
+      )
+    ).status,
+    202,
+  );
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${p.id}/messages`,
+        { text: "Cross-site request", requestKey: id() },
+        f.owner,
+        { origin: "https://attacker.example" },
+      )
+    ).status,
+    403,
+  );
+  const { request } = await import("node:http");
+  const hostCall = (path, cookie, host) =>
+    new Promise((resolve, reject) => {
+      const server = new URL(f.config.publicUrl);
+      const req = request(
+        {
+          hostname: server.hostname,
+          port: server.port,
+          path,
+          headers: { host, cookie },
+        },
+        (res) => {
+          const headers = new Headers(
+            Object.entries(res.headers).map(([key, value]) => [
+              key,
+              Array.isArray(value) ? value.join(", ") : String(value),
+            ]),
+          );
+          res.resume();
+          res.on("end", () =>
+            resolve(new Response(null, { status: res.statusCode, headers })),
+          );
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+  const login = await hostCall(
+      "/auth/github?returnTo=/start",
+      f.owner,
+      "old.butler.example",
+    ),
+    url = new URL(login.headers.get("location"));
+  assert.equal(
+    url.searchParams.get("redirect_uri"),
+    "https://old.butler.example/auth/github/callback",
+  );
+  const original = f.provider.request;
+  let exchanged = false;
+  f.provider.request = async (url, options) => {
+    if (url.endsWith("/login/oauth/access_token")) {
+      assert.equal(
+        new URLSearchParams(options.body).get("redirect_uri"),
+        "https://old.butler.example/auth/github/callback",
+      );
+      exchanged = true;
+    }
+    return original(url, options);
+  };
+  const cookie = login.headers.get("set-cookie").split(";")[0];
+  const callback = await hostCall(
+    `/auth/github/callback?code=fixture&state=${url.searchParams.get("state")}`,
+    f.owner + "; " + cookie,
+    "old.butler.example",
+  );
+  assert.equal(callback.status, 302);
+  assert.equal(callback.headers.get("location"), "/start");
+  assert.equal(exchanged, true);
+  const unknown = await hostCall(
+    "/auth/github?returnTo=/start",
+    f.owner,
+    "attacker.example",
+  );
+  assert.equal(
+    unknown.headers.get("location"),
+    f.config.publicUrl + "/auth/github?returnTo=/start",
+  );
+  const install = await hostCall(
+    "/auth/github/install?returnTo=/start",
+    f.owner,
+    "old.butler.example",
+  );
+  assert.equal(
+    install.headers.get("location"),
+    f.config.publicUrl + "/auth/github/install?returnTo=/start",
+  );
+});
 test("team chat reads expose live durable progress while writes and worker events remain scoped", async (t) => {
   const f = await fixture(t),
     p = await f.create(),
