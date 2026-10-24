@@ -61,6 +61,20 @@ test("provisioning retries reuse repository/services/volume and PR environments 
     hooks = [];
   const provider = {
     railwayToken: async () => "railway-credential-fixture",
+    createRepository: async (project) => {
+      repository ||= {
+        full_name: "lead/butler-our-site-test",
+        description: `Pocket Butler project ${project.id}`,
+        default_branch: "main",
+      };
+      store.run(
+        "UPDATE projects SET repo=? WHERE id=?",
+        repository.full_name,
+        project.id,
+      );
+      project.repo = repository.full_name;
+      return repository;
+    },
     github: async (_user, url, method = "GET", body, raw) => {
       if (raw) return new Response(bytes);
       if (url === "/user/repos") {
@@ -231,7 +245,7 @@ test("provisioning retries reuse repository/services/volume and PR environments 
   assert.equal(volumes.length, 1);
   assert.equal(uploads.length, 2);
   assert.notEqual(resources.app.project, resources.agents.project);
-  assert.equal(hooks.length, 1);
+  assert.equal(hooks.length, 0);
   await provisioner.deploy(project, { sha: prSha, prNumber: 7 });
   assert.equal(environments.length, 1);
   assert.equal(environments[0].projectId, resources.app.project);

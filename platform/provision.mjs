@@ -63,43 +63,24 @@ export function createProvisioner(
       project.id,
     );
   async function repo(project) {
-    const owner = store.get(
-      "SELECT github_login FROM users WHERE id=?",
-      project.owner_id,
-    ).github_login;
-    const name = `butler-${project.slug}`;
-    let found;
-    try {
-      found = await provider.github(
-        project.owner_id,
-        `/repos/${owner}/${name}`,
-      );
-    } catch (error) {
-      if (error.status !== 404) throw error;
-    }
-    if (!found)
-      found = await provider.github(project.owner_id, "/user/repos", "POST", {
-        name,
-        private: true,
-        auto_init: true,
-        description: `Pocket Butler project ${project.id}`,
-      });
-    if (found.description !== `Pocket Butler project ${project.id}`)
-      throw new Error("A different repository already has this project name.");
-    store.run(
-      "UPDATE projects SET repo=? WHERE id=?",
-      found.full_name,
-      project.id,
-    );
-    project.repo = found.full_name;
+    const found = await provider.createRepository(project);
     if (resources(project).seeded) return;
-    if (found.default_branch !== "main")
-      await provider.github(
-        project.owner_id,
-        `/repos/${found.full_name}/branches/${encodeURIComponent(found.default_branch)}/rename`,
-        "POST",
-        { new_name: "main" },
-      );
+    if (found.default_branch !== "main") {
+      try {
+        const original = await provider.github(
+          project.owner_id,
+          `/repos/${found.full_name}/git/ref/heads/${encodeURIComponent(found.default_branch)}`,
+        );
+        await provider.github(
+          project.owner_id,
+          `/repos/${found.full_name}/git/refs`,
+          "POST",
+          { ref: "refs/heads/main", sha: original.object.sha },
+        );
+      } catch (error) {
+        if (error.status !== 422) throw error;
+      }
+    }
     const base = await provider.github(
       project.owner_id,
       `/repos/${found.full_name}/git/ref/heads/main`,
@@ -153,32 +134,10 @@ export function createProvisioner(
       { sha: commit.sha },
     );
     save(project, { seeded: true, initialSha: commit.sha });
-    try {
-      await provider.github(
-        project.owner_id,
-        `/repos/${found.full_name}/branches/main/protection`,
-        "PUT",
-        {
-          required_status_checks: {
-            strict: true,
-            contexts: ["butler/validated-merge"],
-          },
-          enforce_admins: true,
-          required_pull_request_reviews: {
-            required_approving_review_count: 0,
-            dismiss_stale_reviews: true,
-          },
-          restrictions: null,
-          allow_force_pushes: false,
-          allow_deletions: false,
-        },
-      );
-      save(project, { protectedMain: true });
-    } catch (error) {
-      if (![403, 404, 422].includes(error.status)) throw error;
-      save(project, { protectedMain: false });
-    }
+    // Validation is enforced by the controller; repository administration is not granted.
+    save(project, { protectedMain: false });
   }
+
   async function projectResource(project, kind) {
     let value = resources(project)[kind];
     if (value) return value;
@@ -452,31 +411,7 @@ export function createProvisioner(
       await deploy(project, { sha: resources(project).initialSha });
       save(project, { appDeployed: true });
     }
-    if (!resources(project).webhook) {
-      const hooks = await provider.github(
-        project.owner_id,
-        `/repos/${project.repo}/hooks`,
-      );
-      const callback = `${config.publicUrl}/api/hooks/github/${project.id}`;
-      if (!hooks.some((hook) => hook.config?.url === callback))
-        await provider.github(
-          project.owner_id,
-          `/repos/${project.repo}/hooks`,
-          "POST",
-          {
-            name: "web",
-            active: true,
-            events: ["push", "pull_request"],
-            config: {
-              url: callback,
-              content_type: "json",
-              secret: store.open(project.webhook_secret),
-              insecure_ssl: "0",
-            },
-          },
-        );
-      save(project, { webhook: true });
-    }
+    // Events arrive through the GitHub App webhook, without repository hook/admin permissions.
     state(project, "ready");
   }
   async function source(project, sha) {

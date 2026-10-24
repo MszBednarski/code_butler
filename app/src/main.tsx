@@ -12,7 +12,12 @@ type User = {
 type Session = {
   user: User | null;
   connections: { github: boolean; railway: boolean };
-  capabilities: { github: boolean; railway: boolean; email: boolean };
+  capabilities: {
+    github: boolean;
+    githubRepositories?: boolean;
+    railway: boolean;
+    email: boolean;
+  };
   commit: string;
 };
 type Member = { id: string; name: string; prefix: string; role: string };
@@ -498,7 +503,7 @@ function Dashboard({
         <p>Finding your workspace…</p>
       </div>
     );
-  if (!session.connections.github && projects.length > 0)
+  if (!session.user?.githubLogin && projects.length > 0)
     return (
       <div className="dashboard">
         <header className="site-header">
@@ -663,14 +668,21 @@ function Dashboard({
               </span>
               <div>
                 <strong>GitHub</strong>
-                <small>A home for your team’s work</small>
+                <small>Only the project repositories you select</small>
               </div>
               {session.connections.github ? (
                 <span className="connection-check">
                   <Icon name="check" size={17} />
                 </span>
               ) : (
-                <a className="text-link" href="/auth/github">
+                <a
+                  className="text-link"
+                  href={
+                    session.user?.githubLogin
+                      ? "/auth/github/install"
+                      : "/auth/github"
+                  }
+                >
                   Connect ↗
                 </a>
               )}
@@ -1750,11 +1762,15 @@ function EmailComplete({ refresh }: { refresh: () => Promise<void> }) {
   );
 }
 function InstallationSetup() {
-  const [secret] = useState(
-    () => new URLSearchParams(location.hash.slice(1)).get("token") || "",
-  );
+  const [secret] = useState(() => {
+    const value = new URLSearchParams(location.hash.slice(1)).get("token");
+    if (value) sessionStorage.setItem("butler-admin-link", value);
+    return value || sessionStorage.getItem("butler-admin-link") || "";
+  });
   const [status, setStatus] = useState<{
       github: boolean;
+      githubApp?: boolean;
+      githubAppName?: string;
       railway: boolean;
       publicUrl: string;
       railwaySettingsUrl: string;
@@ -1775,6 +1791,8 @@ function InstallationSetup() {
     }
     api<{
       github: boolean;
+      githubApp?: boolean;
+      githubAppName?: string;
       railway: boolean;
       publicUrl: string;
       railwaySettingsUrl: string;
@@ -1804,6 +1822,29 @@ function InstallationSetup() {
     } catch (e) {
       setError((e as Error).message);
     } finally {
+      setBusy("");
+    }
+  }
+  async function registerGithubApp() {
+    setBusy("github-app");
+    setError("");
+    try {
+      const result = await api<{ url: string; manifest: object }>(
+        "/api/setup/github-app/manifest",
+        { token: secret },
+      );
+      const form = document.createElement("form");
+      form.method = "POST";
+      form.action = result.url;
+      const input = document.createElement("input");
+      input.type = "hidden";
+      input.name = "manifest";
+      input.value = JSON.stringify(result.manifest);
+      form.append(input);
+      document.body.append(form);
+      form.submit();
+    } catch (e) {
+      setError((e as Error).message);
       setBusy("");
     }
   }
@@ -1891,53 +1932,79 @@ function InstallationSetup() {
                 </div>
                 {status.github && <Icon name="check" />}
               </div>
-              <a
-                className="button ghost full"
-                href={githubUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Open GitHub registration
-                <Icon name="external" size={16} />
-              </a>
               <p className="setup-instructions">
-                Name it Pocket Butler. Use the homepage and callback below if
-                GitHub doesn’t fill them automatically. Register the app and
-                generate a client secret.
+                Sign-in reads a profile only. Code access uses a separate GitHub
+                App with selected repositories, short-lived credentials, and no
+                repository administration or organization permissions.
               </p>
-              {urls("github")}
-              <label>
-                Client ID
-                <input
-                  autoComplete="off"
-                  value={githubId}
-                  onChange={(e) => setGithubId(e.target.value)}
-                  required
-                  placeholder="Paste from GitHub"
-                />
-              </label>
-              <label>
-                Client secret
-                <input
-                  type="password"
-                  autoComplete="new-password"
-                  value={githubSecret}
-                  onChange={(e) => setGithubSecret(e.target.value)}
-                  required
-                  placeholder="Paste the generated secret"
-                />
-              </label>
               <button
+                type="button"
                 className="button primary full"
-                disabled={Boolean(busy) || !githubId || !githubSecret}
+                disabled={Boolean(busy)}
+                onClick={registerGithubApp}
               >
-                {busy === "github" ? (
-                  <Spinner />
-                ) : (
-                  <Icon name="check" size={17} />
-                )}
-                Save GitHub
+                {busy === "github-app"
+                  ? "Opening GitHub…"
+                  : status.githubApp
+                    ? "Register a replacement repository app"
+                    : "Register limited repository app"}
               </button>
+              {status.githubApp && (
+                <p className="inline-status">
+                  Repository app configured: {status.githubAppName}
+                </p>
+              )}
+              <details className="optional-details">
+                <summary>Advanced: profile-only OAuth credentials</summary>
+                <a
+                  className="button ghost full"
+                  href={githubUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Open GitHub registration
+                  <Icon name="external" size={16} />
+                </a>
+                <p className="setup-instructions">
+                  These OAuth credentials are for profile sign-in only. Keep the
+                  existing values if already saved. The repository app above
+                  saves its own credentials automatically when you confirm
+                  registration.
+                </p>
+                {urls("github")}
+                <label>
+                  Client ID
+                  <input
+                    autoComplete="off"
+                    value={githubId}
+                    onChange={(e) => setGithubId(e.target.value)}
+                    required
+                    placeholder="Paste from GitHub"
+                  />
+                </label>
+                <label>
+                  Client secret
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={githubSecret}
+                    onChange={(e) => setGithubSecret(e.target.value)}
+                    required
+                    placeholder="Paste the generated secret"
+                  />
+                </label>
+                <button
+                  className="button primary full"
+                  disabled={Boolean(busy) || !githubId || !githubSecret}
+                >
+                  {busy === "github" ? (
+                    <Spinner />
+                  ) : (
+                    <Icon name="check" size={17} />
+                  )}
+                  Save GitHub
+                </button>
+              </details>
             </form>
             <form className="create-card" onSubmit={(e) => save("railway", e)}>
               <div className="card-heading">
@@ -2006,7 +2073,7 @@ function InstallationSetup() {
         ) : (
           !error && <Spinner />
         )}
-        {status?.github && status.railway && (
+        {status?.github && status.githubApp && status.railway && (
           <div className="setup-complete">
             <Icon name="check" />
             <h2>Ready for your first team.</h2>

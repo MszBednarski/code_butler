@@ -7,9 +7,9 @@ import { digest } from "./store.mjs";
 export function installGitProxy(
   app,
   store,
-  { upstream = "https://github.com" } = {},
+  { upstream = "https://github.com", repositoryToken } = {},
 ) {
-  app.use("/api/git/:projectId/repo.git", (req, res) => {
+  app.use("/api/git/:projectId/repo.git", async (req, res) => {
     const credentials = /^Basic (.+)$/i.exec(req.headers.authorization || "");
     const value = credentials
       ? Buffer.from(credentials[1], "base64")
@@ -31,26 +31,22 @@ export function installGitProxy(
         .status(401)
         .set("WWW-Authenticate", 'Basic realm="Butler project"')
         .end();
-    if (
-      !(
-        (req.method === "GET" &&
-          req.path === "/info/refs" &&
-          ["git-upload-pack", "git-receive-pack"].includes(
-            req.query.service,
-          )) ||
-        (req.method === "POST" &&
-          ["/git-upload-pack", "/git-receive-pack"].includes(req.path))
-      )
-    )
+    if (!(
+      (req.method === "GET" &&
+        req.path === "/info/refs" &&
+        ["git-upload-pack", "git-receive-pack"].includes(req.query.service)) ||
+      (req.method === "POST" &&
+        ["/git-upload-pack", "/git-receive-pack"].includes(req.path))
+    ))
       return res.status(404).end();
-    const saved = store.connection(project.owner_id, "github");
-    if (!saved?.access_token)
+    const credential = await repositoryToken(project.owner_id, project.repo);
+    if (!credential)
       return res.status(503).end("The project lead needs to reconnect GitHub.");
     const target = new URL(`/${project.repo}.git${req.path}`, upstream);
     if (req.path === "/info/refs")
       target.searchParams.set("service", req.query.service);
     const headers = {
-      Authorization: `Basic ${Buffer.from(`x-access-token:${saved.access_token}`).toString("base64")}`,
+      Authorization: `Basic ${Buffer.from(`x-access-token:${credential}`).toString("base64")}`,
       "User-Agent": "Pocket-Butler-Git",
     };
     for (const name of [
