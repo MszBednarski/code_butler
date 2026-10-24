@@ -64,7 +64,9 @@ async function fixture(t) {
       digest(worker),
       store.seal(token()),
       repo,
-      JSON.stringify({ githubRepositoryId: 7, githubInstallationId: 99 }),
+      JSON.stringify(
+        repo ? { githubRepositoryId: 7, githubInstallationId: 99 } : {},
+      ),
       now(),
     );
     return store.get("SELECT * FROM projects WHERE id=?", projectId);
@@ -198,6 +200,110 @@ test("repository creation uses its dedicated permission without contents access 
   const saved = f.store.get("SELECT * FROM projects WHERE id=?", p.id);
   assert.equal(saved.repo, repo.full_name);
   assert.equal(JSON.parse(saved.resources).githubRepositoryId, 88);
+});
+test("a created repository awaiting selection is reused after approval without creating it again", async (t) => {
+  const f = await fixture(t),
+    p = f.project(null);
+  let approved = false,
+    created = 0,
+    repo;
+  const access = createGithubAccess(f.config, f.store, async (url, options) => {
+    if (url.endsWith("/app/installations/99"))
+      return Response.json(f.installation);
+    if (url.endsWith("/access_tokens")) {
+      const body = JSON.parse(options.body);
+      if (body.repository_ids && !approved)
+        return Response.json(
+          {
+            message:
+              "There is at least one repository that does not exist or is not accessible to the parent installation.",
+          },
+          { status: 422 },
+        );
+      if (body.repository_ids) assert.deepEqual(body.repository_ids, [88]);
+      return Response.json({
+        token: body.permissions.repository_creation
+          ? "create-only"
+          : "repo-metadata",
+        expires_at: new Date(Date.now() + 3600000).toISOString(),
+      });
+    }
+    if (url === "https://api.github.com/user/repos") {
+      created++;
+      const body = JSON.parse(options.body);
+      repo = {
+        id: 88,
+        owner: { id: 42 },
+        full_name: "lead/" + body.name,
+        description: body.description,
+        default_branch: "main",
+      };
+      return Response.json(repo);
+    }
+    if (url.includes("/repos/lead/"))
+      return approved
+        ? Response.json(repo)
+        : Response.json({ message: "Not Found" }, { status: 404 });
+    throw Error("Unexpected request");
+  });
+  const found = await access.createRepository(p);
+  const missing = (error) => error.code === "github_repository_access_required";
+  await assert.rejects(
+    access.repositoryToken(f.user.id, found.full_name),
+    missing,
+  );
+  await assert.rejects(access.createRepository(p), missing);
+  assert.equal(created, 1);
+  approved = true;
+  assert.equal((await access.createRepository(p)).id, 88);
+  assert.equal(created, 1);
+  assert.equal(
+    JSON.parse(
+      f.store.get("SELECT resources FROM projects WHERE id=?", p.id).resources,
+    ).githubRepositoryId,
+    88,
+  );
+});
+test("a lost repository creation response refreshes metadata instead of creating a second repository", async (t) => {
+  const f = await fixture(t),
+    p = f.project(null);
+  let repo,
+    created = 0,
+    generation = 0;
+  const canSee = new Map();
+  const access = createGithubAccess(f.config, f.store, async (url, options) => {
+    if (url.endsWith("/app/installations/99"))
+      return Response.json(f.installation);
+    if (url.endsWith("/access_tokens")) {
+      const body = JSON.parse(options.body),
+        credential = "fixture-" + ++generation;
+      canSee.set(credential, Boolean(repo));
+      return Response.json({
+        token: credential,
+        expires_at: new Date(Date.now() + 3600000).toISOString(),
+      });
+    }
+    if (url === "https://api.github.com/user/repos") {
+      created++;
+      const body = JSON.parse(options.body);
+      repo = {
+        id: 88,
+        owner: { id: 42 },
+        full_name: "lead/" + body.name,
+        description: body.description,
+        default_branch: "main",
+      };
+      throw Error("Successful creation response was lost");
+    }
+    if (url.includes("/repos/lead/"))
+      return canSee.get(options.headers.Authorization.slice(7))
+        ? Response.json(repo)
+        : Response.json({ message: "Not Found" }, { status: 404 });
+    throw Error("Unexpected request");
+  });
+  await assert.rejects(access.createRepository(p), /response was lost/);
+  assert.equal((await access.createRepository(p)).id, 88);
+  assert.equal(created, 1);
 });
 test("old OAuth repository grants are quarantined immediately and revoked, with failed revocations retried", async (t) => {
   const f = await fixture(t);

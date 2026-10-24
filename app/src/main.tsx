@@ -46,6 +46,7 @@ type Project = {
   isOwner: boolean;
   codingReady: boolean;
   hostingProvider?: "railway" | "boat";
+  githubAccess?: { repo: string; url: string } | null;
   member: Member;
   members: Member[];
   ownMemberships: Member[];
@@ -807,8 +808,9 @@ function Dashboard({
               </span>
               <h2>Butler handles the project files.</h2>
               <p>
-                We’ll create a new private GitHub repository automatically when
-                you start your project.
+                We’ll create a new private GitHub repository for your project.
+                If GitHub asks you to add it to Butler, approve only that
+                project. Setup continues automatically when you return.
               </p>
               <a
                 className={
@@ -830,7 +832,7 @@ function Dashboard({
               </a>
               <p className="quiet-note">
                 {githubAvailable
-                  ? "GitHub will ask for permission. Limit access to selected repositories; Butler gets access to the new ones it creates."
+                  ? "Keep access limited to selected repositories. Butler will tell you which new project to approve if GitHub asks."
                   : "GitHub setup is being finished. Please try again shortly."}
               </p>
             </section>
@@ -1438,6 +1440,42 @@ function Workspace({
     };
   }, [project?.hostingProvider, projectId]);
   useEffect(() => {
+    if (project?.state !== "github_access" || !project.isOwner) return;
+    let checkedAt = 0,
+      checking = false,
+      alive = true;
+    const check = () => {
+      if (
+        document.visibilityState !== "visible" ||
+        checking ||
+        Date.now() - checkedAt < 3000
+      )
+        return;
+      checkedAt = Date.now();
+      checking = true;
+      api<{ ready: boolean }>(`/api/projects/${projectId}/github-access`, {})
+        .then((value) => {
+          if (alive && value.ready) return refresh();
+        })
+        .catch((e) => {
+          if (alive) setError(e.message);
+        })
+        .finally(() => {
+          checking = false;
+        });
+    };
+    check();
+    const timer = setInterval(check, 10000);
+    window.addEventListener("focus", check);
+    document.addEventListener("visibilitychange", check);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      window.removeEventListener("focus", check);
+      document.removeEventListener("visibilitychange", check);
+    };
+  }, [project?.state, project?.isOwner, projectId, refresh]);
+  useEffect(() => {
     refresh();
     const timer = setInterval(() => {
       if (document.visibilityState === "visible") refresh();
@@ -1547,7 +1585,11 @@ function Workspace({
           <OnboardingProgress step={3} />
           <div className="eyebrow">STEP 4 OF 4</div>
           <h1>
-            {preparing ? "We’re setting things up." : "One last sign-in."}
+            {project.githubAccess
+              ? "Approve your project on GitHub."
+              : preparing
+                ? "We’re setting things up."
+                : "One last sign-in."}
           </h1>
           <p className="page-description">
             {preparing
@@ -1555,7 +1597,33 @@ function Workspace({
               : "Use your Codex subscription to give everyone an agent. Then you can invite your team."}
           </p>
           <section className="create-card onboarding-card">
-            {preparing ? (
+            {project.githubAccess ? (
+              <>
+                <p>
+                  Your project files are created. GitHub needs your approval
+                  before Butler can finish setup.
+                </p>
+                <p>
+                  Keep <strong>Only select repositories</strong>, add{" "}
+                  <strong style={{ overflowWrap: "anywhere" }}>
+                    {project.githubAccess.repo.split("/")[1]}
+                  </strong>
+                  , then click Save.
+                </p>
+                <a
+                  className="button primary full"
+                  href={project.githubAccess.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Approve project access <Icon name="external" size={18} />
+                </a>
+                <p className="quiet-note">
+                  Come back here afterward. Butler will resume your saved
+                  project.
+                </p>
+              </>
+            ) : preparing ? (
               <>
                 <p className="inline-status" role="status">
                   <Spinner />

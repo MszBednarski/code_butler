@@ -469,6 +469,9 @@ export function createPlatform(
   });
   app.get("/api/projects/:projectId", signed, membership, (req, res) => {
     const p = req.project;
+    const installation =
+      p.owner_id === req.account.id &&
+      store.connection(req.account.id, "github_installation");
     res.json({
       id: p.id,
       name: p.name,
@@ -480,6 +483,15 @@ export function createPlatform(
       isOwner: p.owner_id === req.account.id,
       codingReady: Boolean(p.codex_ready),
       hostingProvider: p.hosting_provider,
+      githubAccess:
+        p.state === "github_access" &&
+        p.repo &&
+        Number.isSafeInteger(installation?.id)
+          ? {
+              repo: p.repo,
+              url: `https://github.com/settings/installations/${installation.id}`,
+            }
+          : null,
       member: memberView(req.member),
       members: store.all(
         "SELECT id,name,prefix,role FROM members WHERE project_id=? ORDER BY created_at",
@@ -631,6 +643,39 @@ export function createPlatform(
             "Your workspace is still being prepared. You can invite teammates now.",
         });
       res.json(await provider.worker(req.project, "/auth/start", "POST"));
+    },
+  );
+  app.post(
+    "/api/projects/:projectId/github-access",
+    signed,
+    membership,
+    owner,
+    async (req, res) => {
+      if (req.project.state !== "github_access")
+        return res.json({ ready: true });
+      if (!req.project.repo)
+        return res
+          .status(409)
+          .json({ error: "The project repository has not been created yet." });
+      try {
+        await provider.createRepository(req.project);
+      } catch (error) {
+        if (error.code === "github_repository_access_required")
+          return res.json({ ready: false });
+        throw error;
+      }
+      store.transaction(() => {
+        store.run(
+          "UPDATE tasks SET state='queued',attempts=0,error=NULL,available_at=? WHERE project_id=? AND kind='provision' AND state='failed'",
+          now(),
+          req.project.id,
+        );
+        store.run(
+          "UPDATE projects SET state='queued',error=NULL WHERE id=? AND state='github_access'",
+          req.project.id,
+        );
+      });
+      res.json({ ready: true });
     },
   );
   app.post(

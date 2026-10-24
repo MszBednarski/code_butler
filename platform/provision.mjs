@@ -726,6 +726,25 @@ export function createProvisioner(
       } catch (error) {
         const message = error.message.slice(0, 350);
         if (
+          task.kind === "provision" &&
+          error.code === "github_repository_access_required"
+        ) {
+          store.transaction(() => {
+            store.run(
+              "UPDATE tasks SET state='failed',error=?,updated_at=? WHERE id=?",
+              message,
+              now(),
+              task.id,
+            );
+            store.run(
+              "UPDATE projects SET state='github_access',error=? WHERE id=?",
+              message,
+              project.id,
+            );
+          });
+          return;
+        }
+        if (
           error.failedDeployment &&
           resources(project).workerDeployment === error.failedDeployment
         )

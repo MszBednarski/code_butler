@@ -4,6 +4,7 @@ import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createPlatform } from "../server.mjs";
 import { createStore, id, token, now, digest } from "../store.mjs";
+import { createProvisioner } from "../provision.mjs";
 
 async function fixture(t, overrides = {}) {
   const dir = await mkdtemp(`${tmpdir()}/butler-platform-`),
@@ -185,6 +186,88 @@ test("QR joining gives separate persistent workspaces with no provider accounts 
     assert.ok(!serialized.includes(secret));
 });
 
+test("GitHub approval waits without repeating setup and resumes the same project with owner-only access", async (t) => {
+  const f = await fixture(t),
+    p = await f.create();
+  f.store.run(
+    "UPDATE projects SET hosting_provider='boat',repo=? WHERE id=?",
+    "lead/created-project",
+    p.id,
+  );
+  let approved = false,
+    checks = 0;
+  f.provider.createRepository = async () => {
+    checks++;
+    if (!approved)
+      throw Object.assign(Error("Approve this project on GitHub."), {
+        code: "github_repository_access_required",
+      });
+    return { id: 88, full_name: "lead/created-project" };
+  };
+  const provisioner = createProvisioner(f.config, f.store, f.provider);
+  await provisioner.tick();
+  assert.equal(
+    f.store.get("SELECT state FROM projects WHERE id=?", p.id).state,
+    "github_access",
+  );
+  await provisioner.tick();
+  assert.equal(checks, 1);
+  const owner = await (await f.call(`/api/projects/${p.id}`)).json();
+  assert.deepEqual(owner.githubAccess, {
+    repo: "lead/created-project",
+    url: "https://github.com/settings/installations/99",
+  });
+  const member = await f.join((await f.invite(p.id)).url, "Teammate");
+  assert.equal(
+    (await (await f.call(`/api/projects/${p.id}`, undefined, member)).json())
+      .githubAccess,
+    null,
+  );
+  assert.equal(
+    (await f.call(`/api/projects/${p.id}/github-access`, {}, member)).status,
+    403,
+  );
+  assert.equal(
+    (
+      await f.call(`/api/projects/${p.id}/github-access`, {}, f.owner, {
+        origin: "https://attacker.example.test",
+      })
+    ).status,
+    403,
+  );
+  assert.deepEqual(
+    await (await f.call(`/api/projects/${p.id}/github-access`, {})).json(),
+    { ready: false },
+  );
+  assert.equal(
+    f.store.get(
+      "SELECT state FROM tasks WHERE project_id=? AND kind='provision'",
+      p.id,
+    ).state,
+    "failed",
+  );
+  approved = true;
+  assert.deepEqual(
+    await (await f.call(`/api/projects/${p.id}/github-access`, {})).json(),
+    { ready: true },
+  );
+  assert.equal(
+    f.store.get(
+      "SELECT state FROM tasks WHERE project_id=? AND kind='provision'",
+      p.id,
+    ).state,
+    "queued",
+  );
+  assert.equal(f.store.get("SELECT COUNT(*) AS n FROM projects").n, 1);
+  assert.equal(
+    f.store.get("SELECT COUNT(*) AS n FROM jobs WHERE project_id=?", p.id).n,
+    1,
+  );
+  assert.equal(
+    f.store.get("SELECT repo FROM projects WHERE id=?", p.id).repo,
+    "lead/created-project",
+  );
+});
 test("accepted messages and project creation are idempotent, origin protected and recoverable after storage reopen", async (t) => {
   const f = await fixture(t),
     p = await f.create();

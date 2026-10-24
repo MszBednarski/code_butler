@@ -41,9 +41,19 @@ export function githubJwt(config) {
   const body = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({ iat: at - 60, exp: at + 540, iss: String(config.githubAppId) })}`;
   return `${body}.${sign("RSA-SHA256", Buffer.from(body), config.githubAppPrivateKey).toString("base64url")}`;
 }
-export function accessError(message, status = 403) {
-  return Object.assign(new Error(message), { provider: "GitHub", status });
+export function accessError(message, status = 403, code) {
+  return Object.assign(new Error(message), {
+    provider: "GitHub",
+    status,
+    code,
+  });
 }
+const repositoryApproval = () =>
+  accessError(
+    "Your project files are created. Approve access to this project in GitHub, then return to Butler to continue.",
+    403,
+    "github_repository_access_required",
+  );
 export function validateInstallation(config, user, installation) {
   if (
     String(installation.app_id) !== String(config.githubAppId) ||
@@ -90,9 +100,12 @@ export function createGithubAccess(config, store, request = fetch) {
     });
     if (!response.ok) {
       const detail = await response.json().catch(() => ({}));
-      throw accessError(
-        detail.message || "Repository connection failed.",
-        response.status,
+      throw Object.assign(
+        accessError(
+          detail.message || "Repository connection failed.",
+          response.status,
+        ),
+        { details: detail.errors },
       );
     }
     if (raw) return response;
@@ -131,19 +144,30 @@ export function createGithubAccess(config, store, request = fetch) {
     });
     return value;
   }
-  async function token(userId, repositoryId, permissions) {
+  async function token(userId, repositoryId, permissions, fresh = false) {
     const value = await installation(userId);
     const key = `${config.githubAppId}:${value.id}:${repositoryId || "bootstrap"}:${JSON.stringify(permissions)}`;
     const cached = tokens.get(key);
-    if (cached?.expires > Date.now() + 90000) return cached.token;
-    const created = await app(
-      `/app/installations/${value.id}/access_tokens`,
-      "POST",
-      {
-        ...(repositoryId ? { repository_ids: [repositoryId] } : {}),
-        permissions,
-      },
-    );
+    if (!fresh && cached?.expires > Date.now() + 90000) return cached.token;
+    let created;
+    try {
+      created = await app(
+        `/app/installations/${value.id}/access_tokens`,
+        "POST",
+        {
+          ...(repositoryId ? { repository_ids: [repositoryId] } : {}),
+          permissions,
+        },
+      );
+    } catch (error) {
+      if (
+        repositoryId &&
+        error.status === 422 &&
+        /not accessible to the parent installation/.test(error.message)
+      )
+        throw repositoryApproval();
+      throw error;
+    }
     if (!created.token || !Number.isFinite(Date.parse(created.expires_at)))
       throw accessError(
         "GitHub did not issue a valid short-lived repository credential.",
@@ -219,29 +243,71 @@ export function createGithubAccess(config, store, request = fetch) {
     const installed = await installation(project.owner_id);
     const owner = installed.account.login,
       name = `butler-${project.slug}`;
+    const saved = store.get(
+        "SELECT repo,resources FROM projects WHERE id=?",
+        project.id,
+      ),
+      existing = JSON.parse(saved.resources),
+      target = saved.repo || `${owner}/${name}`;
     let found;
-    const metadata = await token(project.owner_id, null, { metadata: "read" });
+    const metadata = await token(
+      project.owner_id,
+      (saved.repo && existing.githubRepositoryId) || null,
+      { metadata: "read" },
+      true,
+    );
     try {
-      found = await api(`/repos/${owner}/${name}`, metadata);
+      found = await api(`/repos/${target}`, metadata);
     } catch (error) {
       if (error.status !== 404) throw error;
+      if (saved.repo) throw repositoryApproval();
     }
     if (!found) {
       const creation = await token(project.owner_id, null, {
         metadata: "read",
         repository_creation: "write",
       });
-      found = await api("/user/repos", creation, "POST", {
-        name,
-        private: true,
-        auto_init: true,
-        description: `Pocket Butler project ${project.id}`,
-      });
+      try {
+        found = await api("/user/repos", creation, "POST", {
+          name,
+          private: true,
+          auto_init: true,
+          description: `Pocket Butler project ${project.id}`,
+        });
+      } catch (error) {
+        if (
+          error.status !== 422 ||
+          !Array.isArray(error.details) ||
+          !error.details.some(
+            (item) =>
+              item.field === "name" &&
+              (item.code === "already_exists" ||
+                /already exists/i.test(item.message || "")),
+          )
+        )
+          throw error;
+        // A previous successful create may have lost its response. Keep its deterministic name.
+        store.run("UPDATE projects SET repo=? WHERE id=?", target, project.id);
+        const refreshed = await token(
+          project.owner_id,
+          null,
+          { metadata: "read" },
+          true,
+        );
+        try {
+          found = await api(`/repos/${target}`, refreshed);
+        } catch (lookup) {
+          if (lookup.status === 404) throw repositoryApproval();
+          throw lookup;
+        }
+      }
     }
     if (
       found.description !== `Pocket Butler project ${project.id}` ||
       !Number.isSafeInteger(found.id) ||
-      found.owner?.id !== installed.account.id
+      found.owner?.id !== installed.account.id ||
+      found.full_name?.toLowerCase() !== target.toLowerCase() ||
+      (existing.githubRepositoryId && existing.githubRepositoryId !== found.id)
     )
       throw accessError(
         "A different repository already has this project name.",
