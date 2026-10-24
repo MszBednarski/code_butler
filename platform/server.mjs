@@ -7,7 +7,7 @@ import QRCode from "qrcode";
 import { createStore, id, token, digest, now } from "./store.mjs";
 import { configuration } from "./config.mjs";
 import { providers } from "./providers.mjs";
-import { installAuth, publicUser, cookie } from "./auth.mjs";
+import { installAuth, publicUser, cookie, accountForRequest } from "./auth.mjs";
 import { installWorkerApi } from "./worker-api.mjs";
 import { installGitProxy } from "./git-proxy.mjs";
 import { createProvisioner } from "./provision.mjs";
@@ -116,19 +116,27 @@ export function createPlatform(
         if (
           ["opened", "reopened", "synchronize"].includes(event.action) &&
           event.pull_request.base.ref === "main"
-        )
+        ) {
+          store.run(
+            "DELETE FROM tasks WHERE project_id=? AND dedupe_key=? AND state='queued'",
+            project.id,
+            `cleanup:${project.id}:${event.number}`,
+          );
           store.enqueue(
             project.id,
             "deploy",
             `preview:${project.id}:${event.number}:${event.pull_request.head.sha}`,
             { prNumber: event.number, sha: event.pull_request.head.sha },
+            event.action === "reopened",
           );
+        }
         if (event.action === "closed" && !event.pull_request.merged)
           store.enqueue(
             project.id,
             "cleanup",
             `cleanup:${project.id}:${event.number}`,
             { prNumber: event.number },
+            true,
           );
       }
       res.sendStatus(202);
@@ -142,7 +150,10 @@ export function createPlatform(
       req.path.startsWith("/auth/email") ||
       req.path.startsWith("/auth/recover") ||
       req.path.startsWith("/invites/");
-    const key = `${req.ip}:${restrictive ? req.path : "api"}`,
+    const account = restrictive ? null : accountForRequest(req, store);
+    const budget = ["GET", "HEAD"].includes(req.method) ? "read" : "write";
+    const identity = account ? `user:${account.id}` : `ip:${req.ip}`;
+    const key = restrictive ? `${req.ip}:${req.path}` : `${identity}:${budget}`,
       interval = restrictive ? 600000 : 60000,
       maximum = restrictive ? 25 : 240;
     const entry = limits.get(key);

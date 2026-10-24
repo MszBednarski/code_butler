@@ -619,3 +619,75 @@ test("merge reconciliation is idempotent even when publication finished before t
     1,
   );
 });
+
+test("GitHub linking revokes pre-link guest sessions and recovery links for existing and new accounts", async (t) => {
+  const f = await fixture(t), p = await f.create(), invite = await f.invite(p.id);
+  for (const existing of [true, false]) {
+    const guestCookie = await f.join(invite.url, "Guest");
+    const recovery = await (await f.call("/api/auth/recovery", {}, guestCookie)).json();
+    const before = await (await f.call("/api/session", undefined, guestCookie)).json();
+    if (!existing) f.setProfile({ id: 9191, login: "new-account", name: "New" });
+    const begin = await f.call("/auth/github", undefined, guestCookie);
+    const state = new URL(begin.headers.get("location")).searchParams.get("state");
+    const browser = begin.headers.get("set-cookie").split(";")[0];
+    const callback = await f.call(`/auth/github/callback?code=code&state=${state}`, undefined, guestCookie + "; " + browser);
+    const signedCookie = callback.headers.get("set-cookie").match(/butler_account=[^;]+/)[0];
+    const signed = await (await f.call("/api/session", undefined, signedCookie)).json();
+    assert.equal(signed.user.githubLogin, existing ? "test-lead" : "new-account");
+    assert.equal((await (await f.call("/api/session", undefined, guestCookie)).json()).user, null);
+    assert.equal((await f.call("/api/auth/recover", { token: new URL(recovery.url).hash.slice(7) }, "")).status, 403);
+    assert.equal(f.store.get("SELECT user_id FROM members WHERE project_id=? AND name='Guest' AND user_id=?", p.id, signed.user.id)?.user_id, signed.user.id);
+    assert.equal(f.store.get("SELECT recovery_hash FROM users WHERE id=?", before.user.id).recovery_hash, null);
+  }
+});
+
+test("reopening a PR at the same head reactivates completed preview work and repeat closes reactivate cleanup", async (t) => {
+  const { createHmac } = await import("node:crypto");
+  const f = await fixture(t), p = await f.create();
+  f.store.run("UPDATE projects SET repo=? WHERE id=?", "team/site", p.id);
+  const project = f.store.get("SELECT * FROM projects WHERE id=?", p.id), sha = "a".repeat(40);
+  async function hook(action) {
+    const body = JSON.stringify({ action, number: 12, repository: { full_name: "team/site" }, pull_request: { merged: false, base: { ref: "main" }, head: { sha } } });
+    return fetch(`${f.config.publicUrl}/api/hooks/github/${p.id}`, { method: "POST", headers: { "content-type": "application/json", "x-github-event": "pull_request", "x-hub-signature-256": "sha256=" + createHmac("sha256", f.store.open(project.webhook_secret)).update(body).digest("hex") }, body });
+  }
+  assert.equal((await hook("opened")).status, 202);
+  f.store.run("UPDATE tasks SET state='done',attempts=3 WHERE kind='deploy'");
+  await hook("closed");
+  f.store.run("UPDATE tasks SET state='done' WHERE kind='cleanup'");
+  await hook("reopened");
+  assert.equal(f.store.get("SELECT state FROM tasks WHERE kind='deploy'").state, "queued");
+  assert.equal(f.store.get("SELECT attempts FROM tasks WHERE kind='deploy'").attempts, 0);
+  await hook("reopened");
+  assert.equal(f.store.get("SELECT count(*) AS n FROM tasks WHERE kind='deploy'").n, 1);
+  await hook("closed");
+  assert.equal(f.store.get("SELECT state FROM tasks WHERE kind='cleanup'").state, "queued");
+  await hook("reopened");
+  assert.equal(f.store.get("SELECT count(*) AS n FROM tasks WHERE kind='cleanup'").n, 0);
+});
+
+test("teammates sharing an IP have independent read budgets and polling cannot consume write capacity", async (t) => {
+  const f = await fixture(t);
+  const cookies = Array.from({ length: 20 }, () => `butler_account=${f.store.session(f.store.guest().id)}`);
+  for (let i = 0; i < 25; i++) {
+    const responses = await Promise.all(cookies.map(cookie => f.call("/api/session", undefined, cookie)));
+    assert.ok(responses.every(response => response.status === 200));
+  }
+  for (let i = 25; i < 240; i++) assert.equal((await f.call("/api/session", undefined, cookies[0])).status, 200);
+  assert.equal((await f.call("/api/session", undefined, cookies[0])).status, 429);
+  assert.equal((await f.call("/api/session", undefined, cookies[1])).status, 200);
+  assert.equal((await f.call("/api/projects", {}, cookies[0])).status, 409);
+});
+
+test("email linking also invalidates guest credentials instead of promoting them", async (t) => {
+  const f = await fixture(t), p = await f.create(), inv = await f.invite(p.id);
+  f.store.run("UPDATE users SET email=? WHERE id=?", "lead@example.test", f.lead.id);
+  const guest = await f.join(inv.url, "Guest"), recovery = await (await f.call("/api/auth/recovery", {}, guest)).json();
+  await f.call("/api/auth/email", { email: "lead@example.test" }, guest);
+  const secret = new URL(f.email().text.match(/https?:\/\/\S+/)[0]).hash.slice(7);
+  const response = await f.call("/api/auth/email/complete", { token: secret }, guest);
+  assert.equal(response.status, 200);
+  const signed = response.headers.get("set-cookie").split(";")[0];
+  assert.equal((await (await f.call("/api/session", undefined, signed)).json()).user.id, f.lead.id);
+  assert.equal((await (await f.call("/api/session", undefined, guest)).json()).user, null);
+  assert.equal((await f.call("/api/auth/recover", { token: new URL(recovery.url).hash.slice(7) }, "")).status, 403);
+});

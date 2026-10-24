@@ -32,17 +32,20 @@ export function safeReturn(value) {
     : "/";
 }
 
+export function accountForRequest(req, store) {
+  const hash = cookies(req).butler_account;
+  return typeof hash === "string" && hash.length <= 100
+    ? store.get(
+        "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.hash=? AND s.expires_at>?",
+        digest(hash),
+        now(),
+      )
+    : null;
+}
+
 export function installAuth(app, config, store, provider) {
   app.use((req, _res, next) => {
-    const hash = cookies(req).butler_account;
-    req.account =
-      typeof hash === "string" && hash.length <= 100
-        ? store.get(
-            "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.hash=? AND s.expires_at>?",
-            digest(hash),
-            now(),
-          )
-        : null;
+    req.account = accountForRequest(req, store);
     next();
   });
   const begin = (name, clientId, authorize, scopes) => (req, res) => {
@@ -188,6 +191,7 @@ export function installAuth(app, config, store, provider) {
             userId = existing.id;
           } else {
             if (!userId) userId = store.guest(profile.name || profile.login).id;
+            store.revokeAccess(userId);
             store.run(
               "UPDATE users SET github_id=?,github_login=?,name=? WHERE id=?",
               String(profile.id),
@@ -250,12 +254,10 @@ export function installAuth(app, config, store, provider) {
       "SELECT * FROM users WHERE recovery_hash=?",
       digest(req.body.token),
     );
-    if (!user)
+    if (!user || user.merged_into)
       return res.status(403).json({
         error: "This private sign-in link has expired or was replaced.",
       });
-    for (let hop = 0; user.merged_into && hop < 10; hop++)
-      user = store.get("SELECT * FROM users WHERE id=?", user.merged_into);
     cookie(res, config, "butler_account", store.session(user.id));
     res.json({ ok: true });
   });
@@ -330,6 +332,7 @@ export function installAuth(app, config, store, provider) {
       user = source
         ? store.get("SELECT * FROM users WHERE id=?", source)
         : store.guest(link.email.split("@")[0]);
+      store.revokeAccess(user.id);
       store.run("UPDATE users SET email=? WHERE id=?", link.email, user.id);
     }
     cookie(res, config, "butler_account", store.session(user.id));

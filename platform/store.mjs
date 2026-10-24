@@ -169,6 +169,12 @@ export function createStore(directory) {
     );
     return value;
   }
+  function revokeAccess(userId) {
+    run("DELETE FROM sessions WHERE user_id=?", userId);
+    run("DELETE FROM oauth_states WHERE user_id=?", userId);
+    run("DELETE FROM email_links WHERE user_id=?", userId);
+    run("UPDATE users SET recovery_hash=NULL,recovery_secret=NULL WHERE id=?", userId);
+  }
   function mergeUsers(from, to) {
     if (!from || from === to) return;
     const source = get("SELECT * FROM users WHERE id=?", from),
@@ -195,14 +201,14 @@ export function createStore(directory) {
         );
       run("UPDATE members SET user_id=? WHERE user_id=?", to, from);
       run("UPDATE projects SET owner_id=? WHERE owner_id=?", to, from);
-      run("UPDATE sessions SET user_id=? WHERE user_id=?", to, from);
+      revokeAccess(from);
       run(
         "INSERT OR IGNORE INTO connections SELECT ?,provider,secret FROM connections WHERE user_id=?",
         to,
         from,
       );
       run("DELETE FROM connections WHERE user_id=?", from);
-      // Keep the old account as a recovery alias. It holds no provider login.
+      // Old guest credentials must never become credentials for the target.
       run(
         "UPDATE users SET github_id=NULL,github_login=NULL,email=NULL,merged_into=? WHERE id=?",
         to,
@@ -217,7 +223,7 @@ export function createStore(directory) {
       );
     });
   }
-  function enqueue(project, kind, dedupeKey, payload = {}) {
+  function enqueue(project, kind, dedupeKey, payload = {}, reactivate = false) {
     run(
       "INSERT OR IGNORE INTO tasks VALUES(?,?,?,?,?,?,0,NULL,?,?)",
       id(),
@@ -229,6 +235,13 @@ export function createStore(directory) {
       now(),
       now(),
     );
+    if (reactivate)
+      run(
+        "UPDATE tasks SET state='queued',attempts=0,error=NULL,available_at=?,updated_at=? WHERE dedupe_key=? AND state IN ('done','failed')",
+        now(),
+        now(),
+        dedupeKey,
+      );
   }
   function claimJob(project) {
     return transaction(() => {
@@ -290,6 +303,7 @@ export function createStore(directory) {
     guest,
     session,
     mergeUsers,
+    revokeAccess,
     enqueue,
     claimJob,
     recordMerge,
