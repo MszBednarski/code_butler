@@ -101,7 +101,7 @@ export default function Reactions({
         onClick={() => setOpen((value) => !value)}
       >
         <span aria-hidden="true">☺</span>
-        <span>React</span>
+        <span>{targetType === "preview" ? "React to preview" : "React"}</span>
       </button>
       {open && (
         <div

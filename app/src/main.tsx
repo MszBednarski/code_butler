@@ -2565,6 +2565,12 @@ function Workspace({
                     <Icon name="grid" size={16} />
                     Inspect preview <Icon name="arrow" size={16} />
                   </button>
+                  <Reactions
+                    targetType="preview"
+                    targetId={job.id}
+                    summary={project.reactions}
+                    onReact={react}
+                  />
                 </article>
               ))}
             {project.jobs

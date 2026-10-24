@@ -1043,6 +1043,7 @@ small {
 .message-assistant .emoji-picker { left: 0; right: auto; }
 .preview-reactions {
   position: absolute;
+  z-index: 5;
   bottom: 12px;
   right: 12px;
   max-width: calc(100% - 24px);

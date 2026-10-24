@@ -425,7 +425,39 @@ test("real git transport and app builds carry a teammate request through PR revi
     secret,
     auth,
   });
+  // Persisted worktrees keep their old remote when the platform changes domains.
+  // Reproduce the credential-host mismatch and an unfinished teammate edit.
+  const workerRepo = path.join(data, "repo");
+  const oldOrigin = new URL(config.publicUrl);
+  oldOrigin.hostname = "localhost";
+  await git(
+    [
+      "remote",
+      "set-url",
+      "origin",
+      `${oldOrigin.origin}/api/git/${projectId}/repo.git`,
+    ],
+    workerRepo,
+  );
+  const preservedFile = path.join(data, "wt", member.id, "unfinished-note.txt");
+  await writeFile(preservedFile, "Preserve this unfinished teammate work.\n");
+  const originalHead = await git(
+    ["rev-parse", "HEAD"],
+    path.dirname(preservedFile),
+  );
   await resumed.initialize();
+  assert.equal(
+    await git(["remote", "get-url", "origin"], workerRepo),
+    `${config.publicUrl}/api/git/${projectId}/repo.git`,
+  );
+  assert.equal(
+    await readFile(preservedFile, "utf8"),
+    "Preserve this unfinished teammate work.\n",
+  );
+  assert.equal(
+    await git(["rev-parse", "HEAD"], path.dirname(preservedFile)),
+    originalHead,
+  );
   await call(
     `/api/projects/${projectId}/messages`,
     { text: "Keep the heading Hello Team", requestKey: id() },

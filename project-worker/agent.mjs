@@ -17,7 +17,8 @@ export function createAgent({
 }) {
   const repo = `${dataDir}/repo`,
     worktrees = `${dataDir}/wt`,
-    homes = `${dataDir}/home`;
+    homes = `${dataDir}/home`,
+    repositoryUrl = `${platform}/api/git/${projectId}/repo.git`;
   const gitEnv = {
     ...safeEnvironment(`${dataDir}/git`),
     PLATFORM_URL: platform,
@@ -142,7 +143,7 @@ export function createAgent({
           `credential.helper=!node ${new URL("./git-credential.mjs", import.meta.url).pathname}`,
           "clone",
           "--no-checkout",
-          `${platform}/api/git/${projectId}/repo.git`,
+          repositoryUrl,
           repo,
         ],
         {
@@ -160,6 +161,9 @@ export function createAgent({
     ]);
     await git(["config", "user.name", "Pocket Butler"]);
     await git(["config", "user.email", "butler@users.noreply.github.com"]);
+    // A persistent repo can outlive the platform's public domain. Its remote
+    // must match the credential helper's current, explicitly trusted origin.
+    await git(["remote", "set-url", "origin", repositoryUrl]);
     await git(["fetch", "--prune", "origin"]);
     await git(["worktree", "prune"]);
   }
