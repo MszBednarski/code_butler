@@ -1,5 +1,11 @@
 import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { run, save, load, safeEnvironment } from "./runtime.mjs";
+import { randomUUID } from "node:crypto";
+import {
+  createProgress,
+  assistantUpdate,
+  readableFailure,
+} from "./progress.mjs";
 
 export function createAgent({
   dataDir = "/data",
@@ -19,13 +25,15 @@ export function createAgent({
   };
   let stopping = false,
     child,
-    reportedAuth;
+    reportedAuth,
+    workStage = "preparing the workspace";
   async function api(endpoint, body) {
     const response = await request(`${platform}/api/worker${endpoint}`, {
       method: body === undefined ? "GET" : "POST",
       headers: {
         Authorization: `Bearer ${secret}`,
         "X-Butler-Project": projectId,
+        "X-Butler-Protocol": "2",
         "Content-Type": "application/json",
       },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -38,6 +46,7 @@ export function createAgent({
   }
   const github = (operation, body = {}) =>
     api("/github", { operation, ...body });
+  const progress = createProgress({ dataDir, api });
   const git = (args, cwd = repo, extra = {}) =>
     run("git", args, {
       cwd,
@@ -114,6 +123,14 @@ export function createAgent({
       );
   }
   async function perform(job) {
+    const attempt = randomUUID(),
+      target = `jobs/${job.id}`;
+    workStage = "preparing the workspace";
+    await progress.post(
+      target,
+      `${attempt}:prepare`,
+      "Preparing your saved workspace.",
+    );
     const member = job.member,
       cwd = `${worktrees}/${member.id}`,
       home = `${homes}/${member.id}`,
@@ -135,7 +152,31 @@ export function createAgent({
       const current = (
         await git(["branch", "--show-current"], cwd)
       ).stdout.trim();
-      if (dirty) {
+      if (job.approval_required) {
+        if (dirty && !current.startsWith(`${member.prefix}/`))
+          throw new Error(
+            "Unfinished work on another workspace was preserved.",
+          );
+        branch = `${member.prefix}/draft-${job.id.slice(0, 8)}`;
+        await git(
+          [
+            "switch",
+            "-c",
+            branch,
+            ...(current.startsWith(`${member.prefix}/`) ? [] : ["origin/main"]),
+          ],
+          cwd,
+        );
+      } else if (job.branch) {
+        if (!job.branch.startsWith(`${member.prefix}/`))
+          throw new Error("Invalid review repair branch.");
+        if (dirty && current !== job.branch)
+          throw new Error(
+            "Your unfinished draft was preserved. Finish it before repairing the other branch.",
+          );
+        branch = job.branch;
+        if (current !== branch) await git(["switch", branch], cwd);
+      } else if (dirty) {
         if (!current.startsWith(`${member.prefix}/`))
           throw new Error(
             "Your workspace has unfinished work on another branch. It was preserved; ask the lead to inspect it.",
@@ -178,9 +219,11 @@ export function createAgent({
       `Request: ${job.text}\nJob: ${job.id}\nBranch: ${branch}\nPreserve existing edits. The Butler controller publishes and reviews this request.\n`,
       { mode: 0o600 },
     );
-    let final = recovery.result;
-    if (!["edited", "pushed"].includes(recovery.phase)) {
-      const prompt = `You are ${member.name}'s personal Pocket Butler coding agent. Work only in this project's app/ directory.\nRequest id: ${job.id}. This request may be recovering after a process restart: inspect existing edits and $HOME/.butler-task.md first and preserve completed work.\nMake the requested website change. Use the files in this checkout as the source of truth. Do not run gh, commit, push, merge, change branches/remotes, inspect other workspaces, or read account credentials. A controller independently builds, commits, opens a PR, reviews and publishes your local changes. Keep the final reply short and say what changed; do not claim publication has already happened. Do not delegate.\n\nTeammate's request:\n${job.text}`;
+    let final = recovery.result,
+      metadata = recovery.metadata;
+    if (!["edited", "pushed"].includes(recovery.phase) || !metadata) {
+      workStage = "working on the change";
+      const prompt = `You are ${member.name}'s personal Pocket Butler coding agent. Work only in this project's app/ directory.\nRequest id: ${job.id}. This request may be recovering after a process restart: inspect existing edits and $HOME/.butler-task.md first and preserve completed work.\nMake the requested website change. Use the files in this checkout as the source of truth. Do not run gh, commit, push, merge, change branches/remotes, inspect other workspaces, or read account credentials. Give brief human-readable progress updates. The controller builds an artifact for the teammate to inspect; it creates a PR only after the teammate approves. Review repairs continue an already approved PR. Do not claim publication has happened. Do not delegate. Your final structured response must summarize the change and provide a clean PR title under 100 characters and a short description with validation. Translate spoken intent into normal written English; never use raw dictation as the PR title. Describe the overall diff against main, including existing unmerged features, not only a tiny follow-up fix.\n\nTeammate's request:\n${job.text}`;
       const output = `${dataDir}/jobs/${job.id}.txt`;
       const localThread = await load(`${home}/.butler-conversation.json`);
       const thread =
@@ -190,6 +233,8 @@ export function createAgent({
         ...(thread ? ["resume", thread] : []),
         "--dangerously-bypass-approvals-and-sandbox",
         "--json",
+        "--output-schema",
+        new URL("./change.schema.json", import.meta.url).pathname,
         "--output-last-message",
         output,
         "-",
@@ -206,6 +251,20 @@ export function createAgent({
         onLine: (line) => {
           try {
             const event = JSON.parse(line);
+            const update = assistantUpdate(event);
+            let structured = false;
+            if (update) {
+              try {
+                structured = Boolean(JSON.parse(update.text)?.summary);
+              } catch {}
+            }
+            if (update && !structured)
+              progress.post(
+                target,
+                `${attempt}:${update.key}`,
+                update.text,
+                "agent",
+              );
             if (event.type === "thread.started" && event.thread_id) {
               recovery.threadId = event.thread_id;
               threadPromise = threadPromise
@@ -228,11 +287,42 @@ export function createAgent({
         },
       });
       await threadPromise;
-      final = (await readFile(output, "utf8")).slice(0, 25000);
-      recovery = { ...recovery, phase: "edited", result: final };
+      await progress.flush();
+      metadata = JSON.parse(await readFile(output, "utf8"));
+      if (
+        typeof metadata.summary !== "string" ||
+        typeof metadata.title !== "string" ||
+        !metadata.title.trim() ||
+        typeof metadata.description !== "string"
+      )
+        throw new Error("The agent did not return valid change metadata.");
+      metadata = {
+        summary: metadata.summary.slice(0, 10000),
+        title: metadata.title.trim().slice(0, 100),
+        description: metadata.description.slice(0, 20000),
+      };
+      final = metadata.summary;
+      await progress.post(target, `${attempt}:summary`, final, "agent");
+      recovery = { ...recovery, phase: "edited", result: final, metadata };
       await save(file, recovery);
     }
+    workStage = "checking the app";
+    await progress.post(
+      target,
+      `${attempt}:checks`,
+      "Running the app checks and production build.",
+    );
     await build(cwd, home);
+    workStage = job.approval_required
+      ? "preparing the preview"
+      : "opening the pull request";
+    await progress.post(
+      target,
+      `${attempt}:publish`,
+      job.approval_required
+        ? "App checks passed. Preparing your preview; no pull request has been opened."
+        : "App checks passed. Preparing the pull request.",
+    );
     if ((await git(["branch", "--show-current"], cwd)).stdout.trim() !== branch)
       throw new Error(
         "The agent changed branches. Work is preserved; ask the lead to inspect it.",
@@ -254,13 +344,21 @@ export function createAgent({
           `user.email=${member.prefix}@users.noreply.github.com`,
           "commit",
           "-m",
-          job.text.replace(/\s+/g, " ").slice(0, 90),
+          metadata?.title || "Update the website",
         ],
         cwd,
       );
     }
     const sha = (await git(["rev-parse", "HEAD"], cwd)).stdout.trim();
-    if (sha === (await git(["rev-parse", "origin/main"], cwd)).stdout.trim()) {
+    if (
+      (
+        await git(
+          ["diff", "--quiet", "origin/main", "HEAD", "--", "app"],
+          cwd,
+          { allowFailure: true },
+        )
+      ).code === 0
+    ) {
       await api(`/jobs/${job.id}/result`, {
         state: "unchanged",
         threadId: recovery.threadId,
@@ -274,10 +372,23 @@ export function createAgent({
     );
     recovery = { ...recovery, phase: "pushed", sha };
     await save(file, recovery);
+    if (job.approval_required) {
+      await api(`/jobs/${job.id}/result`, {
+        state: "building_preview",
+        threadId: recovery.threadId,
+        text: `${final}\n\nI’m building your preview. Inspect it, then choose “Make this the website” when you want this change reviewed and published.`,
+        branch,
+        sha,
+        title: metadata.title,
+        description: metadata.description,
+      });
+      return;
+    }
     const pr = await github("createPull", {
       jobId: job.id,
       branch,
-      title: job.text,
+      title: metadata?.title || "Update the website",
+      description: metadata?.description || final,
     });
     await api(`/jobs/${job.id}/result`, {
       state: "reviewing",
@@ -290,6 +401,7 @@ export function createAgent({
   }
   async function codeOne() {
     if (stopping) return;
+    await progress.flush();
     const connected = (await auth.status()).state === "connected";
     if (reportedAuth !== connected) {
       await api("/auth", { connected });
@@ -312,10 +424,11 @@ export function createAgent({
         state: "failed",
         threadId: recovery.threadId,
         branch: recovery.branch,
-        text: "This request stopped before it could be published. Your edits and conversation were saved. Ask your agent to continue, or ask the lead to check the workspace.",
+        text: readableFailure(error, workStage),
       });
     } finally {
       clearInterval(heartbeat);
+      await progress.flush();
     }
   }
   return {
@@ -324,6 +437,8 @@ export function createAgent({
     git,
     github,
     api,
+    reportPull: (number, key, text, kind = "review") =>
+      progress.post(`pulls/${number}`, key, text, kind),
     build,
     run,
     get stopping() {
@@ -331,6 +446,7 @@ export function createAgent({
     },
     stop() {
       stopping = true;
+      progress.stop();
       child?.kill("SIGTERM");
     },
   };

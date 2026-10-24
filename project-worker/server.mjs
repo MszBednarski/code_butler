@@ -48,6 +48,7 @@ export async function createWorker({
     next();
   });
   app.post("/auth/start", async (_req, res) => res.json(await auth.start()));
+  app.get("/status",(_req,res)=>res.json({version:process.env.WORKER_VERSION||null}));
   app.get("/auth/status", async (_req, res) => res.json(await auth.status()));
   app.use((_req, res) => res.sendStatus(404));
   app.use((error, _req, res, _next) => {

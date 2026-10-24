@@ -78,6 +78,15 @@ export function createStore(directory) {
     CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(project_id,state,created_at);
     CREATE INDEX IF NOT EXISTS members_user ON members(user_id,project_id);
     CREATE INDEX IF NOT EXISTS messages_member ON messages(member_id,created_at);
+    CREATE TABLE IF NOT EXISTS job_events (
+      job_id TEXT NOT NULL REFERENCES jobs(id), event_key TEXT NOT NULL,
+      kind TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL,
+      PRIMARY KEY(job_id,event_key));
+    CREATE TABLE IF NOT EXISTS releases (
+      project_id TEXT NOT NULL REFERENCES projects(id), pr_number INTEGER NOT NULL,
+      title TEXT NOT NULL, author TEXT, merge_sha TEXT NOT NULL,
+      merged_at INTEGER, published_at INTEGER, is_live INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(project_id,pr_number));
   `);
   if (
     !db
@@ -100,6 +109,47 @@ export function createStore(directory) {
     );
   const all = (sql, ...args) => db.prepare(sql).all(...args);
   const run = (sql, ...args) => db.prepare(sql).run(...args);
+  const jobColumns = new Set(
+    db
+      .prepare("PRAGMA table_info(jobs)")
+      .all()
+      .map((c) => c.name),
+  );
+  for (const column of [
+    "started_at",
+    "finished_at",
+    "merged_at",
+    "published_at",
+  ])
+    if (!jobColumns.has(column))
+      db.exec(`ALTER TABLE jobs ADD COLUMN ${column} INTEGER`);
+  for (const [column, type] of Object.entries({
+    approval_required: "INTEGER NOT NULL DEFAULT 0",
+    change_sha: "TEXT",
+    branch: "TEXT",
+    pr_title: "TEXT",
+    pr_body: "TEXT",
+    artifact_url: "TEXT",
+    artifact_number: "INTEGER",
+    artifact_ready_at: "INTEGER",
+    inspected_at: "INTEGER",
+    approved_at: "INTEGER",
+  }))
+    if (!jobColumns.has(column))
+      db.exec(`ALTER TABLE jobs ADD COLUMN ${column} ${type}`);
+  // Preserve older outcomes without pretending their historical start/merge times were recorded.
+  db.exec(`INSERT OR IGNORE INTO releases(project_id,pr_number,title,author,merge_sha,merged_at,published_at,is_live)
+    SELECT j.project_id,j.pr_number,substr(j.text,1,100),m.name,j.merge_sha,j.merged_at,j.published_at,(j.state='live')
+    FROM jobs j JOIN members m ON m.id=j.member_id WHERE j.pr_number IS NOT NULL AND j.merge_sha IS NOT NULL ORDER BY j.created_at`);
+  for (const job of all(
+    "SELECT id,error,state FROM jobs WHERE error IS NOT NULL",
+  ))
+    recordEvent(
+      job.id,
+      `previous-error:${digest(job.error)}`,
+      job.state === "needs_attention" ? "review" : "error",
+      job.error,
+    );
   const transaction = (fn) => {
     db.exec("BEGIN IMMEDIATE");
     try {
@@ -255,41 +305,104 @@ export function createStore(directory) {
         dedupeKey,
       );
   }
-  function claimJob(project) {
+  function claimJob(project, { supportsApproval = true } = {}) {
     return transaction(() => {
       const job = get(
-        "SELECT * FROM jobs WHERE project_id=? AND (state='queued' OR (state='working' AND lease_until<?)) ORDER BY created_at LIMIT 1",
+        "SELECT * FROM jobs WHERE project_id=? AND (approval_required=0 OR ?=1) AND (state='queued' OR (state='working' AND lease_until<?)) ORDER BY created_at LIMIT 1",
         project,
+        supportsApproval ? 1 : 0,
         now(),
       );
       if (!job) return null;
       run(
-        "UPDATE jobs SET state='working',lease_until=?,updated_at=? WHERE id=?",
+        "UPDATE jobs SET state='working',lease_until=?,updated_at=?,started_at=COALESCE(started_at,?),finished_at=NULL WHERE id=?",
         now() + 90000,
         now(),
+        now(),
         job.id,
+      );
+      recordEvent(
+        job.id,
+        job.started_at ? `resume:${now()}` : "started",
+        "status",
+        job.started_at
+          ? "Resuming your saved request."
+          : "I’m starting work on your request.",
       );
       return {
         ...job,
         state: "working",
+        started_at: job.started_at || now(),
         member: get("SELECT * FROM members WHERE id=?", job.member_id),
       };
     });
   }
-  function recordMerge(project, number, sha) {
+  function recordEvent(jobId, key, kind, text, at = now()) {
+    run(
+      "INSERT OR IGNORE INTO job_events(job_id,event_key,kind,text,created_at) VALUES(?,?,?,?,?)",
+      jobId,
+      key,
+      kind,
+      text,
+      at,
+    );
+  }
+  function recordRelease(project, number, sha, metadata = {}) {
+    const job = get(
+      "SELECT j.pr_title,m.name FROM jobs j JOIN members m ON m.id=j.member_id WHERE j.project_id=? AND j.pr_number=? ORDER BY j.created_at DESC LIMIT 1",
+      project,
+      number,
+    );
+    const mergedAt = Number.isFinite(metadata.mergedAt)
+      ? metadata.mergedAt
+      : now();
+    run(
+      `INSERT INTO releases(project_id,pr_number,title,author,merge_sha,merged_at) VALUES(?,?,?,?,?,?)
+      ON CONFLICT(project_id,pr_number) DO UPDATE SET title=excluded.title,author=COALESCE(excluded.author,releases.author),merge_sha=excluded.merge_sha,merged_at=CASE WHEN ? THEN excluded.merged_at ELSE COALESCE(releases.merged_at,excluded.merged_at) END`,
+      project,
+      number,
+      String(metadata.title || job?.pr_title || `PR #${number}`).slice(0, 200),
+      job?.name || metadata.author || null,
+      sha,
+      mergedAt,
+      Number.isFinite(metadata.mergedAt) ? 1 : 0,
+    );
+  }
+  function recordMerge(project, number, sha, metadata = {}) {
     return transaction(() => {
+      recordRelease(project, number, sha, metadata);
       const resources = JSON.parse(
         get("SELECT resources FROM projects WHERE id=?", project).resources,
       );
       const state = resources.deployedSha === sha ? "live" : "deploying";
       run(
-        "UPDATE jobs SET state=?,error=NULL,merge_sha=?,updated_at=? WHERE project_id=? AND pr_number=? AND state IN ('reviewing','needs_attention','preview_failed','deploying','publish_failed')",
+        "UPDATE jobs SET state=?,error=NULL,merge_sha=?,updated_at=?,merged_at=COALESCE(merged_at,?),finished_at=CASE WHEN ?='live' THEN COALESCE(finished_at,?) ELSE NULL END WHERE project_id=? AND pr_number=? AND state IN ('reviewing','needs_attention','preview_failed','deploying','publish_failed')",
         state,
         sha,
+        now(),
+        Number.isFinite(metadata.mergedAt) ? metadata.mergedAt : now(),
+        state,
         now(),
         project,
         number,
       );
+      if (state === "live")
+        run(
+          "UPDATE releases SET is_live=1 WHERE project_id=? AND pr_number=?",
+          project,
+          number,
+        );
+      for (const job of all(
+        "SELECT id FROM jobs WHERE project_id=? AND pr_number=?",
+        project,
+        number,
+      ))
+        recordEvent(
+          job.id,
+          `merged:${sha}`,
+          "status",
+          `PR #${number} merged. ${state === "live" ? "Your change is live." : "Publishing the website update."}`,
+        );
       if (state !== "live") {
         const key = `main:${project}:${sha}`;
         enqueue(project, "deploy", key, { sha });
@@ -319,6 +432,8 @@ export function createStore(directory) {
     enqueue,
     claimJob,
     recordMerge,
+    recordEvent,
+    recordRelease,
     close: () => db.close(),
   };
 }

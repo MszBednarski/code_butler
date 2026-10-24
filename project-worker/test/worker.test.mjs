@@ -2,10 +2,148 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseDeviceOutput } from "../auth.mjs";
 import { safeEnvironment } from "../runtime.mjs";
-import { mergeAllowed } from "../reviewer.mjs";
+import { mergeAllowed, reviewKey } from "../reviewer.mjs";
 import { createWorker } from "../server.mjs";
 import { randomBytes, randomUUID } from "node:crypto";
+import {
+  assistantUpdate,
+  createProgress,
+  readableFailure,
+} from "../progress.mjs";
+import {
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+  mkdir,
+} from "node:fs/promises";
 
+test("progress forwards assistant messages and excludes reasoning, commands, and auth output", () => {
+  assert.deepEqual(
+    assistantUpdate({
+      type: "item.completed",
+      item: {
+        id: "item_1",
+        type: "agent_message",
+        text: "I’m updating the layout.",
+      },
+    }),
+    { key: "item_1", text: "I’m updating the layout." },
+  );
+  for (const type of ["reasoning", "command_execution", "mcp_tool_call"])
+    assert.equal(
+      assistantUpdate({
+        type: "item.completed",
+        item: { id: "hidden", type, text: "sensitive-fixture" },
+      }),
+      null,
+    );
+  assert.equal(
+    assistantUpdate({ type: "error", message: "sensitive-fixture" }),
+    null,
+  );
+  assert.ok(
+    !readableFailure(
+      { output: "sensitive-fixture" },
+      "checking the app",
+    ).includes("sensitive-fixture"),
+  );
+});
+test("progress survives a lost delivery response and worker restart without duplicate events", async (t) => {
+  const dataDir = await mkdtemp("/tmp/butler-progress-"),
+    target = `jobs/${randomUUID()}`,
+    delivered = new Set();
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  let lose = true;
+  const api = async (_path, { events }) => {
+    for (const e of events) delivered.add(e.key);
+    if (lose) {
+      lose = false;
+      throw Error("Response lost");
+    }
+    return { ok: true };
+  };
+  await createProgress({ dataDir, api }).post(
+    target,
+    "attempt:item_1",
+    "The app checks are running.",
+    "agent",
+  );
+  assert.equal((await readdir(dataDir + "/events")).length, 1);
+  const file = (await readdir(dataDir + "/events"))[0];
+  assert.ok(
+    (await readFile(dataDir + "/events/" + file, "utf8")).includes(
+      "The app checks are running.",
+    ),
+  );
+  await createProgress({ dataDir, api }).flush();
+  assert.equal(delivered.size, 1);
+  assert.equal((await readdir(dataDir + "/events")).length, 0);
+});
+test("a reviewer that changes proposed files cannot publish a validation", async (t) => {
+  const { createReviewer, reviewKey } = await import("../reviewer.mjs"),
+    dataDir = await mkdtemp("/tmp/butler-review-integrity-");
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  await mkdir(dataDir + "/reviews");
+  const pr = {
+    number: 1,
+    state: "open",
+    draft: false,
+    title: "Improve tiles",
+    labels: [],
+    head: {
+      sha: "a".repeat(40),
+      ref: "alice/task",
+      repo: { full_name: "team/project" },
+    },
+    base: { ref: "main", repo: { full_name: "team/project" } },
+  };
+  let diffs = 0,
+    blocked = false,
+    validated = false;
+  const agent = {
+    stopping: false,
+    github: async (operation, b) => {
+      if (operation === "pulls") return [pr];
+      if (operation === "pull") return pr;
+      if (operation === "main") return { object: { sha: "b".repeat(40) } };
+      if (operation === "reviews") return [];
+      if (operation === "block") {
+        blocked = true;
+        assert.equal(b.retryable, true);
+        assert.ok(b.text.includes("changed the checkout"));
+      }
+      if (operation === "status") validated = true;
+      return {};
+    },
+    git: async (args) => ({
+      code: 0,
+      stdout:
+        args[0] === "diff"
+          ? ++diffs === 1
+            ? "original proposed code"
+            : "changed proposed code"
+          : "",
+    }),
+    run: async (_file, args) => {
+      assert.ok(args.includes("--dangerously-bypass-approvals-and-sandbox"));
+      assert.ok(args.includes("--json"));
+      const output = args[args.indexOf("--output-last-message") + 1];
+      await writeFile(
+        output,
+        JSON.stringify({ decision: "approve", summary: "Fine", findings: [] }),
+      );
+    },
+  };
+  const reviewer = createReviewer(agent, {
+    dataDir,
+    auth: { status: async () => ({ state: "connected" }) },
+  });
+  await reviewer.one();
+  assert.equal(blocked, true);
+  assert.equal(validated, false);
+});
 test("device authentication extracts only the OpenAI authorization link and one-time code", () => {
   const value = parseDeviceOutput(
     "\x1b[32mOpen https://auth.openai.com/codex/device\nCode: ABCD-EFGH\x1b[0m",
@@ -133,7 +271,7 @@ test("a failed proposed merge build is recorded and does not starve later PRs", 
     }));
   for (const pr of pulls)
     await save(`${dir}/reviews/${pr.number}.json`, {
-      key: `${pr.head.sha}:${base}`,
+      key: reviewKey(pr.head.sha, base),
       decision: "reviewed",
       verdict: { decision: "approve", summary: "Fine", findings: [] },
     });

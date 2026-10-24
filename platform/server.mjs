@@ -147,6 +147,11 @@ export function createPlatform(
             project.id,
             event.number,
             event.pull_request.merge_commit_sha,
+            {
+              title: event.pull_request.title,
+              author: event.pull_request.user?.login,
+              mergedAt: Date.parse(event.pull_request.merged_at),
+            },
           );
         if (
           ["opened", "reopened", "synchronize"].includes(event.action) &&
@@ -234,6 +239,15 @@ export function createPlatform(
         error:
           "This project is not in your account. Open its invitation to join.",
       });
+    if (
+      !["GET", "HEAD"].includes(req.method) &&
+      req.query.chat &&
+      req.query.chat !== req.member.id
+    )
+      return res.status(403).json({
+        error:
+          "Teammate chats are read-only. Return to your chat to send a request.",
+      });
     next();
   }
   const owner = (req, res, next) =>
@@ -244,8 +258,8 @@ export function createPlatform(
     const saved = user && store.connection(user.id, "boat");
     return Boolean(
       saved?.access_token &&
-      saved.environmentId &&
-      Date.parse(saved.expiresAt) > now(),
+        saved.environmentId &&
+        Date.parse(saved.expiresAt) > now(),
     );
   };
   const hostingFor = (user) =>
@@ -377,7 +391,7 @@ export function createPlatform(
       store.enqueue(projectId, "provision", `provision:${projectId}`);
       const jobId = id();
       store.run(
-        "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at,approval_required) VALUES(?,?,?,?,?,?,?,1)",
         jobId,
         projectId,
         memberId,
@@ -469,6 +483,17 @@ export function createPlatform(
   });
   app.get("/api/projects/:projectId", signed, membership, (req, res) => {
     const p = req.project;
+    const chat = req.query.chat
+      ? store.get(
+          "SELECT * FROM members WHERE project_id=? AND id=?",
+          p.id,
+          String(req.query.chat),
+        )
+      : req.member;
+    if (!chat)
+      return res
+        .status(404)
+        .json({ error: "This chat is not in your project." });
     const installation =
       p.owner_id === req.account.id &&
       store.connection(req.account.id, "github_installation");
@@ -493,8 +518,10 @@ export function createPlatform(
             }
           : null,
       member: memberView(req.member),
+      chatMember: memberView(chat),
+      readOnly: chat.id !== req.member.id,
       members: store.all(
-        "SELECT id,name,prefix,role FROM members WHERE project_id=? ORDER BY created_at",
+        "SELECT m.id,m.name,m.prefix,m.role,j.state AS agentState,j.started_at AS startedAt,j.finished_at AS finishedAt FROM members m LEFT JOIN jobs j ON j.id=(SELECT id FROM jobs WHERE member_id=m.id ORDER BY created_at DESC,rowid DESC LIMIT 1) WHERE m.project_id=? ORDER BY m.created_at",
         p.id,
       ),
       ownMemberships: store.all(
@@ -503,17 +530,30 @@ export function createPlatform(
         req.account.id,
       ),
       messages: store.all(
-        "SELECT id,job_id AS jobId,role,text,created_at AS createdAt FROM messages WHERE member_id=? ORDER BY created_at,rowid",
-        req.member.id,
+        `SELECT id,job_id AS jobId,role,text,created_at AS createdAt,'message' AS kind,CASE role WHEN 'user' THEN 0 ELSE 2 END AS position,rowid AS sequence FROM messages WHERE member_id=?
+         UNION ALL SELECT j.id||':'||e.event_key,j.id,'assistant',e.text,e.created_at,e.kind,1,e.rowid FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.member_id=?
+         ORDER BY createdAt,position,sequence`,
+        chat.id,
+        chat.id,
       ),
       jobs: store.all(
-        "SELECT id,request_key AS requestKey,text,state,result,error,pr_url AS prUrl,preview_url AS previewUrl,created_at AS createdAt FROM jobs WHERE member_id=? ORDER BY created_at",
-        req.member.id,
+        "SELECT id,member_id AS memberId,request_key AS requestKey,text,state,result,error,pr_number AS prNumber,pr_url AS prUrl,preview_url AS previewUrl,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt,merged_at AS mergedAt,published_at AS publishedAt,change_sha AS changeSha,pr_title AS prTitle,artifact_url AS artifactUrl,artifact_ready_at AS artifactReadyAt,inspected_at AS inspectedAt,approved_at AS approvedAt FROM jobs WHERE member_id=? ORDER BY created_at,rowid",
+        chat.id,
       ),
       activity: store.all(
-        "SELECT j.id,substr(j.text,1,100) AS text,j.state,j.pr_url AS prUrl,j.preview_url AS previewUrl,m.name FROM jobs j JOIN members m ON m.id=j.member_id WHERE j.project_id=? ORDER BY j.created_at DESC LIMIT 15",
+        "SELECT j.id,j.member_id AS memberId,substr(j.text,1,100) AS text,j.state,j.error,j.pr_url AS prUrl,j.preview_url AS previewUrl,m.name,j.started_at AS startedAt,j.finished_at AS finishedAt,j.created_at AS createdAt FROM jobs j JOIN members m ON m.id=j.member_id WHERE j.project_id=? ORDER BY j.created_at DESC LIMIT 30",
         p.id,
       ),
+      releases: store
+        .all(
+          "SELECT pr_number AS number,title,author,merge_sha AS sha,merged_at AS mergedAt,published_at AS publishedAt,is_live AS isLive FROM releases WHERE project_id=? ORDER BY merged_at DESC,pr_number DESC",
+          p.id,
+        )
+        .map((r) => ({
+          ...r,
+          isLive: Boolean(r.isLive),
+          url: `https://github.com/${p.repo}/pull/${r.number}`,
+        })),
       tasks:
         p.owner_id === req.account.id
           ? store.all(
@@ -583,6 +623,25 @@ export function createPlatform(
         return res
           .status(400)
           .json({ error: "Send a request between 1 and 20,000 characters." });
+      if (
+        /^(?:please\s+)?(?:make (?:the change|this the website|the website have that)|apply (?:this|the change)|publish (?:it|this)|ship it)[.!?]*$/i.test(
+          text.trim(),
+        )
+      ) {
+        const job = store.get(
+          "SELECT * FROM jobs WHERE project_id=? AND member_id=? AND state='awaiting_approval' ORDER BY inspected_at DESC,created_at DESC LIMIT 1",
+          req.project.id,
+          req.member.id,
+        );
+        if (!job)
+          return res
+            .status(409)
+            .json({
+              error:
+                "Inspect a ready preview first, then choose Make this the website.",
+            });
+        return approveJob(req, res, job, job.change_sha);
+      }
       const jobId = store.transaction(() => {
         const existing = store.get(
           "SELECT id FROM jobs WHERE member_id=? AND request_key=?",
@@ -592,7 +651,7 @@ export function createPlatform(
         if (existing) return existing.id;
         const value = id();
         store.run(
-          "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+          "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at,approval_required) VALUES(?,?,?,?,?,?,?,1)",
           value,
           req.project.id,
           req.member.id,
@@ -614,6 +673,126 @@ export function createPlatform(
         return value;
       });
       res.status(202).json({ jobId });
+    },
+  );
+  function ownedJob(req, res, next) {
+    req.job = store.get(
+      "SELECT * FROM jobs WHERE id=? AND project_id=? AND member_id=?",
+      req.params.jobId,
+      req.project.id,
+      req.member.id,
+    );
+    if (!req.job)
+      return res
+        .status(404)
+        .json({ error: "This request is not in your chat." });
+    next();
+  }
+  app.post(
+    "/api/projects/:projectId/jobs/:jobId/inspect",
+    signed,
+    membership,
+    ownedJob,
+    (req, res) => {
+      if (
+        req.job.state !== "awaiting_approval" ||
+        !req.job.artifact_url ||
+        req.body.sha !== req.job.change_sha
+      )
+        return res
+          .status(409)
+          .json({ error: "Open the latest ready preview before applying it." });
+      store.run("UPDATE jobs SET inspected_at=? WHERE id=?", now(), req.job.id);
+      res.json({ ok: true });
+    },
+  );
+  app.post(
+    "/api/projects/:projectId/jobs/:jobId/approve",
+    signed,
+    membership,
+    ownedJob,
+    (req, res) => {
+      return approveJob(req, res, req.job, req.body.sha);
+    },
+  );
+  function approveJob(req, res, job, sha) {
+    if (sha !== job.change_sha)
+      return res
+        .status(409)
+        .json({
+          error: "The preview changed. Inspect the latest version first.",
+        });
+    if (job.approved_at) return res.json({ ok: true, jobId: job.id });
+    if (
+      job.state !== "awaiting_approval" ||
+      !job.inspected_at ||
+      !job.artifact_url ||
+      !job.artifact_ready_at ||
+      !job.pr_title ||
+      !job.branch
+    )
+      return res
+        .status(409)
+        .json({
+          error:
+            "Inspect your preview first, then choose Make this the website.",
+        });
+    store.transaction(() => {
+      store.run(
+        "UPDATE jobs SET state='creating_pr',approved_at=?,updated_at=? WHERE id=?",
+        now(),
+        now(),
+        job.id,
+      );
+      store.run(
+        "INSERT INTO messages VALUES(?,?,?,?,?,?,?)",
+        id(),
+        req.project.id,
+        req.member.id,
+        job.id,
+        "user",
+        "Make this the website.",
+        now(),
+      );
+      store.recordEvent(
+        job.id,
+        "approved",
+        "status",
+        "You approved this preview. Creating the pull request for review.",
+      );
+      store.enqueue(
+        req.project.id,
+        "open-pr",
+        `open-pr:${job.id}:${job.change_sha}`,
+        { jobId: job.id, sha: job.change_sha },
+      );
+    });
+    return res.status(202).json({ ok: true, jobId: job.id });
+  }
+  app.post(
+    "/api/projects/:projectId/jobs/:jobId/retry",
+    signed,
+    membership,
+    ownedJob,
+    (req, res) => {
+      const job = req.job;
+      if (job.state !== "preview_failed" || !job.change_sha)
+        return res
+          .status(409)
+          .json({ error: "There is no preview step to retry." });
+      const kind = job.approved_at ? "open-pr" : "artifact";
+      store.run(
+        "UPDATE tasks SET state='queued',attempts=0,available_at=0,error=NULL WHERE project_id=? AND dedupe_key=? AND state='failed'",
+        req.project.id,
+        `${kind}:${job.id}:${job.change_sha}`,
+      );
+      store.run(
+        "UPDATE jobs SET state=?,error=NULL,updated_at=? WHERE id=?",
+        job.approved_at ? "creating_pr" : "building_preview",
+        now(),
+        job.id,
+      );
+      res.status(202).json({ ok: true });
     },
   );
   app.get(

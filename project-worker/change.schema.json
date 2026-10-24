@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "A concise human-readable summary of the finished website changes."
+    },
+    "title": {
+      "type": "string",
+      "description": "A clear pull-request title, under 100 characters, describing the intended overall change relative to main. Rewrite voice dictation into normal written English."
+    },
+    "description": {
+      "type": "string",
+      "description": "Two or three short lines describing the changes and checks performed. Do not copy the user's raw voice transcript."
+    }
+  },
+  "required": ["summary", "title", "description"],
+  "additionalProperties": false
+}

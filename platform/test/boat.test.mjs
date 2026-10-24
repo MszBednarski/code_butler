@@ -451,7 +451,65 @@ test("Boat provisioning retries reuse one VM and previews never fork or copy age
     "ready",
   );
   const baseline = commands.length;
+  // Draft artifacts use the same app-only hosting path without any PR or main deployment.
+  const githubBefore = provider.github;
+  provider.github = async () => {
+    throw new Error("A draft must never call PR endpoints");
+  };
+  const mainBefore = f.store.get(
+    "SELECT app_url,resources FROM projects WHERE id=?",
+    project.id,
+  );
+  await boat.deploy(project, {
+    sha: "c".repeat(40),
+    prNumber: -1,
+    jobId: "draft-fixture",
+  });
+  const artifact = f.store.get(
+    "SELECT * FROM previews WHERE project_id=? AND pr_number=-1",
+    project.id,
+  );
+  assert.equal(artifact.state, "ready");
+  assert.equal(artifact.commit_sha, "c".repeat(40));
+  assert.equal(
+    f.store.get("SELECT app_url FROM projects WHERE id=?", project.id).app_url,
+    mainBefore.app_url,
+  );
+  assert.equal(
+    JSON.parse(
+      f.store.get("SELECT resources FROM projects WHERE id=?", project.id)
+        .resources,
+    ).deployedSha,
+    JSON.parse(mainBefore.resources).deployedSha,
+  );
+  provider.github = githubBefore;
+  const member = id(),
+    blocked = id();
+  f.store.run(
+    "INSERT INTO members(id,project_id,user_id,name,prefix,role,created_at) VALUES(?,?,?,?,?,'owner',?)",
+    member,
+    project.id,
+    f.user.id,
+    "Lead",
+    "lead",
+    now(),
+  );
+  f.store.run(
+    "INSERT INTO jobs(id,project_id,member_id,request_key,text,state,error,pr_number,created_at,updated_at) VALUES(?,?,?,?,?,'needs_attention',?,7,?,?)",
+    blocked,
+    project.id,
+    member,
+    id(),
+    "Improve the app",
+    "The keyboard control needs a click handler.",
+    now(),
+    now(),
+  );
   await boat.deploy(project, { sha: "b".repeat(40), prNumber: 7 });
+  assert.equal(
+    f.store.get("SELECT error FROM jobs WHERE id=?", blocked).error,
+    "The keyboard control needs a click handler.",
+  );
   const firstPort = f.store.get(
     "SELECT environment_id FROM previews WHERE project_id=? AND pr_number=7",
     project.id,
@@ -508,5 +566,20 @@ test("Boat provisioning retries reuse one VM and previews never fork or copy age
   assert.equal(
     requests.filter((r) => r.endpoint.endsWith("/resume")).length,
     1,
+  );
+  const appUrl = f.store.get(
+    "SELECT app_url FROM projects WHERE id=?",
+    project.id,
+  ).app_url;
+  await boat.updateWorker(project);
+  assert.equal(created.size, 1);
+  assert.equal(
+    f.store.get("SELECT state,app_url FROM projects WHERE id=?", project.id)
+      .state,
+    "ready",
+  );
+  assert.equal(
+    f.store.get("SELECT app_url FROM projects WHERE id=?", project.id).app_url,
+    appUrl,
   );
 });

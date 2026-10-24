@@ -1995,6 +1995,132 @@ small {
   padding: 6px;
   font-size: 10px;
 }
+.message-caption {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.message-kind-status .message-content {
+  border-left: 2px solid #96ad87;
+  padding-left: 12px;
+}
+.message-kind-review .message-content {
+  border-left: 2px solid #b9a36a;
+  padding-left: 12px;
+}
+.message-kind-error .message-content {
+  border-left: 2px solid #b3745e;
+  padding-left: 12px;
+}
+.read-only-notice p {
+  font-size: 12px;
+  margin: 0 0 10px;
+  color: var(--muted);
+}
+.release-history {
+  margin-top: 25px;
+  border-top: 1px solid var(--line);
+  padding-top: 18px;
+}
+.release-history h3 {
+  margin: 0 0 15px;
+  font-size: 13px;
+}
+.release-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 13px;
+  margin-bottom: 12px;
+  background: #fbfcf7;
+}
+.release-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 9px;
+  font-size: 10px;
+}
+.release-top a {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.release-live {
+  color: #427342;
+}
+.release-pending {
+  color: #966b32;
+}
+.release-card > strong {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.release-card > small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.7;
+  margin-top: 6px;
+}
+.release-card > a {
+  margin-top: 8px;
+  font-size: 10px;
+}
+.team-member > div {
+  min-width: 0;
+  flex: 1;
+}
+.team-member strong {
+  overflow-wrap: anywhere;
+}
+.team-member .text-button {
+  flex-shrink: 0;
+  font-size: 10px;
+}
+.elapsed {
+  white-space: nowrap;
+}
+@media (max-width: 760px) {
+  .mobile-tabs {
+    gap: 4px;
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+  .mobile-tabs button {
+    font-size: 10px;
+    padding: 9px 6px;
+    gap: 5px;
+  }
+  .tab-updates .team-panel {
+    display: flex;
+  }
+  .tab-updates .team-overview {
+    display: none;
+  }
+  .tab-team .release-history {
+    display: none;
+  }
+  .tab-updates .release-history {
+    margin-top: 0;
+    border-top: 0;
+    padding-top: 0;
+  }
+}
+@media (min-width: 761px) and (max-width: 1499px) {
+  .project-layout.tab-updates .preview-panel {
+    display: none;
+  }
+  .project-layout.tab-updates .team-panel {
+    display: flex;
+  }
+  .project-layout.tab-updates .team-overview {
+    display: none;
+  }
+}
 .state-preview_failed,
 .state-publish_failed {
   color: #b08242;
@@ -2230,4 +2356,48 @@ small {
   .onboarding-card .codex-card > .round-icon {
     display: none;
   }
+}
+
+.artifact-banner {
+  padding: 16px 20px;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  background: #f4f3ec;
+}
+.artifact-banner > div {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+.artifact-banner strong,
+.artifact-banner small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.artifact-banner small {
+  margin-top: 5px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.artifact-banner .button {
+  white-space: normal;
+}
+.artifact-card {
+  margin: 16px 0;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #f4f3ec;
+}
+.artifact-card > strong {
+  display: block;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+.artifact-card p {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.6;
 }

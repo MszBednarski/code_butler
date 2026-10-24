@@ -124,6 +124,477 @@ async function fixture(t, overrides = {}) {
   };
 }
 
+function workerCall(f, project, path, body) {
+  return fetch(f.config.publicUrl + "/api/worker" + path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: {
+      authorization: `Bearer ${f.store.open(project.worker_secret)}`,
+      "x-butler-project": project.id,
+      "x-butler-protocol": "2",
+      "content-type": "application/json",
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+test("team chat reads expose live durable progress while writes and worker events remain scoped", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    inv = await f.invite(p.id),
+    alice = await f.join(inv.url, "Alice"),
+    bob = await f.join(inv.url, "Bob");
+  f.store.run("UPDATE projects SET state='ready' WHERE id=?", p.id);
+  f.store.run("UPDATE jobs SET state='unchanged' WHERE project_id=?", p.id);
+  const project = f.store.get("SELECT * FROM projects WHERE id=?", p.id);
+  const sent = await (
+    await f.call(
+      `/api/projects/${p.id}/messages`,
+      { text: "Make the tiles larger", requestKey: id() },
+      alice,
+    )
+  ).json();
+  const claimed = await (await workerCall(f, project, "/claim", {})).json();
+  assert.equal(claimed.job.id, sent.jobId);
+  const member = claimed.job.member.id;
+  const event = {
+    key: "attempt:item_1",
+    kind: "agent",
+    text: "I’m updating the tile layout.",
+    at: Date.now(),
+  };
+  for (let n = 0; n < 2; n++)
+    assert.equal(
+      (
+        await workerCall(f, project, `/jobs/${sent.jobId}/events`, {
+          events: [event],
+        })
+      ).status,
+      200,
+    );
+  const watched = await (
+    await f.call(`/api/projects/${p.id}?chat=${member}`, undefined, bob)
+  ).json();
+  assert.equal(watched.readOnly, true);
+  assert.equal(watched.chatMember.name, "Alice");
+  assert.equal(watched.member.name, "Bob");
+  assert.equal(watched.messages.filter((m) => m.text === event.text).length, 1);
+  assert.ok(watched.jobs[0].startedAt);
+  assert.equal(watched.jobs[0].state, "working");
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${p.id}/messages?chat=${member}`,
+        { text: "Hijack", requestKey: id() },
+        bob,
+      )
+    ).status,
+    403,
+  );
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${p.id}/messages?member=${member}`,
+        { text: "Hijack", requestKey: id() },
+        bob,
+      )
+    ).status,
+    404,
+  );
+  assert.equal(
+    (await f.call(`/api/projects/${p.id}?chat=${id()}`, undefined, bob)).status,
+    404,
+  );
+  assert.equal(
+    (
+      await workerCall(f, project, `/jobs/${sent.jobId}/events`, {
+        events: [{ ...event, key: "private", kind: "reasoning" }],
+      })
+    ).status,
+    400,
+  );
+  const other = await f.create("Other team"),
+    otherProject = f.store.get("SELECT * FROM projects WHERE id=?", other.id);
+  assert.equal(
+    (
+      await workerCall(f, otherProject, `/jobs/${sent.jobId}/events`, {
+        events: [event],
+      })
+    ).status,
+    404,
+  );
+  assert.equal(
+    (
+      await workerCall(f, project, `/jobs/${sent.jobId}/result`, {
+        state: "unchanged",
+        text: "The tile layout is updated.",
+      })
+    ).status,
+    200,
+  );
+  const final = await (
+    await f.call(`/api/projects/${p.id}?chat=${member}`, undefined, bob)
+  ).json();
+  assert.ok(final.messages.some((m) => m.text === event.text));
+  assert.ok(
+    final.messages.some((m) => m.text === "The tile layout is updated."),
+  );
+  assert.ok(final.jobs[0].finishedAt >= final.jobs[0].startedAt);
+  const reopened = createStore(f.dir);
+  assert.equal(
+    reopened.get(
+      "SELECT COUNT(*) AS n FROM job_events WHERE job_id=? AND event_key=?",
+      sent.jobId,
+      event.key,
+    ).n,
+    1,
+  );
+  reopened.close();
+});
+test("a ready artifact requires its creator to inspect and approve the exact revision before a PR can exist", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    inv = await f.invite(p.id),
+    alice = await f.join(inv.url, "Alice"),
+    bob = await f.join(inv.url, "Bob");
+  f.store.run(
+    "UPDATE projects SET state='ready',repo='lead/site' WHERE id=?",
+    p.id,
+  );
+  f.store.run("UPDATE jobs SET state='unchanged' WHERE project_id=?", p.id);
+  const project = f.store.get("SELECT * FROM projects WHERE id=?", p.id);
+  const sent = await (
+    await f.call(
+      `/api/projects/${p.id}/messages`,
+      {
+        text: "uh make that home heading say hello team or whatever",
+        requestKey: id(),
+      },
+      alice,
+    )
+  ).json();
+  const old = await f.call("/api/worker/claim", {}, "", {
+    authorization: `Bearer ${f.store.open(project.worker_secret)}`,
+    "x-butler-project": p.id,
+  });
+  assert.equal(
+    (await old.json()).job,
+    null,
+    "An older worker must not create PRs for gated requests",
+  );
+  const claimed = (await (await workerCall(f, project, "/claim", {})).json())
+    .job;
+  assert.equal(claimed.id, sent.jobId);
+  const sha = "a".repeat(40),
+    base = `/api/projects/${p.id}/jobs/${sent.jobId}`,
+    branch = claimed.member.prefix + "/draft-test";
+  let creations = 0,
+    latestSha = sha;
+  const pulls = [];
+  f.provider.github = async (_owner, path, method = "GET", body) => {
+    if (path.includes("/git/ref/heads/")) return { object: { sha: latestSha } };
+    if (path.includes("/pulls?")) return pulls;
+    if (path.endsWith("/pulls") && method === "POST") {
+      creations++;
+      const pr = {
+        number: 7,
+        state: "open",
+        title: body.title,
+        body: body.body,
+        head: { sha, ref: body.head },
+      };
+      pulls.push(pr);
+      return pr;
+    }
+    throw new Error("Unexpected GitHub request " + path);
+  };
+  assert.equal(
+    (
+      await workerCall(f, project, "/github", {
+        operation: "createPull",
+        jobId: sent.jobId,
+        branch,
+        title: "Bad premature PR",
+      })
+    ).status,
+    409,
+  );
+  assert.equal(
+    (
+      await workerCall(f, project, `/jobs/${sent.jobId}/result`, {
+        state: "reviewing",
+        text: "Premature",
+        branch,
+        prNumber: 7,
+      })
+    ).status,
+    409,
+  );
+  const result = {
+    state: "building_preview",
+    text: "The heading is updated.",
+    sha,
+    branch,
+    title: "Update the homepage heading to Hello Team",
+    description:
+      "Show Hello Team as the heading. Checks: production build passed.",
+  };
+  assert.equal(
+    (
+      await workerCall(f, project, `/jobs/${sent.jobId}/result`, {
+        ...result,
+        branch: "someone-else/draft",
+      })
+    ).status,
+    400,
+  );
+  assert.equal(
+    (await workerCall(f, project, `/jobs/${sent.jobId}/result`, result)).status,
+    200,
+  );
+  const provisioner = createProvisioner(f.config, f.store, f.provider);
+  await provisioner.openPull(project, { jobId: sent.jobId, sha });
+  assert.equal(creations, 0);
+  assert.equal((await f.call(base + "/approve", { sha }, alice)).status, 409);
+  assert.equal(
+    (await f.call(base + "/inspect", { sha }, alice)).status,
+    409,
+    "A building artifact is not ready to inspect",
+  );
+  f.store.run(
+    "INSERT INTO previews(project_id,pr_number,state,commit_sha,url,environment_id) VALUES(?,-1,'ready',?,'https://preview.example.test','boat:4000')",
+    p.id,
+    sha,
+  );
+  f.store.run(
+    "UPDATE jobs SET state='awaiting_approval',artifact_url='https://preview.example.test',artifact_number=-1,artifact_ready_at=? WHERE id=?",
+    now(),
+    sent.jobId,
+  );
+  assert.equal((await f.call(base + "/inspect", { sha }, bob)).status, 404);
+  assert.equal(
+    (await f.call(base + "/approve", { sha }, f.owner)).status,
+    404,
+    "The team lead cannot approve another member’s work",
+  );
+  assert.equal(
+    (await f.call(base + "/inspect", { sha: "b".repeat(40) }, alice)).status,
+    409,
+  );
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${p.id}/messages`,
+        { text: "make the change", requestKey: id() },
+        alice,
+      )
+    ).status,
+    409,
+  );
+  assert.equal((await f.call(base + "/inspect", { sha }, alice)).status, 200);
+  assert.equal(creations, 0, "Inspection alone does not open a PR");
+  assert.equal(
+    (await f.call(base + "/approve", { sha: "b".repeat(40) }, alice)).status,
+    409,
+  );
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${p.id}/messages`,
+        { text: "make the website have that", requestKey: id() },
+        alice,
+      )
+    ).status,
+    202,
+  );
+  assert.equal(
+    (await f.call(base + "/approve", { sha }, alice)).status,
+    200,
+    "Double approval is idempotent",
+  );
+  assert.equal(
+    f.store.get(
+      "SELECT COUNT(*) AS n FROM tasks WHERE project_id=? AND kind='open-pr'",
+      p.id,
+    ).n,
+    1,
+  );
+  latestSha = "b".repeat(40);
+  await assert.rejects(
+    provisioner.openPull(project, { jobId: sent.jobId, sha }),
+    /changed after approval/,
+  );
+  assert.equal(creations, 0);
+  latestSha = sha;
+  await provisioner.openPull(project, { jobId: sent.jobId, sha });
+  await provisioner.openPull(project, { jobId: sent.jobId, sha });
+  assert.equal(creations, 1);
+  assert.equal(pulls[0].title, result.title);
+  assert.ok(!pulls[0].body.includes(claimed.text));
+  const saved = f.store.get("SELECT * FROM jobs WHERE id=?", sent.jobId);
+  assert.equal(saved.pr_number, 7);
+  assert.ok(saved.approved_at);
+  assert.equal(saved.state, "reviewing");
+  assert.equal(
+    f.store.get(
+      "SELECT environment_id FROM previews WHERE project_id=? AND pr_number=7",
+      p.id,
+    ).environment_id,
+    "boat:4000",
+  );
+  assert.equal(
+    f.store.get(
+      "SELECT state FROM previews WHERE project_id=? AND pr_number=-1",
+      p.id,
+    ).state,
+    "closed",
+  );
+});
+test("merged PR history distinguishes merged changes from published changes and preserves timestamps", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    sha = "a".repeat(40),
+    published = "b".repeat(40),
+    mergedAt = Date.now() - 60000;
+  f.store.run("UPDATE projects SET repo='lead/site' WHERE id=?", p.id);
+  f.store.run(
+    "UPDATE jobs SET state='reviewing',pr_number=7,started_at=? WHERE project_id=?",
+    mergedAt - 10000,
+    p.id,
+  );
+  f.store.recordMerge(p.id, 7, sha, { title: "Larger tiles", mergedAt });
+  let page = await (await f.call(`/api/projects/${p.id}`)).json();
+  assert.equal(page.releases.length, 1);
+  assert.equal(page.releases[0].isLive, false);
+  assert.equal(page.releases[0].mergedAt, mergedAt);
+  const project = f.store.get("SELECT * FROM projects WHERE id=?", p.id);
+  f.provider.github = async (_user, path) => {
+    if (path.includes("/compare/")) return { status: "ahead" };
+    if (path.includes("/pulls?"))
+      return [
+        {
+          number: 8,
+          title: "Another merged change",
+          user: { login: "teammate" },
+          base: { ref: "main" },
+          merged_at: new Date(mergedAt - 1000).toISOString(),
+          merge_commit_sha: "c".repeat(40),
+        },
+      ];
+    throw Error("Unexpected history request");
+  };
+  const provisioner = createProvisioner(f.config, f.store, f.provider);
+  await provisioner.markPublished(project, published);
+  page = await (await f.call(`/api/projects/${p.id}`)).json();
+  assert.equal(page.releases[0].isLive, true);
+  assert.ok(page.releases[0].publishedAt >= mergedAt);
+  assert.equal(page.jobs[0].state, "live");
+  assert.ok(page.jobs[0].finishedAt);
+  assert.ok(
+    page.messages.some((m) => m.text === "Your change is live on the website."),
+  );
+  await provisioner.markPublished(project, published);
+  assert.equal(
+    f.store.get("SELECT COUNT(*) AS n FROM releases WHERE project_id=?", p.id)
+      .n,
+    1,
+  );
+  const tasksBefore = f.store.get(
+    "SELECT COUNT(*) AS n FROM tasks WHERE project_id=?",
+    p.id,
+  ).n;
+  await provisioner.syncHistory(project);
+  assert.equal(
+    f.store.get("SELECT COUNT(*) AS n FROM tasks WHERE project_id=?", p.id).n,
+    tasksBefore,
+  );
+  assert.equal(
+    f.store.get("SELECT COUNT(*) AS n FROM releases WHERE project_id=?", p.id)
+      .n,
+    2,
+  );
+});
+test("automatic review repairs are deduplicated, bounded, and never queued for stale or held PRs", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    sha = "a".repeat(40),
+    base = "b".repeat(40);
+  f.store.run("UPDATE projects SET repo='lead/site' WHERE id=?", p.id);
+  f.store.run(
+    "UPDATE jobs SET state='needs_attention',pr_number=1 WHERE project_id=?",
+    p.id,
+  );
+  const project = f.store.get("SELECT * FROM projects WHERE id=?", p.id),
+    original = f.store.get("SELECT * FROM jobs WHERE project_id=?", p.id);
+  let head = sha,
+    labels = [];
+  f.provider.github = async (_user, path) =>
+    path.endsWith("/pulls/1")
+      ? {
+          state: "open",
+          draft: false,
+          head: { sha: head, ref: "lead/change" },
+          labels,
+        }
+      : { object: { sha: base } };
+  const repair = () =>
+    workerCall(f, project, "/github", {
+      operation: "repair",
+      number: 1,
+      sha,
+      base,
+      text: "Restore keyboard activation.",
+    });
+  head = "c".repeat(40);
+  assert.equal((await (await repair()).json()).queued, false);
+  head = sha;
+  labels = [{ name: "hold" }];
+  assert.equal((await (await repair()).json()).queued, false);
+  labels = [];
+  const queued = await (await repair()).json();
+  assert.equal(queued.queued, true);
+  assert.equal((await (await repair()).json()).queued, false);
+  assert.equal(
+    f.store.get("SELECT member_id FROM jobs WHERE id=?", queued.jobId)
+      .member_id,
+    original.member_id,
+  );
+  assert.equal(
+    f.store.get("SELECT COUNT(*) AS n FROM jobs WHERE project_id=?", p.id).n,
+    2,
+  );
+  f.store.run("UPDATE jobs SET state='failed' WHERE id=?", queued.jobId);
+  for (const n of [2, 3])
+    f.store.run(
+      "INSERT INTO jobs(id,project_id,member_id,request_key,text,state,created_at,updated_at) VALUES(?,?,?,?,?,'failed',?,?)",
+      id(),
+      p.id,
+      original.member_id,
+      `review-fix:1:attempt-${n}`,
+      "Repair",
+      now(),
+      now(),
+    );
+  const limited = await (
+    await workerCall(f, project, "/github", {
+      operation: "repair",
+      number: 1,
+      sha: "d".repeat(40),
+      base,
+      text: "Fix another issue.",
+    })
+  ).json();
+  assert.equal(limited.queued, false);
+  head = "d".repeat(40);
+  const cap = await (
+    await workerCall(f, project, "/github", {
+      operation: "repair",
+      number: 1,
+      sha: head,
+      base,
+      text: "Fix another issue.",
+    })
+  ).json();
+  assert.equal(cap.reason, "Repair limit reached.");
+});
 test("QR joining gives separate persistent workspaces with no provider accounts and no cross-member access", async (t) => {
   const f = await fixture(t),
     p = await f.create(),
@@ -368,6 +839,7 @@ test("Codex connection and worker requests require the right project and role; a
   const workerHeaders = {
     authorization: `Bearer ${secret}`,
     "x-butler-project": p.id,
+    "x-butler-protocol": "2",
   };
   assert.equal(
     (

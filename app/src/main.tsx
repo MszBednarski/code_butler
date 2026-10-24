@@ -22,7 +22,15 @@ type Session = {
   };
   commit: string;
 };
-type Member = { id: string; name: string; prefix: string; role: string };
+type Member = {
+  id: string;
+  name: string;
+  prefix: string;
+  role: string;
+  agentState?: string;
+  startedAt?: number;
+  finishedAt?: number;
+};
 type Job = {
   id: string;
   requestKey: string;
@@ -34,6 +42,18 @@ type Job = {
   previewUrl?: string;
   createdAt: number;
   name?: string;
+  memberId?: string;
+  prNumber?: number;
+  startedAt?: number;
+  finishedAt?: number;
+  mergedAt?: number;
+  publishedAt?: number;
+  changeSha?: string;
+  prTitle?: string;
+  artifactUrl?: string;
+  artifactReadyAt?: number;
+  inspectedAt?: number;
+  approvedAt?: number;
 };
 type Project = {
   id: string;
@@ -48,11 +68,30 @@ type Project = {
   hostingProvider?: "railway" | "boat";
   githubAccess?: { repo: string; url: string } | null;
   member: Member;
+  chatMember?: Member;
+  readOnly?: boolean;
   members: Member[];
   ownMemberships: Member[];
-  messages: { id: string; jobId: string; role: string; text: string }[];
+  messages: {
+    id: string;
+    jobId: string;
+    role: string;
+    text: string;
+    kind?: string;
+    createdAt?: number;
+  }[];
   jobs: Job[];
   activity: Job[];
+  releases?: {
+    number: number;
+    title: string;
+    author?: string;
+    sha: string;
+    mergedAt?: number;
+    publishedAt?: number;
+    isLive: boolean;
+    url: string;
+  }[];
   tasks: { kind: string; state: string; error?: string; attempts: number }[];
 };
 type Summary = Pick<
@@ -1359,25 +1398,56 @@ const jobLabel: Record<string, string> = {
   queued: "Queued",
   working: "Working",
   reviewing: "Reviewing",
+  building_preview: "Building preview",
+  awaiting_approval: "Ready to inspect",
+  creating_pr: "Sending for review",
   deploying: "Publishing",
   live: "Live",
   unchanged: "Done",
-  failed: "Needs a hand",
-  preview_failed: "Preview needs a hand",
-  publish_failed: "Publishing needs a hand",
-  needs_attention: "Needs a hand",
+  failed: "Agent stopped",
+  preview_failed: "Preview failed",
+  publish_failed: "Website update failed",
+  needs_attention: "Review blocked",
 };
-function JobState({ job }: { job: Job }) {
+function elapsed(start: number, end: number) {
+  const seconds = Math.max(0, Math.floor((end - start) / 1000));
+  return seconds < 60
+    ? `${seconds}s`
+    : seconds < 3600
+      ? `${Math.floor(seconds / 60)}m ${seconds % 60}s`
+      : `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+function statusLabel(job: Pick<Job, "state" | "error">) {
+  return job.state === "needs_attention" &&
+    /bwrap|namespace|Review could not|reviewer process|review.*retry|review.*paused/i.test(
+      job.error || "",
+    )
+    ? "Review could not run"
+    : jobLabel[job.state] || job.state;
+}
+function JobState({ job, clock = Date.now() }: { job: Job; clock?: number }) {
   return (
     <span className={"job-state state-" + job.state}>
       {["live", "unchanged"].includes(job.state) ? (
         <Icon name="check" size={12} />
-      ) : ["working", "reviewing", "deploying"].includes(job.state) ? (
+      ) : [
+          "working",
+          "reviewing",
+          "deploying",
+          "building_preview",
+          "creating_pr",
+        ].includes(job.state) ? (
         <Spinner />
       ) : (
         <i />
       )}
-      {jobLabel[job.state] || job.state}
+      {statusLabel(job)}
+      {job.startedAt && (
+        <span className="elapsed" aria-label="Elapsed time">
+          {" "}
+          · {elapsed(job.startedAt, job.finishedAt || clock)}
+        </span>
+      )}
     </span>
   );
 }
@@ -1398,7 +1468,9 @@ function Workspace({
     [tab, setTab] = useState("chat"),
     [sending, setSending] = useState(false),
     [codexReady, setCodexReady] = useState(false),
-    [memberId, setMemberId] = useState("");
+    [memberId, setMemberId] = useState(""),
+    [chatId, setChatId] = useState(""),
+    [clock, setClock] = useState(Date.now());
   const [text, setText] = useState(
     () => localStorage.getItem(`butler-draft-${projectId}`) || "",
   );
@@ -1408,10 +1480,13 @@ function Workspace({
     pendingKey = useRef<{ text: string; key: string } | null>(null),
     lastLive = useRef("");
   const [previewVersion, setPreviewVersion] = useState("");
+  const [artifact, setArtifact] = useState<Job | null>(null);
+  const [approvalBusy, setApprovalBusy] = useState(false);
+  const [inspection, setInspection] = useState("");
   const refresh = useCallback(async () => {
     try {
       const data = await api<Project>(
-        `/api/projects/${projectId}${memberId ? "?member=" + memberId : ""}`,
+        `/api/projects/${projectId}?${new URLSearchParams({ ...(memberId ? { member: memberId } : {}), ...(chatId ? { chat: chatId } : {}) })}`,
       );
       setProject(data);
       setError("");
@@ -1423,7 +1498,19 @@ function Workspace({
     } catch (e) {
       setError((e as Error).message);
     }
-  }, [projectId, memberId]);
+  }, [projectId, memberId, chatId]);
+  useEffect(() => {
+    const timer = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  function viewChat(id: string) {
+    if (!project) return;
+    if (project.ownMemberships.some((m) => m.id === id)) {
+      setMemberId(id);
+      setChatId("");
+    } else setChatId(id);
+    setTab("chat");
+  }
   const connected = useCallback(() => setCodexReady(true), []);
   useEffect(() => {
     if (project?.hostingProvider !== "boat") return;
@@ -1512,7 +1599,14 @@ function Workspace({
   }, [project?.messages]);
   async function send(event?: React.FormEvent) {
     event?.preventDefault();
-    if (!text.trim() || sending || !project) return;
+    if (
+      !text.trim() ||
+      sending ||
+      !project ||
+      project.readOnly ||
+      (chatId && chatId !== project.member.id)
+    )
+      return;
     setSending(true);
     setError("");
     const draft = text;
@@ -1543,6 +1637,57 @@ function Workspace({
       setError((e as Error).message);
     }
   }
+  function inspect(job: Job) {
+    setArtifact(job);
+    setInspection("");
+    setTab("preview");
+  }
+  async function markInspected(job: Job) {
+    if (
+      !project ||
+      job.memberId !== project.member.id ||
+      job.state !== "awaiting_approval"
+    )
+      return;
+    try {
+      await api(
+        `/api/projects/${projectId}/jobs/${job.id}/inspect${memberId ? "?member=" + memberId : ""}`,
+        { sha: job.changeSha },
+      );
+      setInspection(job.id);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+  async function approve(job: Job) {
+    setApprovalBusy(true);
+    setError("");
+    try {
+      await api(
+        `/api/projects/${projectId}/jobs/${job.id}/approve${memberId ? "?member=" + memberId : ""}`,
+        { sha: job.changeSha },
+      );
+      setArtifact(null);
+      setTab("chat");
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setApprovalBusy(false);
+    }
+  }
+  async function retryPreview(job: Job) {
+    try {
+      await api(
+        `/api/projects/${projectId}/jobs/${job.id}/retry${memberId ? "?member=" + memberId : ""}`,
+        {},
+      );
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
   if (!project)
     return (
       <div className="loading-page">
@@ -1566,6 +1711,15 @@ function Workspace({
       "ready",
     ].indexOf(project.state),
     latestJob = project.jobs.at(-1);
+  const chatMember = project.chatMember || project.member,
+    readOnly = Boolean(project.readOnly);
+  const shownArtifact = artifact
+    ? project.jobs.find((j) => j.id === artifact.id) || artifact
+    : null;
+  const canApprove =
+    shownArtifact?.memberId === project.member.id &&
+    shownArtifact?.state === "awaiting_approval";
+  const websiteUrl = shownArtifact?.artifactUrl || project.appUrl;
   const firstSetup =
     project.isOwner &&
     !project.codingReady &&
@@ -1691,6 +1845,7 @@ function Workspace({
           ["chat", "chat", "Your agent"],
           ["preview", "grid", "Website"],
           ["team", "users", "Team"],
+          ["updates", "check", "Updates"],
         ].map(([value, icon, label]) => (
           <button
             key={value}
@@ -1711,14 +1866,16 @@ function Workspace({
               <span
                 className={"status-dot" + (project.appUrl ? " green" : "")}
               />
-              {project.appUrl
-                ? "Your shared website"
-                : "Your website starts here"}
+              {shownArtifact
+                ? "Your preview"
+                : project.appUrl
+                  ? "Your shared website"
+                  : "Your website starts here"}
             </span>
-            {project.appUrl && (
+            {websiteUrl && (
               <a
                 className="icon-button"
-                href={project.appUrl}
+                href={websiteUrl}
                 target="_blank"
                 rel="noopener noreferrer"
                 aria-label="Open website"
@@ -1727,15 +1884,59 @@ function Workspace({
               </a>
             )}
           </div>
+          {shownArtifact && (
+            <div className="artifact-banner">
+              <div>
+                <strong>
+                  {shownArtifact.prTitle || "Inspect your change"}
+                </strong>
+                <small>
+                  {canApprove
+                    ? "Try it here. When you’re happy, send it for review and publishing."
+                    : "A preview of this change. The shared website is separate."}
+                </small>
+              </div>
+              {canApprove && (
+                <button
+                  className="button primary compact"
+                  disabled={
+                    approvalBusy ||
+                    (!shownArtifact.inspectedAt &&
+                      inspection !== shownArtifact.id)
+                  }
+                  onClick={() => approve(shownArtifact)}
+                >
+                  {approvalBusy ? <Spinner /> : <Icon name="check" size={16} />}
+                  Make this the website
+                </button>
+              )}
+              <button className="text-button" onClick={() => setArtifact(null)}>
+                Back to shared website
+              </button>
+              {error && <Alert>{error}</Alert>}
+            </div>
+          )}
           <div className="preview-surface">
-            {project.appUrl ? (
+            {websiteUrl ? (
               <iframe
-                key={previewVersion}
-                src={
-                  project.appUrl +
-                  (previewVersion ? "?butler=" + previewVersion : "")
+                key={
+                  shownArtifact
+                    ? shownArtifact.id + shownArtifact.changeSha
+                    : previewVersion
                 }
-                title={project.name + " live website"}
+                src={
+                  websiteUrl +
+                  (!shownArtifact && previewVersion
+                    ? "?butler=" + previewVersion
+                    : "")
+                }
+                title={
+                  project.name +
+                  (shownArtifact ? " change preview" : " live website")
+                }
+                onLoad={() => {
+                  if (shownArtifact) markInspected(shownArtifact);
+                }}
                 sandbox="allow-scripts allow-forms allow-same-origin allow-popups"
               />
             ) : (
@@ -1782,20 +1983,27 @@ function Workspace({
             <div className="agent-heading">
               <span className="mini-butler">✳</span>
               <div>
-                <strong>{project.member.name}’s Butler</strong>
-                <small>Your own space to make things</small>
+                <strong>{chatMember.name}’s Butler</strong>
+                <small>
+                  {readOnly
+                    ? "Watching your teammate’s chat"
+                    : "Your chat · visible to your team"}
+                </small>
               </div>
             </div>
-            {project.ownMemberships.length > 1 ? (
+            {project.members.length > 1 ? (
               <select
                 className="workspace-picker"
-                aria-label="Your saved workspaces"
-                value={project.member.id}
-                onChange={(e) => setMemberId(e.target.value)}
+                aria-label="Choose a team chat"
+                value={chatMember.id}
+                onChange={(e) => viewChat(e.target.value)}
               >
-                {project.ownMemberships.map((m, i) => (
+                {project.members.map((m) => (
                   <option key={m.id} value={m.id}>
-                    {m.name} · workspace {i + 1}
+                    {m.name}
+                    {project.ownMemberships.some((own) => own.id === m.id)
+                      ? " (you)"
+                      : ""}
                   </option>
                 ))}
               </select>
@@ -1850,34 +2058,48 @@ function Workspace({
               </div>
             )}
             {project.isOwner &&
+              !readOnly &&
               project.state === "ready" &&
-              project.tasks.some((task) => task.state === "failed") && (
-                <Alert>
-                  Publishing needs another try. Your team’s work is saved.
-                  <button className="text-button" onClick={retry}>
-                    Retry publishing <Icon name="refresh" size={13} />
-                  </button>
-                </Alert>
-              )}
-            {latestJob?.error && !project.isOwner && (
-              <Alert>
-                Your work is saved. This change needs another try before it can
-                go live.
-              </Alert>
-            )}
-            {project.isOwner && (
+              project.tasks
+                .filter((task) => task.state === "failed")
+                .map((task, index) => (
+                  <Alert key={task.kind + index}>
+                    <strong>
+                      {task.kind === "worker-update"
+                        ? "Agent update failed"
+                        : task.kind === "sync-history"
+                          ? "Website history could not be loaded"
+                          : "Website publishing failed"}
+                    </strong>
+                    <p>
+                      {task.error || "Your work is saved. Retry this step."}
+                    </p>
+                    <button className="text-button" onClick={retry}>
+                      Retry{" "}
+                      {task.kind === "worker-update"
+                        ? "agent update"
+                        : task.kind === "sync-history"
+                          ? "history sync"
+                          : "publishing"}{" "}
+                      <Icon name="refresh" size={13} />
+                    </button>
+                  </Alert>
+                ))}
+            {project.isOwner && !readOnly && (
               <CodexConnection project={project} onConnected={connected} />
             )}
             <div className="agent-welcome">
               <span className="mini-butler">✳</span>
               <div>
                 <p>
-                  Hi {project.member.name.split(" ")[0]}. What would you like to
-                  make?
+                  {readOnly
+                    ? `You’re watching ${chatMember.name}’s conversation.`
+                    : `Hi ${project.member.name.split(" ")[0]}. What would you like to make?`}
                 </p>
                 <small>
-                  Tell me in your own words. I’ll build it, get it reviewed, and
-                  help bring it to the website.
+                  {readOnly
+                    ? "Everyone on this project can follow the work here. Send requests from your own chat."
+                    : "Tell me in your own words. I’ll build a preview. Inspect it, then choose Make this the website to send it for review and publishing."}
                 </small>
               </div>
             </div>
@@ -1886,34 +2108,127 @@ function Workspace({
               return (
                 <div
                   key={message.id}
-                  className={"message message-" + message.role}
+                  className={
+                    "message message-" +
+                    message.role +
+                    " message-kind-" +
+                    (message.kind || "message")
+                  }
                 >
                   {message.role === "assistant" && (
                     <span className="mini-butler">✳</span>
                   )}
                   <div className="message-content">
+                    {message.kind && message.kind !== "message" && (
+                      <small className="message-caption">
+                        {message.kind === "review"
+                          ? "Reviewer"
+                          : message.kind === "error"
+                            ? "Update failed"
+                            : message.kind === "status"
+                              ? "Butler"
+                              : "Codex"}
+                        {message.createdAt
+                          ? ` · ${new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+                          : ""}
+                      </small>
+                    )}
                     <p>{message.text}</p>
-                    {message.role === "user" && job && <JobState job={job} />}
+                    {message.role === "user" && job && (
+                      <JobState job={job} clock={clock} />
+                    )}
                   </div>
                 </div>
               );
             })}
+            {latestJob?.error && (
+              <Alert>
+                <strong>{statusLabel(latestJob)}</strong>
+                <p>{latestJob.error}</p>
+                {!readOnly && latestJob.state === "preview_failed" ? (
+                  <button
+                    className="text-button"
+                    onClick={() => retryPreview(latestJob)}
+                  >
+                    Retry{" "}
+                    {latestJob.approvedAt
+                      ? "opening the pull request"
+                      : "preview"}{" "}
+                    <Icon name="refresh" size={13} />
+                  </button>
+                ) : (
+                  !readOnly &&
+                  !/automatically|bwrap|namespace/i.test(latestJob.error) && (
+                    <button
+                      className="text-button"
+                      onClick={() => {
+                        setText(
+                          `Continue my request and fix this problem: ${latestJob.error}`,
+                        );
+                        textarea.current?.focus();
+                      }}
+                    >
+                      Ask my agent to fix it <Icon name="arrow" size={13} />
+                    </button>
+                  )
+                )}
+                {latestJob.prUrl && (
+                  <a
+                    href={latestJob.prUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Open pull request
+                  </a>
+                )}
+              </Alert>
+            )}
             {latestJob &&
-              ["working", "reviewing", "deploying"].includes(
-                latestJob.state,
-              ) && (
+              [
+                "working",
+                "reviewing",
+                "deploying",
+                "building_preview",
+                "creating_pr",
+              ].includes(latestJob.state) && (
                 <div className="working-line">
                   <span className="mini-butler">✳</span>
                   <Spinner />
                   <span>
                     {latestJob.state === "working"
                       ? "Working on your idea…"
-                      : latestJob.state === "reviewing"
-                        ? "Making sure everything works together…"
-                        : "Publishing your change…"}
+                      : latestJob.state === "building_preview"
+                        ? "Building your preview…"
+                        : latestJob.state === "creating_pr"
+                          ? "Opening your approved change for review…"
+                          : latestJob.state === "reviewing"
+                            ? "Making sure everything works together…"
+                            : "Publishing your change…"}
+                    {latestJob.startedAt &&
+                      ` · ${elapsed(latestJob.startedAt, clock)}`}
                   </span>
                 </div>
               )}
+            {project.jobs
+              .filter((j) => j.state === "awaiting_approval" && j.artifactUrl)
+              .map((job) => (
+                <article className="artifact-card" key={job.id}>
+                  <span className="small-label">PREVIEW READY · NO PR YET</span>
+                  <strong>{job.prTitle || "Your change is ready"}</strong>
+                  <p>
+                    {readOnly
+                      ? "Your teammate can inspect and approve this change."
+                      : "Try your change before it goes to the shared website."}
+                  </p>
+                  <button
+                    className="button primary compact"
+                    onClick={() => inspect(job)}
+                  >
+                    <Icon name="grid" size={16} />
+                    Inspect preview <Icon name="arrow" size={16} />
+                  </button>
+                </article>
+              ))}
             {project.jobs
               .filter((j) => j.previewUrl)
               .slice(-1)
@@ -1948,79 +2263,162 @@ function Workspace({
             {error && <Alert>{error}</Alert>}
             <div ref={bottom} />
           </div>
-          <form className="composer" onSubmit={send}>
-            <div className="composer-input">
-              <textarea
-                ref={textarea}
-                placeholder="What would you like to change?"
-                aria-label="Tell your agent what to change"
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-                maxLength={20000}
-                rows={2}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-                    e.preventDefault();
-                    send();
-                  }
-                }}
-              />
+          {readOnly ? (
+            <div className="composer read-only-notice">
+              <p>You’re viewing {chatMember.name}’s chat.</p>
               <button
-                type="submit"
-                className="send-button"
-                aria-label="Send request"
-                disabled={!text.trim() || sending}
+                className="button secondary full"
+                onClick={() => viewChat(project.member.id)}
               >
-                {sending ? <Spinner /> : <Icon name="arrow" size={21} />}
+                Back to my chat <Icon name="arrow" size={16} />
               </button>
             </div>
-            <div className="composer-note">
-              <span>
-                {preparing
-                  ? "You can send ideas while we prepare."
-                  : !project.codingReady
-                    ? "Your lead is connecting Codex. Requests wait safely."
-                    : "Type it. Dictate it. Make it happen."}
-              </span>
-              <span>↵ ⌘ / Ctrl</span>
-            </div>
-          </form>
+          ) : (
+            <form className="composer" onSubmit={send}>
+              <div className="composer-input">
+                <textarea
+                  ref={textarea}
+                  placeholder="What would you like to change?"
+                  aria-label="Tell your agent what to change"
+                  value={text}
+                  onChange={(e) => setText(e.target.value)}
+                  maxLength={20000}
+                  rows={2}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                      e.preventDefault();
+                      send();
+                    }
+                  }}
+                />
+                <button
+                  type="submit"
+                  className="send-button"
+                  aria-label="Send request"
+                  disabled={!text.trim() || sending}
+                >
+                  {sending ? <Spinner /> : <Icon name="arrow" size={21} />}
+                </button>
+              </div>
+              <div className="composer-note">
+                <span>
+                  {preparing
+                    ? "You can send ideas while we prepare."
+                    : !project.codingReady
+                      ? "Your lead is connecting Codex. Requests wait safely."
+                      : "Type it. Dictate it. Make it happen."}
+                </span>
+                <span>↵ ⌘ / Ctrl</span>
+              </div>
+            </form>
+          )}
         </section>
         <section className="team-panel">
           <div className="panel-top">
-            <strong>Your people</strong>
+            <strong>
+              {tab === "updates" ? "Website updates" : "Your people"}
+            </strong>
             <span>{project.members.length}</span>
           </div>
           <div className="team-content">
-            {project.members.map((member, i) => (
-              <div className="team-member" key={member.id}>
-                <Avatar name={member.name} index={i} />
-                <div>
-                  <strong>{member.name}</strong>
-                  <small>
-                    {member.role === "owner" ? "Team lead" : "Teammate"}
-                  </small>
+            <div className="team-overview">
+              {project.members.map((member, i) => (
+                <div className="team-member" key={member.id}>
+                  <Avatar name={member.name} index={i} />
+                  <div>
+                    <strong>{member.name}</strong>
+                    <small>
+                      {member.agentState
+                        ? `${statusLabel({ state: member.agentState })}${member.startedAt ? ` · ${elapsed(member.startedAt, member.finishedAt || clock)}` : ""}`
+                        : member.role === "owner"
+                          ? "Team lead"
+                          : "Teammate"}
+                    </small>
+                  </div>
+                  <button
+                    className="text-button"
+                    onClick={() => viewChat(member.id)}
+                  >
+                    {project.ownMemberships.some((m) => m.id === member.id)
+                      ? "My chat"
+                      : "View chat"}
+                  </button>
                 </div>
-                {member.id === project.member.id && <span>You</span>}
-              </div>
-            ))}
-            {project.isOwner && (
-              <button
-                className="button ghost full"
-                onClick={() => setInvite(true)}
-              >
-                <Icon name="plus" size={16} />
-                Invite someone
-              </button>
-            )}
-            <h3>Coming together</h3>
-            {project.activity.map((job) => (
-              <div className="activity-item" key={job.id}>
-                <strong>{job.name}</strong>
-                <p>{job.text}</p>
-                <JobState job={job} />
-              </div>
-            ))}
+              ))}
+              {project.isOwner && (
+                <button
+                  className="button ghost full"
+                  onClick={() => setInvite(true)}
+                >
+                  <Icon name="plus" size={16} />
+                  Invite someone
+                </button>
+              )}
+              <h3>Coming together</h3>
+              {project.activity.map((job) => (
+                <div className="activity-item" key={job.id}>
+                  <button
+                    className="text-button"
+                    onClick={() => job.memberId && viewChat(job.memberId)}
+                  >
+                    <strong>{job.name}</strong>
+                  </button>
+                  <p>{job.text}</p>
+                  <JobState job={job} clock={clock} />
+                </div>
+              ))}
+            </div>
+            <div className="release-history">
+              <h3>Website updates</h3>
+              {(!project.releases || project.releases.length === 0) && (
+                <p className="quiet-note">
+                  Merged pull requests and live website updates will appear
+                  here.
+                </p>
+              )}
+              {project.releases?.map((release) => (
+                <article className="release-card" key={release.number}>
+                  <div className="release-top">
+                    <a
+                      href={release.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      PR #{release.number} <Icon name="external" size={12} />
+                    </a>
+                    <span
+                      className={
+                        release.isLive ? "release-live" : "release-pending"
+                      }
+                    >
+                      {release.isLive ? "Live" : "Merged · publishing"}
+                    </span>
+                  </div>
+                  <strong>{release.title}</strong>
+                  <small>
+                    {release.author}
+                    {release.mergedAt
+                      ? ` · Merged ${new Date(release.mergedAt).toLocaleString()}`
+                      : " · Previously merged"}
+                  </small>
+                  {release.publishedAt && (
+                    <small>
+                      Published {new Date(release.publishedAt).toLocaleString()}
+                    </small>
+                  )}
+                  {release.isLive && project.appUrl && (
+                    <a
+                      className="text-button"
+                      href={project.appUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      Open website <Icon name="external" size={12} />
+                    </a>
+                  )}
+                </article>
+              ))}
+            </div>
           </div>
         </section>
       </main>

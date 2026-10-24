@@ -1,6 +1,6 @@
 # Pocket Butler
 
-Turn a group of people with phones into a software team. A lead connects GitHub, Boat and their Codex subscription; teammates scan an invitation and start requesting changes. Butler handles persistent workspaces, PRs, review, previews and publishing.
+Turn a group of people with phones into a software team. A lead connects GitHub, Boat and their Codex subscription; teammates scan an invitation and start requesting changes. Each change gets a preview first. Its creator inspects it and chooses **Make this the website** before Butler opens a PR, reviews it and publishes it. Teammates can follow each other’s chats, agent progress and website update history.
 
 - [Product direction / implementation issue](https://github.com/MszBednarski/code_butler/issues/9)
 - [Run and deploy the platform](docs/PLATFORM.md)

@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { c as archive } from "tar";
 import { setTimeout as delay } from "node:timers/promises";
 import { now } from "./store.mjs";
+import { workerSource } from "./worker-source.mjs";
 const quote = (value) => "'" + String(value).replaceAll("'", "'\\''") + "'";
 const root = "/home/user/butler",
   SHA = /^[a-f0-9]{40}$/;
@@ -137,6 +138,13 @@ export function createBoatProvisioner(
       );
       if (!status.running) {
         if (status.exitCode === 0) return;
+        if (status.exitCode === 75)
+          throw Object.assign(
+            new Error(
+              "The agent is busy. Its update will retry when the current task finishes.",
+            ),
+            { code: "worker_busy" },
+          );
         throw new Error(
           "The Boat build stopped before it passed. Its source and workspace are saved; inspect the build in Boat and retry.",
         );
@@ -212,25 +220,19 @@ export function createBoatProvisioner(
       "UPDATE projects SET state='infrastructure',error=NULL WHERE id=?",
       p.id,
     );
+    await updateWorker(p);
+    store.run("UPDATE projects SET state='deploying' WHERE id=?", p.id);
+    if (!resources(p).appDeployed) {
+      await deploy(p, { sha: resources(p).initialSha });
+      save(p, { appDeployed: true });
+    }
+    store.run("UPDATE projects SET state='ready',error=NULL WHERE id=?", p.id);
+  }
+  async function updateWorker(p) {
+    if (!resources(p).boat?.id)
+      throw new Error("This project has no saved Boat workspace.");
     await ensure(p);
-    const entries = (await readdir(config.workerDir))
-      .filter(
-        (name) =>
-          [
-            "Dockerfile",
-            ".dockerignore",
-            "package.json",
-            "package-lock.json",
-            "verdict.schema.json",
-          ].includes(name) || /\.mjs$/.test(name),
-      )
-      .sort();
-    const fingerprint = createHash("sha256");
-    for (const entry of entries)
-      fingerprint
-        .update(entry)
-        .update(await readFile(path.join(config.workerDir, entry)));
-    const hash = fingerprint.digest("hex").slice(0, 24);
+    const { entries, hash } = await workerSource(config.workerDir);
     const remote = await put(
       p,
       `uploads/worker-${hash}.tgz`,
@@ -240,28 +242,20 @@ export function createBoatProvisioner(
       p,
       "worker.env",
       Buffer.from(
-        `PORT=3000\nPLATFORM_URL=${config.publicUrl}\nPROJECT_ID=${p.id}\nWORKER_SECRET=${store.open(p.worker_secret)}\nREQUIRE_PERSISTENT_VOLUME=1\nIS_SANDBOX=1\n`,
+        `PORT=3000\nPLATFORM_URL=${config.publicUrl}\nPROJECT_ID=${p.id}\nWORKER_SECRET=${store.open(p.worker_secret)}\nWORKER_VERSION=${hash}\nREQUIRE_PERSISTENT_VOLUME=1\nIS_SANDBOX=1\n`,
       ),
     );
     await job(
       p,
       `worker:${hash}`,
-      `sudo systemctl enable --now docker\nmkdir -p ${quote(root + "/data")} ${quote(root + "/worker-source")}\ntar -xzf ${quote(remote)} -C ${quote(root + "/worker-source")}\nsudo docker build -t butler-worker:${hash} ${quote(root + "/worker-source")}\nsudo docker rm -f butler-worker >/dev/null 2>&1 || true\nsudo docker run -d --restart unless-stopped --name butler-worker -p 3100:3000 --env-file ${quote(root + "/worker.env")} -v ${quote(root + "/data:/data")} butler-worker:${hash}`,
+      `sudo systemctl enable --now docker\nmkdir -p ${quote(root + "/data")} ${quote(root + "/worker-source")}\ntar -xzf ${quote(remote)} -C ${quote(root + "/worker-source")}\nsudo docker build -t butler-worker:${hash} ${quote(root + "/worker-source")}\nif sudo docker exec butler-worker pgrep -f '[c]odex.*exec' >/dev/null 2>&1; then exit 75; fi\nsudo docker rm -f butler-worker >/dev/null 2>&1 || true\nsudo docker run -d --restart unless-stopped --name butler-worker -p 3100:3000 --env-file ${quote(root + "/worker.env")} -v ${quote(root + "/data:/data")} butler-worker:${hash}`,
       "butler-worker",
       `butler-worker:${hash}`,
     );
     const workerUrl = await host(p, 3100, "Butler agent");
     await healthy(workerUrl + "/healthz");
-    store.run(
-      "UPDATE projects SET worker_url=?,state='deploying' WHERE id=?",
-      workerUrl,
-      p.id,
-    );
-    if (!resources(p).appDeployed) {
-      await deploy(p, { sha: resources(p).initialSha });
-      save(p, { appDeployed: true });
-    }
-    store.run("UPDATE projects SET state='ready',error=NULL WHERE id=?", p.id);
+    store.run("UPDATE projects SET worker_url=? WHERE id=?", workerUrl, p.id);
+    save(p, { workerVersion: hash });
   }
   async function previewPort(p, number) {
     let saved = store.get(
@@ -305,15 +299,15 @@ export function createBoatProvisioner(
     );
     return port;
   }
-  async function deploy(p, { sha, prNumber }) {
+  async function deploy(p, { sha, prNumber, jobId }) {
     if (!SHA.test(sha)) throw new Error("Invalid deployment revision.");
-    if (prNumber) {
+    if (prNumber && !jobId) {
       const pr = await provider.github(
         p.owner_id,
         `/repos/${p.repo}/pulls/${prNumber}`,
       );
       if (pr.state !== "open" || pr.head.sha !== sha) return;
-    } else if (resources(p).appDeployed) {
+    } else if (!jobId && resources(p).appDeployed) {
       const main = await provider.github(
         p.owner_id,
         `/repos/${p.repo}/git/ref/heads/main`,
@@ -331,7 +325,7 @@ export function createBoatProvisioner(
     const directory = await source(p, sha),
       staging = await mkdtemp(path.join(tmpdir(), "butler-boat-app-"));
     const port = prNumber ? await previewPort(p, prNumber) : 3000,
-      name = prNumber ? `butler-preview-${prNumber}` : "butler-web";
+      name = prNumber ? `butler-preview-port-${port}` : "butler-web";
     try {
       await cp(path.join(directory, "app"), staging, {
         recursive: true,
@@ -371,7 +365,7 @@ export function createBoatProvisioner(
       await job(
         p,
         `app:${prNumber || "main"}:${sha}`,
-        `mkdir -p ${quote(appSource)}\ntar -xzf ${quote(remote)} -C ${quote(appSource)}\nsudo docker build --build-arg BUTLER_COMMIT_SHA=${sha} -t butler-web:${sha} ${quote(appSource)}\nsudo docker rm -f ${quote(name)} >/dev/null 2>&1 || true\nsudo docker run -d --restart unless-stopped --name ${quote(name)} -p ${port}:3000 butler-web:${sha}`,
+        `mkdir -p ${quote(appSource)}\ntar -xzf ${quote(remote)} -C ${quote(appSource)}\nsudo docker build --build-arg BUTLER_COMMIT_SHA=${sha} -t butler-web:${sha} ${quote(appSource)}\n${prNumber && !jobId ? `sudo docker rm -f ${quote(`butler-preview-${prNumber}`)} >/dev/null 2>&1 || true\n` : ""}sudo docker rm -f ${quote(name)} >/dev/null 2>&1 || true\nsudo docker run -d --restart unless-stopped --name ${quote(name)} -p ${port}:3000 butler-web:${sha}`,
         name,
         `butler-web:${sha}`,
       );
@@ -389,12 +383,24 @@ export function createBoatProvisioner(
           p.id,
           prNumber,
         );
+        if (jobId) return;
         store.run(
-          "UPDATE jobs SET preview_url=?,error=NULL,state=CASE WHEN state='preview_failed' THEN 'reviewing' ELSE state END WHERE project_id=? AND pr_number=?",
+          "UPDATE jobs SET preview_url=?,error=CASE WHEN state='preview_failed' THEN NULL ELSE error END,state=CASE WHEN state='preview_failed' THEN 'reviewing' ELSE state END WHERE project_id=? AND pr_number=?",
           url,
           p.id,
           prNumber,
         );
+        for (const job of store.all(
+          "SELECT id FROM jobs WHERE project_id=? AND pr_number=?",
+          p.id,
+          prNumber,
+        ))
+          store.recordEvent(
+            job.id,
+            `preview:${sha}`,
+            "status",
+            `Preview ready: ${url}`,
+          );
         const marker = `<!-- butler-preview:${prNumber}:${sha} -->`,
           comments = await provider.github(
             p.owner_id,
@@ -420,8 +426,14 @@ export function createBoatProvisioner(
   async function cleanup(p, { prNumber }) {
     await ensure(p);
     const vm = resources(p).boat.id;
+    const preview = store.get(
+        "SELECT environment_id FROM previews WHERE project_id=? AND pr_number=?",
+        p.id,
+        prNumber,
+      ),
+      port = Number(preview?.environment_id?.slice(5));
     await api(p, `/sandboxes/${vm}/commands`, "POST", {
-      command: `sudo docker rm -f ${quote(`butler-preview-${prNumber}`)} >/dev/null 2>&1 || true`,
+      command: `sudo docker rm -f ${quote(`butler-preview-${prNumber}`)} ${quote(`butler-preview-port-${port}`)} >/dev/null 2>&1 || true`,
       timeoutSeconds: 30,
     });
     // Closed previews stop serving. Their ports may be reused without adding hosted URLs.
@@ -431,5 +443,5 @@ export function createBoatProvisioner(
       prNumber,
     );
   }
-  return { provision, deploy, cleanup, ensure };
+  return { provision, deploy, cleanup, ensure, updateWorker };
 }

@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createStore, id, token, digest, now } from "../store.mjs";
 import { createPlatform } from "../server.mjs";
+import { createProvisioner } from "../provision.mjs";
 import { createAgent } from "../../project-worker/agent.mjs";
 import { createReviewer } from "../../project-worker/reviewer.mjs";
 const exec = promisify(execFile);
@@ -113,8 +114,10 @@ test("real git transport and app builds carry a teammate request through PR revi
     repositoryToken: async () => "project-installation-fixture",
     github: async (_user, endpoint, method = "GET", body) => {
       const suffix = endpoint.replace("/repos/team/project", "");
-      if (suffix === "/git/ref/heads/main")
-        return { object: { sha: await sha("main") } };
+      if (suffix.startsWith("/git/ref/heads/"))
+        return {
+          object: { sha: await sha(suffix.slice("/git/ref/heads/".length)) },
+        };
       if (suffix.startsWith("/pulls?"))
         return pr?.state === "open" ? [await currentPull()] : [];
       if (suffix === "/pulls" && method === "POST") {
@@ -223,13 +226,20 @@ test("real git transport and app builds carry a teammate request through PR revi
     memberCookie = joined.headers.get("set-cookie").split(";")[0];
   await call(
     `/api/projects/${projectId}/messages`,
-    { text: "Change the heading to Hello Team", requestKey: id() },
+    {
+      text: "umm yeah can you like have the heading say hello team thanks",
+      requestKey: id(),
+    },
     memberCookie,
   );
   const bin = path.join(dir, "bin");
   await mkdir(bin);
-  const fakeCodex = `#!${process.execPath}\nconst fs=require('fs'),crypto=require('crypto');const args=process.argv.slice(2),out=args[args.indexOf('--output-last-message')+1];if(args.includes('--output-schema')){fs.writeFileSync(out,JSON.stringify({decision:'approve',summary:'No blocking findings in the test review.',findings:[]}));}else{let p=fs.readFileSync('app/src/main.tsx','utf8');fs.writeFileSync('app/src/main.tsx',p.replace('__PROJECT_NAME__','Hello Team'));const resume=args.indexOf('resume'),thread=resume>=0?args[resume+1]:crypto.randomUUID();fs.appendFileSync(process.env.HOME+'/invocations.jsonl',JSON.stringify(args)+'\\n');console.log(JSON.stringify({type:'thread.started',thread_id:thread}));fs.writeFileSync(out,'Changed the heading to Hello Team.');}\n`;
-  await writeFile(path.join(bin, "codex"), fakeCodex, { mode: 0o700 });
+  const fakeCodex = `#!${process.execPath}\nconst fs=require('fs'),crypto=require('crypto');const args=process.argv.slice(2),out=args[args.indexOf('--output-last-message')+1];if(args[args.indexOf('--output-schema')+1]?.endsWith('verdict.schema.json')){fs.writeFileSync(out,JSON.stringify({decision:'approve',summary:'No blocking findings in the test review.',findings:[]}));}else{let p=fs.readFileSync('app/src/main.tsx','utf8');fs.writeFileSync('app/src/main.tsx',p.replace('__PROJECT_NAME__','Hello Team'));const resume=args.indexOf('resume'),thread=resume>=0?args[resume+1]:crypto.randomUUID();fs.appendFileSync(process.env.HOME+'/invocations.jsonl',JSON.stringify(args)+'\\n');console.log(JSON.stringify({type:'thread.started',thread_id:thread}));fs.writeFileSync(out,JSON.stringify({summary:'Changed the heading to Hello Team.',title:'Update the homepage heading to Hello Team',description:'Show Hello Team as the homepage heading. Validated with the app production build.'}));}\n`;
+  const streamingCodex = fakeCodex.replace(
+    "let p=fs.readFileSync",
+    `console.log(JSON.stringify({type:'item.completed',item:{id:'item_progress',type:'agent_message',text:'I am updating the heading now.'}}));console.log(JSON.stringify({type:'item.completed',item:{id:'private_item',type:'reasoning',text:'private-reasoning-fixture'}}));let p=fs.readFileSync`,
+  );
+  await writeFile(path.join(bin, "codex"), streamingCodex, { mode: 0o700 });
   const originalPath = process.env.PATH;
   process.env.PATH = bin + ":" + originalPath;
   t.after(() => {
@@ -254,14 +264,98 @@ test("real git transport and app builds carry a teammate request through PR revi
     }),
     reviewer = createReviewer(agent, { dataDir: data, auth });
   await agent.initialize();
-  await agent.codeOne();
+  const coding = agent.codeOne();
+  for (let n = 0; n < 200; n++) {
+    if (
+      store.get(
+        "SELECT job_id FROM job_events WHERE text=?",
+        "I am updating the heading now.",
+      )
+    )
+      break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(
+    store.get(
+      "SELECT job_id FROM job_events WHERE text=?",
+      "I am updating the heading now.",
+    ),
+  );
+  assert.ok(
+    store.get(
+      "SELECT id FROM jobs WHERE state='working' AND project_id=?",
+      projectId,
+    ),
+  );
+  await coding;
   const job = store.get(
     "SELECT * FROM jobs WHERE project_id=? AND state=?",
     projectId,
-    "reviewing",
+    "building_preview",
   );
   assert.ok(job);
-  assert.equal(job.pr_number, 1);
+  assert.equal(job.pr_number, null);
+  assert.equal(
+    pr,
+    null,
+    "Coding and pushing a draft must not open a pull request",
+  );
+  assert.equal(job.pr_title, "Update the homepage heading to Hello Team");
+  const provisioner = createProvisioner(config, store, provider);
+  // The provider deployment is tested separately. This fixture supplies its ready artifact.
+  store.run(
+    "INSERT INTO previews(project_id,pr_number,state,url,commit_sha,environment_id) VALUES(?,-1,'ready','https://preview.example.test',?,'draft-env')",
+    projectId,
+    job.change_sha,
+  );
+  store.run(
+    "UPDATE jobs SET state='awaiting_approval',artifact_number=-1,artifact_url='https://preview.example.test',artifact_ready_at=? WHERE id=?",
+    now(),
+    job.id,
+  );
+  const approvalUrl = `/api/projects/${projectId}/jobs/${job.id}`;
+  assert.equal(
+    (
+      await call(
+        approvalUrl + "/approve",
+        { sha: job.change_sha },
+        memberCookie,
+      )
+    ).status,
+    409,
+  );
+  assert.equal(
+    (
+      await call(
+        approvalUrl + "/inspect",
+        { sha: job.change_sha },
+        memberCookie,
+      )
+    ).status,
+    200,
+  );
+  assert.equal(pr, null);
+  assert.equal(
+    (
+      await call(
+        approvalUrl + "/approve",
+        { sha: job.change_sha },
+        memberCookie,
+      )
+    ).status,
+    202,
+  );
+  await provisioner.openPull(project, { jobId: job.id, sha: job.change_sha });
+  assert.equal(pr.number, 1);
+  assert.equal(pr.title, job.pr_title);
+  assert.ok(
+    !pr.body.includes(job.text),
+    "PR copy describes the intent rather than transcribing the request",
+  );
+  assert.equal(
+    store.get("SELECT state FROM jobs WHERE id=?", job.id).state,
+    "reviewing",
+  );
   const member = store.get("SELECT * FROM members WHERE id=?", job.member_id);
   assert.match(member.thread_id, /^[a-f0-9-]{36}$/);
   assert.ok(authorizedGitRequests > 0);
@@ -273,14 +367,20 @@ test("real git transport and app builds carry a teammate request through PR revi
   const page = await (
     await call(`/api/projects/${projectId}`, undefined, memberCookie)
   ).json();
-  assert.equal(page.messages.at(-1).role, "assistant");
+  assert.ok(page.messages.some((m) => m.role === "assistant"));
+  assert.ok(
+    page.messages.some((m) => m.text === "I am updating the heading now."),
+  );
+  assert.ok(
+    !JSON.stringify(page.messages).includes("private-reasoning-fixture"),
+  );
   assert.ok(page.jobs[0].prUrl.endsWith("/pull/1"));
   await reviewer.one();
   const candidate = (await currentPull()).head.sha;
   store.run(
-    "INSERT INTO previews(project_id,pr_number,state,url,commit_sha) VALUES(?,1,'ready','https://preview.example.test',?)",
-    projectId,
+    "UPDATE previews SET commit_sha=? WHERE project_id=? AND pr_number=1",
     candidate,
+    projectId,
   );
   // Waiting for a preview must not create a new commit on every poll.
   await reviewer.one();
