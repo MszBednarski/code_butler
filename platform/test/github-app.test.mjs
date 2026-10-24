@@ -6,6 +6,9 @@ import { createStore, id, token, digest, now } from "../store.mjs";
 import { createPlatform } from "../server.mjs";
 import {
   createGithubAccess,
+  saveCreationCredential,
+  creationCredential,
+  creationPermissions,
   githubPermissions,
   repositoryPermissions,
   githubJwt,
@@ -46,6 +49,12 @@ async function fixture(t) {
     account: { id: 42, login: "lead", type: "User" },
     suspended_at: null,
   };
+  store.connection(user.id, "github_creation", {
+    token: "create-only",
+    accountId: "42",
+    appId: "123",
+    expiresAt: Date.now() + 3600000,
+  });
   store.connection(user.id, "github_installation", { id: 99 });
   function project(repo = "lead/butler-fixture") {
     const projectId = id(),
@@ -160,30 +169,20 @@ test("project GitHub and git credentials are short-lived and restricted to that 
   );
   assert.ok(!JSON.stringify(requests).includes("old-broad-token"));
 });
-test("repository creation uses its dedicated permission without contents access or repository administration", async (t) => {
+test("a new personal repository is created with a scoped USER token before any installation or existing repository", async (t) => {
   const f = await fixture(t),
-    p = f.project(null),
-    requested = [];
+    p = f.project(null);
+  f.store.run("DELETE FROM connections WHERE provider='github_installation'");
+  let created = 0;
   const access = createGithubAccess(f.config, f.store, async (url, options) => {
-    if (url.endsWith("/app/installations/99"))
-      return Response.json(f.installation);
-    if (url.endsWith("/access_tokens")) {
-      const b = JSON.parse(options.body);
-      requested.push(b.permissions);
-      assert.equal(b.permissions.contents, undefined);
-      assert.equal(b.permissions.administration, undefined);
-      return Response.json({
-        token: b.permissions.repository_creation
-          ? "create-only"
-          : "metadata-only",
-        expires_at: new Date(Date.now() + 3600000).toISOString(),
-      });
-    }
-    if (url.includes("/repos/lead/"))
-      return Response.json({ message: "Not found" }, { status: 404 });
-    assert.equal(url, "https://api.github.com/user/repos");
     assert.equal(options.headers.Authorization, "Bearer create-only");
+    if (url.includes("/repos/lead/"))
+      return Response.json({ message: "Not Found" }, { status: 404 });
+    assert.equal(url, "https://api.github.com/user/repos");
+    assert.equal(options.method, "POST");
+    created++;
     const body = JSON.parse(options.body);
+    assert.equal(body.private, true);
     return Response.json({
       id: 88,
       owner: { id: 42 },
@@ -192,14 +191,18 @@ test("repository creation uses its dedicated permission without contents access 
       default_branch: "main",
     });
   });
-  const repo = await access.createRepository(p);
-  assert.deepEqual(requested, [
-    { metadata: "read" },
-    { metadata: "read", repository_creation: "write" },
-  ]);
+  await assert.rejects(
+    access.createRepository(p),
+    (e) => e.code === "github_repository_access_required",
+  );
   const saved = f.store.get("SELECT * FROM projects WHERE id=?", p.id);
-  assert.equal(saved.repo, repo.full_name);
+  assert.equal(saved.repo, `lead/butler-${p.slug}`);
   assert.equal(JSON.parse(saved.resources).githubRepositoryId, 88);
+  await assert.rejects(
+    access.createRepository(p),
+    (e) => e.code === "github_repository_access_required",
+  );
+  assert.equal(created, 1);
 });
 test("a created repository awaiting selection is reused after approval without creating it again", async (t) => {
   const f = await fixture(t),
@@ -246,12 +249,9 @@ test("a created repository awaiting selection is reused after approval without c
         : Response.json({ message: "Not Found" }, { status: 404 });
     throw Error("Unexpected request");
   });
-  const found = await access.createRepository(p);
   const missing = (error) => error.code === "github_repository_access_required";
-  await assert.rejects(
-    access.repositoryToken(f.user.id, found.full_name),
-    missing,
-  );
+  await assert.rejects(access.createRepository(p), missing);
+  await assert.rejects(access.repositoryToken(f.user.id, p.repo), missing);
   await assert.rejects(access.createRepository(p), missing);
   assert.equal(created, 1);
   approved = true;
@@ -296,13 +296,16 @@ test("a lost repository creation response refreshes metadata instead of creating
       throw Error("Successful creation response was lost");
     }
     if (url.includes("/repos/lead/"))
-      return canSee.get(options.headers.Authorization.slice(7))
+      return repo
         ? Response.json(repo)
         : Response.json({ message: "Not Found" }, { status: 404 });
     throw Error("Unexpected request");
   });
   await assert.rejects(access.createRepository(p), /response was lost/);
-  assert.equal((await access.createRepository(p)).id, 88);
+  await assert.rejects(
+    access.createRepository(p),
+    (e) => e.code === "github_repository_access_required",
+  );
   assert.equal(created, 1);
 });
 test("old OAuth repository grants are quarantined immediately and revoked, with failed revocations retried", async (t) => {
@@ -579,14 +582,22 @@ test("installation callbacks require the browser, signed-in account and installa
   await new Promise((r) => platform.server.listen(0, "127.0.0.1", r));
   f.config.publicUrl = `http://127.0.0.1:${platform.server.address().port}`;
   t.after(() => new Promise((r) => platform.server.close(r)));
-  const start = await fetch(f.config.publicUrl + "/auth/github/install", {
-    headers: { cookie },
-    redirect: "manual",
-  });
+  const start = await fetch(
+    f.config.publicUrl +
+      `/auth/github/install?returnTo=${encodeURIComponent(`/p/${project.id}`)}`,
+    {
+      headers: { cookie },
+      redirect: "manual",
+    },
+  );
   const url = new URL(start.headers.get("location")),
     browser = start.headers.get("set-cookie").split(";")[0];
   assert.equal(url.hostname, "github.com");
-  assert.equal(url.pathname, "/apps/butler-renamed/installations/new");
+  assert.equal(
+    url.pathname,
+    "/apps/butler-renamed/installations/new/permissions",
+  );
+  assert.deepEqual(url.searchParams.getAll("repository_ids[]"), ["7"]);
   assert.equal(f.config.githubAppSlug, "butler-renamed");
   assert.equal(
     f.store.setting("provider-settings").githubAppSlug,
@@ -594,10 +605,14 @@ test("installation callbacks require the browser, signed-in account and installa
   );
   assert.equal(url.searchParams.get("suggested_target_id"), "42");
   registration = { id: "wrong-app", slug: "unrelated-app" };
-  const wrong = await fetch(f.config.publicUrl + "/auth/github/install", {
-    headers: { cookie },
-    redirect: "manual",
-  });
+  const wrong = await fetch(
+    f.config.publicUrl +
+      `/auth/github/install?returnTo=${encodeURIComponent(`/p/${project.id}`)}`,
+    {
+      headers: { cookie },
+      redirect: "manual",
+    },
+  );
   assert.equal(wrong.status, 503);
   assert.equal(wrong.headers.get("location"), null);
   registration = { id: f.config.githubAppId, slug: "butler-renamed" };
@@ -646,4 +661,155 @@ test("installation callbacks require the browser, signed-in account and installa
   assert.equal(f.store.all("SELECT * FROM tasks").length, 0);
   assert.equal((await hook(99)).status, 202);
   assert.equal(f.store.all("SELECT * FROM tasks").length, 1);
+});
+
+test("creation authorization stores only a bounded scoped token and rejects expanded permissions or expired credentials", async (t) => {
+  const f = await fixture(t);
+  Object.assign(f.config, {
+    githubAppClientId: "app-client",
+    githubAppClientSecret: "app-secret",
+  });
+  let extra = false;
+  const request = async (url, options) => {
+    assert.equal(
+      url,
+      "https://api.github.com/applications/app-client/token/scoped",
+    );
+    const body = JSON.parse(options.body);
+    assert.equal(body.target_id, 42);
+    assert.deepEqual(body.permissions, creationPermissions);
+    return Response.json({
+      token: "scoped-user",
+      installation: {
+        permissions: {
+          ...creationPermissions,
+          ...(extra ? { contents: "write" } : {}),
+        },
+      },
+      expires_at: new Date(Date.now() + 7200000).toISOString(),
+    });
+  };
+  await saveCreationCredential(
+    f.config,
+    f.store,
+    f.user.id,
+    { access_token: "unscoped-user" },
+    request,
+  );
+  assert.equal(creationCredential(f.config, f.store, f.user.id), "scoped-user");
+  assert.ok(
+    f.store.connection(f.user.id, "github_creation").expiresAt <=
+      Date.now() + 3600000,
+  );
+  assert.ok(
+    !JSON.stringify(f.store.connection(f.user.id, "github_creation")).includes(
+      "unscoped-user",
+    ),
+  );
+  assert.equal(
+    creationCredential({ ...f.config, githubAppId: 321 }, f.store, f.user.id),
+    null,
+  );
+  extra = true;
+  await assert.rejects(
+    saveCreationCredential(
+      f.config,
+      f.store,
+      f.user.id,
+      { access_token: "unscoped-user" },
+      request,
+    ),
+  );
+  // A top-level permissions fixture is not GitHub's scoped-token response.
+  await assert.rejects(
+    saveCreationCredential(
+      f.config,
+      f.store,
+      f.user.id,
+      { access_token: "unscoped-user" },
+      async () =>
+        Response.json({
+          token: "wrong-envelope",
+          permissions: creationPermissions,
+        }),
+    ),
+  );
+  const saved = f.store.connection(f.user.id, "github_creation");
+  f.store.connection(f.user.id, "github_creation", {
+    ...saved,
+    expiresAt: Date.now() - 1,
+  });
+  assert.equal(creationCredential(f.config, f.store, f.user.id), null);
+});
+
+test("creation consent is browser-bound, preserves the idea return path, and saves only scoped user credentials", async (t) => {
+  const f = await fixture(t);
+  f.store.run(
+    "DELETE FROM connections WHERE provider IN ('github_creation','github_installation')",
+  );
+  Object.assign(f.config, {
+    publicUrl: "http://127.0.0.1",
+    secure: false,
+    frontend: "/missing",
+    githubAppClientId: "app-client",
+    githubAppClientSecret: "app-secret",
+  });
+  let narrowed = 0;
+  const platform = createPlatform(f.config, {
+    store: f.store,
+    provisioner: {},
+    provider: {
+      request: async (url, options) => {
+        if (url.endsWith("/login/oauth/access_token"))
+          return Response.json({ access_token: "unscoped-user" });
+        if (url.endsWith("/user"))
+          return Response.json({ id: 42, login: "lead", name: "Lead" });
+        assert.ok(url.endsWith("/token/scoped"));
+        narrowed++;
+        assert.deepEqual(
+          JSON.parse(options.body).permissions,
+          creationPermissions,
+        );
+        return Response.json({
+          token: "scoped-create-user",
+          installation: { permissions: creationPermissions },
+          expires_at: new Date(Date.now() + 3600000).toISOString(),
+        });
+      },
+    },
+  });
+  await new Promise((resolve) =>
+    platform.server.listen(0, "127.0.0.1", resolve),
+  );
+  f.config.publicUrl = `http://127.0.0.1:${platform.server.address().port}`;
+  t.after(() => new Promise((resolve) => platform.server.close(resolve)));
+  const start = await fetch(
+    f.config.publicUrl + "/auth/github?purpose=create&returnTo=%2Fstart",
+    { redirect: "manual" },
+  );
+  const authorization = new URL(start.headers.get("location"));
+  assert.equal(authorization.pathname, "/login/oauth/authorize");
+  assert.equal(authorization.searchParams.has("scope"), false);
+  const callback =
+    f.config.publicUrl +
+    `/auth/github/callback?state=${authorization.searchParams.get("state")}&code=fixture`;
+  assert.equal((await fetch(callback, { redirect: "manual" })).status, 400);
+  assert.equal(narrowed, 0);
+  const done = await fetch(callback, {
+    redirect: "manual",
+    headers: { cookie: start.headers.get("set-cookie").split(";")[0] },
+  });
+  assert.equal(done.headers.get("location"), "/start");
+  assert.equal(narrowed, 1);
+  assert.equal(
+    creationCredential(f.config, f.store, f.user.id),
+    "scoped-create-user",
+  );
+  assert.equal(f.store.connection(f.user.id, "github_installation"), null);
+  const cookie = `butler_account=${f.store.session(f.user.id)}`;
+  const premature = await fetch(
+    f.config.publicUrl + "/auth/github/install?returnTo=%2Fstart",
+    { redirect: "manual", headers: { cookie } },
+  );
+  assert.equal(premature.headers.get("location"), "/start");
 });

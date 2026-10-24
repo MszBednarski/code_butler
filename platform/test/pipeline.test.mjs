@@ -100,6 +100,12 @@ test("real git transport and app builds carry a teammate request through PR revi
     "team",
     lead.id,
   );
+  store.connection(lead.id, "github_creation", {
+    token: "create-only",
+    accountId: "42",
+    appId: "123",
+    expiresAt: Date.now() + 3600000,
+  });
   store.connection(lead.id, "github_installation", { id: 99, accountId: 42 });
   store.connection(lead.id, "railway", {
     access_token: "owner-railway-fixture",

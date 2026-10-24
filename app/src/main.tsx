@@ -25,7 +25,12 @@ type User = {
 };
 type Session = {
   user: User | null;
-  connections: { github: boolean; railway: boolean; boat?: boolean };
+  connections: {
+    githubCreation?: boolean;
+    github: boolean;
+    railway: boolean;
+    boat?: boolean;
+  };
   hostingProvider?: "railway" | "boat";
   capabilities: {
     github: boolean;
@@ -808,7 +813,7 @@ function Dashboard({
   ]);
   const memberOnly = listOnly;
   const step =
-    !session.user?.githubLogin || !session.connections.github
+    !session.user?.githubLogin || !session.connections.githubCreation
       ? 0
       : useBoat
         ? !session.connections.boat
@@ -932,20 +937,18 @@ function Dashboard({
                 aria-disabled={!githubAvailable}
                 href={
                   githubAvailable
-                    ? session.user?.githubLogin
-                      ? "/auth/github/install?returnTo=%2Fstart"
-                      : "/auth/github?returnTo=%2Fstart"
+                    ? "/auth/github?purpose=create&returnTo=%2Fstart"
                     : undefined
                 }
               >
                 {session.user?.githubLogin
-                  ? "Allow Butler to set up my project"
+                  ? "Allow Butler to create a new project"
                   : "Continue with GitHub"}
                 <Icon name="arrow" size={18} />
               </a>
               <p className="quiet-note">
                 {githubAvailable
-                  ? "Keep access limited to selected repositories. Butler will tell you which new project to approve if GitHub asks."
+                  ? "No existing repository needed. Describe your idea next; Butler creates a new private repository, then asks you to approve access to it."
                   : "GitHub setup is being finished. Please try again shortly."}
               </p>
             </section>
@@ -2067,7 +2070,7 @@ function Workspace({
                   <strong style={{ overflowWrap: "anywhere" }}>
                     {project.githubAccess.repo.split("/")[1]}
                   </strong>
-                  , then click Save.
+                  , then click Install or Save.
                 </p>
                 <a
                   className="button primary full"
@@ -2081,6 +2084,19 @@ function Workspace({
                   Come back here afterward. Butler will resume your saved
                   project.
                 </p>
+              </>
+            ) : project.state === "github_authorization" ? (
+              <>
+                <p>
+                  Your idea is saved. Reconnect GitHub so Butler can create its
+                  new private repository.
+                </p>
+                <a
+                  className="button primary full"
+                  href={`/auth/github?purpose=create&returnTo=${encodeURIComponent(`/p/${project.id}`)}`}
+                >
+                  Reconnect GitHub
+                </a>
               </>
             ) : preparing ? (
               <>

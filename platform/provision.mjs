@@ -993,7 +993,10 @@ export function createProvisioner(
         }
         if (
           task.kind === "provision" &&
-          error.code === "github_repository_access_required"
+          [
+            "github_repository_access_required",
+            "github_creation_authorization_required",
+          ].includes(error.code)
         ) {
           store.transaction(() => {
             store.run(
@@ -1003,7 +1006,10 @@ export function createProvisioner(
               task.id,
             );
             store.run(
-              "UPDATE projects SET state='github_access',error=? WHERE id=?",
+              "UPDATE projects SET state=?,error=? WHERE id=?",
+              error.code === "github_creation_authorization_required"
+                ? "github_authorization"
+                : "github_access",
               message,
               project.id,
             );

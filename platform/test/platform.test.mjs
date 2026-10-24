@@ -68,6 +68,12 @@ async function fixture(t, overrides = {}) {
     "test-lead",
     lead.id,
   );
+  store.connection(lead.id, "github_creation", {
+    token: "create-only",
+    accountId: "4242",
+    appId: "123",
+    expiresAt: Date.now() + 3600000,
+  });
   store.connection(lead.id, "github_installation", { id: 99, accountId: 4242 });
   store.connection(lead.id, "railway", {
     access_token: "rail-sensitive-fixture",
@@ -1785,7 +1791,7 @@ test("QR joining gives separate persistent workspaces with no provider accounts 
     401,
   );
   assert.equal((await f.call("/api/session", undefined, bob)).status, 200);
-  assert.equal(f.store.all("SELECT * FROM connections").length, 2);
+  assert.equal(f.store.all("SELECT * FROM connections").length, 3);
   const serialized = JSON.stringify({ a, b, inv });
   for (const secret of [
     "github-sensitive-fixture",
@@ -1825,7 +1831,7 @@ test("GitHub approval waits without repeating setup and resumes the same project
   const owner = await (await f.call(`/api/projects/${p.id}`)).json();
   assert.deepEqual(owner.githubAccess, {
     repo: "lead/created-project",
-    url: "https://github.com/settings/installations/99",
+    url: `/auth/github/install?returnTo=${encodeURIComponent(`/p/${p.id}`)}`,
   });
   const member = await f.join((await f.invite(p.id)).url, "Teammate");
   assert.equal(
@@ -2515,5 +2521,26 @@ test("email linking also invalidates guest credentials instead of promoting them
       )
     ).status,
     403,
+  );
+});
+
+test("first-time project creation needs no installation or existing repository and does not expose creation credentials", async (t) => {
+  const f = await fixture(t);
+  f.store.run("DELETE FROM connections WHERE provider='github_installation'");
+  const session = await (await f.call("/api/session")).json();
+  assert.equal(session.connections.github, false);
+  assert.equal(session.connections.githubCreation, true);
+  assert.ok(!JSON.stringify(session).includes("create-only"));
+  const p = await f.create();
+  assert.equal(
+    f.store.get("SELECT repo FROM projects WHERE id=?", p.id).repo,
+    null,
+  );
+  assert.equal(
+    f.store.get(
+      "SELECT COUNT(*) AS n FROM tasks WHERE project_id=? AND kind='provision'",
+      p.id,
+    ).n,
+    1,
   );
 });
