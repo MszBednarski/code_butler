@@ -137,6 +137,15 @@ test("QR joining gives separate persistent workspaces with no provider accounts 
   assert.notEqual(a.member.id, b.member.id);
   assert.notEqual(a.member.prefix, b.member.prefix);
   assert.equal(
+    (await (await f.call("/api/projects")).json()).projects[0].isOwner,
+    true,
+  );
+  assert.equal(
+    (await (await f.call("/api/projects", undefined, alice)).json()).projects[0]
+      .isOwner,
+    false,
+  );
+  assert.equal(
     (
       await f.call(
         `/api/projects/${p.id}?member=${a.member.id}`,

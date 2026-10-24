@@ -264,10 +264,13 @@ export function createPlatform(
   });
   app.get("/api/projects", signed, (req, res) =>
     res.json({
-      projects: store.all(
-        "SELECT DISTINCT p.id,p.name,p.description,p.state,p.app_url AS appUrl,p.created_at AS createdAt FROM projects p JOIN members m ON m.project_id=p.id WHERE m.user_id=? ORDER BY p.created_at DESC",
-        req.account.id,
-      ),
+      projects: store
+        .all(
+          "SELECT DISTINCT p.id,p.name,p.description,p.state,p.app_url AS appUrl,p.created_at AS createdAt,(p.owner_id=?) AS isOwner FROM projects p JOIN members m ON m.project_id=p.id WHERE m.user_id=? ORDER BY p.created_at DESC",
+          req.account.id,
+          req.account.id,
+        )
+        .map((project) => ({ ...project, isOwner: Boolean(project.isOwner) })),
     }),
   );
   app.get("/api/railway/workspaces", signed, async (req, res) =>

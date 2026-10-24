@@ -2086,3 +2086,148 @@ small {
     font-size: 43px;
   }
 }
+
+.onboarding-main {
+  max-width: 660px;
+  margin-top: 42px;
+}
+.onboarding-progress {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  padding: 0;
+  margin: 0 0 42px;
+}
+.onboarding-progress li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 14px;
+  border-bottom: 2px solid #e0e5d7;
+  color: #89947e;
+  font-size: 11px;
+}
+.onboarding-progress li > span {
+  width: 23px;
+  height: 23px;
+  flex-shrink: 0;
+  border: 1px solid #dce3d2;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+}
+.onboarding-progress strong {
+  font-weight: 500;
+}
+.onboarding-progress .current {
+  color: #254e3c;
+  border-color: #45694e;
+}
+.onboarding-progress .current > span {
+  background: #254e3c;
+  border-color: #254e3c;
+  color: white;
+}
+.onboarding-progress .complete {
+  color: #5c7951;
+  border-color: #b2c09c;
+}
+.onboarding-progress .complete > span {
+  background: #edf2e5;
+}
+.onboarding-main > h1 {
+  font-size: 39px;
+  letter-spacing: -1.5px;
+}
+.onboarding-main > .page-description {
+  max-width: 520px;
+  font-size: 14px;
+}
+.onboarding-card {
+  margin-top: 28px;
+}
+.onboarding-card > .round-icon {
+  margin-bottom: 18px;
+}
+.onboarding-card > h2 {
+  font-size: 18px;
+  line-height: 1.5;
+}
+.onboarding-card > p:not(.quiet-note) {
+  color: #77836c;
+  font-size: 14px;
+  line-height: 1.75;
+  margin: 10px 0 24px;
+}
+.onboarding-card .button.primary {
+  margin-top: 20px;
+}
+.onboarding-card select {
+  margin-top: 10px;
+  font-size: 14px;
+}
+.onboarding-card .codex-card {
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+.onboarding-card .codex-content .button {
+  display: flex;
+  width: 100%;
+}
+.onboarding-card .codex-content h3 {
+  font-size: 18px;
+}
+.onboarding-card .codex-content p {
+  font-size: 13px;
+  line-height: 1.75;
+}
+.onboarding-card .codex-content small {
+  font-size: 12px;
+  line-height: 1.7;
+}
+.onboarding-card .inline-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+@media (max-width: 650px) {
+  .onboarding-main {
+    margin-top: 26px;
+    padding: 0 20px;
+  }
+  .onboarding-main > h1 {
+    font-size: 31px;
+    letter-spacing: -1px;
+  }
+  .onboarding-main > .page-description {
+    font-size: 13px;
+  }
+  .onboarding-progress {
+    gap: 8px;
+    margin-bottom: 30px;
+  }
+  .onboarding-progress li {
+    gap: 5px;
+    font-size: 10px;
+    padding-bottom: 11px;
+  }
+  .onboarding-progress li > span {
+    width: 20px;
+    height: 20px;
+  }
+  .onboarding-card {
+    padding: 23px;
+    margin-top: 24px;
+  }
+  .onboarding-card .codex-card {
+    display: block;
+  }
+  .onboarding-card .codex-card > .round-icon {
+    display: none;
+  }
+}

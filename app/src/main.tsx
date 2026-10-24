@@ -54,7 +54,7 @@ type Project = {
 type Summary = Pick<
   Project,
   "id" | "name" | "description" | "state" | "appUrl"
->;
+> & { isOwner?: boolean };
 type Codex = { state: string; code?: string; url?: string; message?: string };
 const emptySession: Session = {
   user: null,
@@ -289,6 +289,7 @@ function Landing({ session, error }: { session: Session; error: string }) {
             Bring the whole team into building. Share a link, say what you want
             to change, and watch your website come to life.
           </p>
+          {error && <Alert>{error}</Alert>}
           <div id="get-started" className="hero-actions">
             <a
               className={
@@ -312,8 +313,8 @@ function Landing({ session, error }: { session: Session; error: string }) {
           </div>
           {!session.capabilities.github && (
             <p className="setup-note">
-              {error ||
-                "Sign-in is being prepared. Your Butler operator needs to connect GitHub."}
+              Sign-in is being prepared. Your Butler operator needs to connect
+              GitHub.
             </p>
           )}
           <div className="hero-proof">
@@ -424,63 +425,165 @@ function Landing({ session, error }: { session: Session; error: string }) {
   );
 }
 
+function OnboardingProgress({ step }: { step: number }) {
+  return (
+    <ol className="onboarding-progress" aria-label="Setup progress">
+      {["GitHub", "Hosting", "Your idea", "Codex"].map((label, index) => (
+        <li
+          key={label}
+          className={
+            index < step ? "complete" : index === step ? "current" : ""
+          }
+          aria-current={index === step ? "step" : undefined}
+        >
+          <span>
+            {index < step ? <Icon name="check" size={13} /> : index + 1}
+          </span>
+          <strong>{label}</strong>
+        </li>
+      ))}
+    </ol>
+  );
+}
+function ProjectCards({ projects }: { projects: Summary[] }) {
+  return (
+    <section className="projects-section">
+      <div className="section-title">
+        <h2>Your projects</h2>
+      </div>
+      <div className="project-cards">
+        {projects.map((p, index) => (
+          <button
+            key={p.id}
+            className={`project-card project-tone-${index % 3}`}
+            onClick={() => navigate(`/p/${p.id}`)}
+          >
+            <span className="project-monogram">
+              {p.name.slice(0, 1).toUpperCase()}
+            </span>
+            <h3>{p.name}</h3>
+            <p>{p.description}</p>
+            <span className="project-card-foot">
+              Open your workspace
+              <Icon name="arrow" size={16} />
+            </span>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
 function Dashboard({
   session,
   refresh,
+  authError,
 }: {
   session: Session;
   refresh: () => Promise<void>;
+  authError: string;
 }) {
   const [projectsLoaded, setProjectsLoaded] = useState(false),
     [memberSaving, setMemberSaving] = useState(false);
   const [projects, setProjects] = useState<Summary[]>([]),
     [error, setError] = useState(""),
-    [busy, setBusy] = useState(false),
-    [workspaces, setWorkspaces] = useState<{ id: string; name: string }[]>([]),
-    [workspace, setWorkspace] = useState("");
-  const [description, setDescription] = useState(
-      () => localStorage.getItem("butler-project-idea") || "",
+    [busy, setBusy] = useState(false);
+  const [workspaces, setWorkspaces] = useState<{ id: string; name: string }[]>(
+      [],
     ),
-    [projectName, setProjectName] = useState(""),
-    [createKey] = useState(
-      () => sessionStorage.getItem("butler-create-key") || crypto.randomUUID(),
-    );
+    [workspace, setWorkspace] = useState(""),
+    [hostingConfirmed, setHostingConfirmed] = useState(false),
+    [hostingLoaded, setHostingLoaded] = useState(false),
+    [hostingFailed, setHostingFailed] = useState(false),
+    [hostingReconnect, setHostingReconnect] = useState(false),
+    [hostingAttempt, setHostingAttempt] = useState(0);
+  const [description, setDescription] = useState(
+    () => localStorage.getItem("butler-project-idea") || "",
+  );
+  const [createKey] = useState(() => {
+    const key =
+      sessionStorage.getItem("butler-create-key") || crypto.randomUUID();
+    sessionStorage.setItem("butler-create-key", key);
+    return key;
+  });
+  const workspaceKey = `butler-hosting-${session.user!.id}`;
   useEffect(() => {
+    let alive = true;
     api<{ projects: Summary[] }>("/api/projects")
-      .then((v) => {
-        setProjects(v.projects);
-        if (!session.connections.github && v.projects.length === 1)
-          navigate(`/p/${v.projects[0].id}`, true);
+      .then(({ projects: found }) => {
+        if (!alive) return;
+        setProjects(found);
+        if (
+          found.length === 1 &&
+          (!session.user?.githubLogin || found[0].isOwner === false)
+        )
+          navigate(`/p/${found[0].id}`, true);
       })
-      .catch((e) => setError(e.message))
-      .finally(() => setProjectsLoaded(true));
-  }, []);
+      .catch((e) => alive && setError(e.message))
+      .finally(() => alive && setProjectsLoaded(true));
+    return () => {
+      alive = false;
+    };
+  }, [session.user?.id]);
   useEffect(() => {
     localStorage.setItem("butler-project-idea", description);
   }, [description]);
   useEffect(() => {
-    if (session.connections.railway)
-      api<{ id: string; name: string }[]>("/api/railway/workspaces")
-        .then((v) => {
-          setWorkspaces(v);
-          if (v.length === 1) setWorkspace(v[0].id);
-        })
-        .catch((e) => setError(e.message));
-  }, [session.connections.railway]);
+    if (!session.connections.railway) return;
+    let alive = true;
+    setHostingLoaded(false);
+    setHostingFailed(false);
+    setHostingReconnect(false);
+    api<{ id: string; name: string }[]>("/api/railway/workspaces")
+      .then((found) => {
+        if (!alive) return;
+        setWorkspaces(found);
+        const saved = localStorage.getItem(workspaceKey);
+        const selected =
+          found.length === 1
+            ? found[0].id
+            : found.find((w) => w.id === saved)?.id || "";
+        setWorkspace(selected);
+        setHostingConfirmed(Boolean(selected));
+      })
+      .catch((e) => {
+        if (alive) {
+          setError(e.message);
+          setHostingFailed(true);
+          setHostingReconnect(
+            e instanceof ApiError && [401, 403].includes(e.status),
+          );
+        }
+      })
+      .finally(() => alive && setHostingLoaded(true));
+    return () => {
+      alive = false;
+    };
+  }, [session.connections.railway, workspaceKey, hostingAttempt]);
+  const memberOnly =
+    projects.length > 0 &&
+    (!session.user?.githubLogin || projects.every((p) => p.isOwner === false));
+  const step =
+    !session.user?.githubLogin || !session.connections.github
+      ? 0
+      : !session.connections.railway || !hostingLoaded || !hostingConfirmed
+        ? 1
+        : 2;
+  const githubAvailable = session.user?.githubLogin
+    ? session.capabilities.githubRepositories
+    : session.capabilities.github;
   async function create(event: React.FormEvent) {
     event.preventDefault();
+    if (step !== 2 || busy) return;
     setError("");
     setBusy(true);
-    sessionStorage.setItem("butler-create-key", createKey);
     try {
       const result = await api<{ id: string }>("/api/projects", {
         name:
-          projectName.trim() ||
           description.trim().split(/\s+/).slice(0, 5).join(" ").slice(0, 45) ||
           "Our next idea",
         description,
         requestKey: createKey,
-        workspaceId: workspace || undefined,
+        workspaceId: workspace,
       });
       localStorage.removeItem("butler-project-idea");
       sessionStorage.removeItem("butler-create-key");
@@ -495,67 +598,12 @@ function Dashboard({
     await api("/api/auth/logout", {});
     await refresh();
   }
-  if (!session.connections.github && !projectsLoaded)
+  if (!projectsLoaded)
     return (
       <div className="loading-page">
         <Brand />
         <Spinner />
         <p>Finding your workspace…</p>
-      </div>
-    );
-  if (!session.user?.githubLogin && projects.length > 0)
-    return (
-      <div className="dashboard">
-        <header className="site-header">
-          <Brand />
-          <div className="account-menu">
-            <Avatar name={session.user!.name} />
-            <button
-              className="icon-button"
-              aria-label="Save your access"
-              onClick={() => setMemberSaving(true)}
-            >
-              <Icon name="lock" />
-            </button>
-          </div>
-        </header>
-        <main className="dashboard-main">
-          <div className="eyebrow">YOUR IDEAS HAVE A HOME</div>
-          <h1>
-            Good to have
-            <br />
-            <em>you back.</em>
-          </h1>
-          <p className="page-description">
-            Pick up your conversation and keep making things together.
-          </p>
-          <section className="projects-section">
-            <div className="project-cards">
-              {projects.map((p, i) => (
-                <button
-                  key={p.id}
-                  className={`project-card project-tone-${i % 3}`}
-                  onClick={() => navigate(`/p/${p.id}`)}
-                >
-                  <span className="project-monogram">{p.name.slice(0, 1)}</span>
-                  <h3>{p.name}</h3>
-                  <p>{p.description}</p>
-                  <span className="project-card-foot">
-                    Open your workspace
-                    <Icon name="arrow" size={16} />
-                  </span>
-                </button>
-              ))}
-            </div>
-          </section>
-        </main>
-        {memberSaving && (
-          <SaveAccess
-            session={session}
-            projectId={projects[0].id}
-            onClose={() => setMemberSaving(false)}
-          />
-        )}
       </div>
     );
   return (
@@ -565,208 +613,213 @@ function Dashboard({
         <div className="account-menu">
           <Avatar name={session.user!.name} />
           <span>{session.user!.name.split(" ")[0]}</span>
-          <button
-            className="icon-button"
-            onClick={logout}
-            aria-label="Sign out"
-          >
-            <Icon name="logout" />
-          </button>
+          {memberOnly ? (
+            <button
+              className="icon-button"
+              aria-label="Save your access"
+              onClick={() => setMemberSaving(true)}
+            >
+              <Icon name="lock" />
+            </button>
+          ) : (
+            <button
+              className="icon-button"
+              onClick={logout}
+              aria-label="Sign out"
+            >
+              <Icon name="logout" />
+            </button>
+          )}
         </div>
       </header>
-      <main className="dashboard-main">
-        <div className="eyebrow">A LITTLE HELP GETTING STARTED</div>
-        <h1>
-          What shall we
-          <br />
-          <em>make together?</em>
-        </h1>
-        <p className="page-description">
-          A fresh idea, your favorite people, and a Butler for everyone.
-        </p>
-        {error && <Alert>{error}</Alert>}
-        <div className="dashboard-grid">
-          <form className="create-card" onSubmit={create}>
-            <div className="card-heading">
+      {memberOnly ? (
+        <main className="dashboard-main">
+          <h1>Welcome back.</h1>
+          <p className="page-description">
+            Pick up your conversation and keep making things together.
+          </p>
+          <ProjectCards projects={projects} />
+        </main>
+      ) : (
+        <main className="dashboard-main onboarding-main">
+          <OnboardingProgress step={step} />
+          <div className="eyebrow">STEP {step + 1} OF 4</div>
+          <h1>
+            {step === 0
+              ? "First, your GitHub."
+              : step === 1
+                ? "A home for your app."
+                : "What would you like to build?"}
+          </h1>
+          <p className="page-description">
+            {step === 0
+              ? "Let Butler create and save your project for you."
+              : step === 1
+                ? "Butler uses your Railway account to host your app and your team’s agents."
+                : "Describe the idea in your own words. Butler will set everything up."}
+          </p>
+          {(error || authError) && <Alert>{error || authError}</Alert>}
+          {step === 0 && (
+            <section className="create-card onboarding-card">
               <span className="round-icon">
-                <Icon name="spark" />
-              </span>
-              <div>
-                <h2>Start something new</h2>
-                <p>Your first website is a conversation away.</p>
-              </div>
-            </div>
-            <label htmlFor="project-idea">What would you like to build?</label>
-            <textarea
-              id="project-idea"
-              autoFocus
-              placeholder="A website for our supper club, with upcoming dinners and a way to join…"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              maxLength={10000}
-              rows={4}
-              required
-              minLength={3}
-            />
-            <details className="optional-details">
-              <summary>
-                Give it a name <span>optional</span>
-              </summary>
-              <input
-                aria-label="Project name"
-                placeholder="Our next idea"
-                value={projectName}
-                onChange={(e) => setProjectName(e.target.value)}
-                maxLength={50}
-              />
-            </details>
-            {workspaces.length > 1 && (
-              <label className="workspace-select">
-                Where should it live?
-                <select
-                  value={workspace}
-                  onChange={(e) => setWorkspace(e.target.value)}
-                  required
-                >
-                  <option value="">Choose your Railway workspace</option>
-                  {workspaces.map((w) => (
-                    <option key={w.id} value={w.id}>
-                      {w.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-            <button
-              className="button primary full"
-              disabled={
-                busy ||
-                !session.connections.github ||
-                !session.connections.railway ||
-                description.trim().length < 3 ||
-                (workspaces.length > 1 && !workspace)
-              }
-            >
-              {busy ? <Spinner /> : <Icon name="plus" />}
-              {busy ? "Creating your project…" : "Create & invite your team"}
-              <Icon name="arrow" size={18} />
-            </button>
-            <p className="quiet-note">
-              Your work and conversations are saved as you go.
-            </p>
-          </form>
-          <aside className="connection-card">
-            <span className="small-label">YOUR CONNECTIONS</span>
-            <h2>
-              Set up once.
-              <br />
-              Keep making things.
-            </h2>
-            <div className="connection-row">
-              <span className="connection-icon">
                 <Icon name="github" />
               </span>
-              <div>
-                <strong>GitHub</strong>
-                <small>Only the project repositories you select</small>
-              </div>
-              {session.connections.github ? (
-                <span className="connection-check">
-                  <Icon name="check" size={17} />
-                </span>
-              ) : (
-                <a
-                  className="text-link"
-                  href={
-                    session.user?.githubLogin
+              <h2>Butler handles the project files.</h2>
+              <p>
+                We’ll create a new private GitHub repository automatically when
+                you start your project.
+              </p>
+              <a
+                className={
+                  "button primary full" + (!githubAvailable ? " disabled" : "")
+                }
+                aria-disabled={!githubAvailable}
+                href={
+                  githubAvailable
+                    ? session.user?.githubLogin
                       ? "/auth/github/install"
                       : "/auth/github"
-                  }
-                >
-                  Connect ↗
-                </a>
-              )}
-            </div>
-            <div className="connection-row">
-              <span className="connection-icon">
+                    : undefined
+                }
+              >
+                {session.user?.githubLogin
+                  ? "Allow Butler to set up my project"
+                  : "Continue with GitHub"}
+                <Icon name="arrow" size={18} />
+              </a>
+              <p className="quiet-note">
+                {githubAvailable
+                  ? "GitHub will ask for permission. Limit access to selected repositories; Butler gets access to the new ones it creates."
+                  : "GitHub setup is being finished. Please try again shortly."}
+              </p>
+            </section>
+          )}
+          {step === 1 && (
+            <section className="create-card onboarding-card">
+              <span className="round-icon">
                 <Icon name="railway" />
               </span>
-              <div>
-                <strong>Railway</strong>
-                <small>A home for your website</small>
-              </div>
-              {session.connections.railway ? (
-                <span className="connection-check">
-                  <Icon name="check" size={17} />
-                </span>
-              ) : (
-                <a
-                  className={
-                    "text-link" +
-                    (!session.capabilities.railway ? " disabled" : "")
-                  }
-                  href={session.capabilities.railway ? "/auth/railway" : "#"}
-                >
-                  Connect ↗
-                </a>
-              )}
-            </div>
-            <div className="connection-row muted">
-              <span className="connection-icon">
-                <Icon name="spark" />
-              </span>
-              <div>
-                <strong>Codex</strong>
-                <small>Connect your subscription inside your new project</small>
-              </div>
-            </div>
-            {!session.capabilities.railway && (
-              <p className="quiet-note">
-                Your Butler operator is preparing the Railway connection.
-              </p>
-            )}
-            <div className="connection-foot">
-              <Icon name="users" />
-              <span>
-                Your teammates only need
-                <br />
-                your invitation. We’ll handle the rest.
-              </span>
-            </div>
-          </aside>
-        </div>
-        {projects.length > 0 && (
-          <section className="projects-section">
-            <div className="section-title">
-              <h2>Pick up where you left off</h2>
-              <span>
-                {projects.length} project{projects.length === 1 ? "" : "s"}
-              </span>
-            </div>
-            <div className="project-cards">
-              {projects.map((p, i) => (
+              <h2>
+                {session.connections.railway && workspaces.length > 1
+                  ? "Choose where it should live."
+                  : "Let Butler publish your app."}
+              </h2>
+              {!session.connections.railway ||
+              hostingReconnect ||
+              (hostingLoaded && !hostingFailed && workspaces.length === 0) ? (
+                <>
+                  <p>
+                    Approve Railway access, then you’ll come straight back to
+                    your idea.
+                  </p>
+                  <a
+                    className={
+                      "button primary full" +
+                      (!session.capabilities.railway ? " disabled" : "")
+                    }
+                    aria-disabled={!session.capabilities.railway}
+                    href={
+                      session.capabilities.railway ? "/auth/railway" : undefined
+                    }
+                  >
+                    Continue with Railway
+                    <Icon name="arrow" size={18} />
+                  </a>
+                  {!session.capabilities.railway && (
+                    <p className="quiet-note">
+                      Railway setup is being finished. Please try again shortly.
+                    </p>
+                  )}
+                </>
+              ) : !hostingLoaded ? (
+                <p className="inline-status">
+                  <Spinner />
+                  Checking your Railway account…
+                </p>
+              ) : hostingFailed ? (
                 <button
-                  key={p.id}
-                  className={`project-card project-tone-${i % 3}`}
-                  onClick={() => navigate(`/p/${p.id}`)}
+                  className="button primary full"
+                  onClick={() => {
+                    setError("");
+                    setHostingAttempt((n) => n + 1);
+                  }}
                 >
-                  <span className="project-monogram">
-                    {p.name.slice(0, 1).toUpperCase()}
-                  </span>
-                  <h3>{p.name}</h3>
-                  <p>{p.description}</p>
-                  <span className="project-card-foot">
-                    {p.state === "ready"
-                      ? "Open your workspace"
-                      : "Workspace preparing"}
-                    <Icon name="arrow" size={16} />
-                  </span>
+                  Try again
+                  <Icon name="refresh" size={18} />
                 </button>
-              ))}
-            </div>
-          </section>
-        )}
-      </main>
+              ) : (
+                <form
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    if (workspace) {
+                      localStorage.setItem(workspaceKey, workspace);
+                      setHostingConfirmed(true);
+                    }
+                  }}
+                >
+                  <label htmlFor="hosting-workspace">
+                    Your Railway workspace
+                  </label>
+                  <select
+                    id="hosting-workspace"
+                    value={workspace}
+                    onChange={(event) => setWorkspace(event.target.value)}
+                    required
+                  >
+                    <option value="">Choose a workspace</option>
+                    {workspaces.map((w) => (
+                      <option key={w.id} value={w.id}>
+                        {w.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button className="button primary full" disabled={!workspace}>
+                    Continue
+                    <Icon name="arrow" size={18} />
+                  </button>
+                </form>
+              )}
+            </section>
+          )}
+          {step === 2 && (
+            <form className="create-card onboarding-card" onSubmit={create}>
+              <label htmlFor="project-idea">Your idea</label>
+              <textarea
+                id="project-idea"
+                autoFocus
+                placeholder="A website for our supper club, with upcoming dinners and a way to join…"
+                value={description}
+                onChange={(event) => setDescription(event.target.value)}
+                maxLength={10000}
+                rows={5}
+                required
+                minLength={3}
+              />
+              <button
+                className="button primary full"
+                disabled={busy || description.trim().length < 3}
+              >
+                {busy ? <Spinner /> : <Icon name="spark" />}
+                {busy ? "Creating your project…" : "Create my project"}
+                {!busy && <Icon name="arrow" size={18} />}
+              </button>
+              <p className="quiet-note">
+                Next: sign in to Codex, then invite your team.
+              </p>
+            </form>
+          )}
+          {step === 2 && projects.length > 0 && (
+            <ProjectCards projects={projects} />
+          )}
+        </main>
+      )}
+      {memberSaving && projects.length > 0 && (
+        <SaveAccess
+          session={session}
+          projectId={projects[0].id}
+          onClose={() => setMemberSaving(false)}
+        />
+      )}
     </div>
   );
 }
@@ -1313,6 +1366,59 @@ function Workspace({
       "ready",
     ].indexOf(project.state),
     latestJob = project.jobs.at(-1);
+  const firstSetup =
+    project.isOwner &&
+    !project.codingReady &&
+    !codexReady &&
+    (preparing ||
+      project.jobs.every(
+        (job) => job.requestKey === "initial" && job.state === "queued",
+      ));
+  if (firstSetup)
+    return (
+      <div className="dashboard">
+        <header className="site-header">
+          <Brand />
+          <span className="header-note">{project.name}</span>
+        </header>
+        <main className="dashboard-main onboarding-main">
+          <OnboardingProgress step={3} />
+          <div className="eyebrow">STEP 4 OF 4</div>
+          <h1>
+            {preparing ? "We’re setting things up." : "One last sign-in."}
+          </h1>
+          <p className="page-description">
+            {preparing
+              ? "Your idea is saved. Butler is creating your project and getting your team’s workspace ready."
+              : "Use your Codex subscription to give everyone an agent. Then you can invite your team."}
+          </p>
+          <section className="create-card onboarding-card">
+            {preparing ? (
+              <>
+                <p className="inline-status" role="status">
+                  <Spinner />
+                  {project.state === "repository"
+                    ? "Creating your project files…"
+                    : project.state === "failed"
+                      ? "Setup needs another try."
+                      : "Preparing your workspace…"}
+                </p>
+                {project.error && <Alert>{project.error}</Alert>}
+                {["failed", "retrying"].includes(project.state) && (
+                  <button className="button primary full" onClick={retry}>
+                    Try again
+                    <Icon name="refresh" size={18} />
+                  </button>
+                )}
+              </>
+            ) : (
+              <CodexConnection project={project} onConnected={connected} />
+            )}
+          </section>
+          {error && <Alert>{error}</Alert>}
+        </main>
+      </div>
+    );
   return (
     <div className="workspace-shell">
       <header className="workspace-header">
@@ -2100,7 +2206,10 @@ function App() {
   const route = useRoute(),
     [session, setSession] = useState<Session>(emptySession),
     [loaded, setLoaded] = useState(false),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [authError, setAuthError] = useState(
+      () => new URLSearchParams(location.search).get("auth_error") || "",
+    );
   const refresh = useCallback(async () => {
     try {
       setSession(await api<Session>("/api/session"));
@@ -2114,7 +2223,7 @@ function App() {
   useEffect(() => {
     const value = new URLSearchParams(location.search).get("auth_error");
     if (value) {
-      setError(value);
+      setAuthError(value);
       history.replaceState({}, "", location.pathname + location.hash);
     }
     const resize = () =>
@@ -2151,9 +2260,9 @@ function App() {
       </div>
     );
   return session.user ? (
-    <Dashboard session={session} refresh={refresh} />
+    <Dashboard session={session} refresh={refresh} authError={authError} />
   ) : (
-    <Landing session={session} error={error} />
+    <Landing session={session} error={error || authError} />
   );
 }
 ReactDOM.createRoot(document.getElementById("root")!).render(

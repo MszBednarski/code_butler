@@ -165,21 +165,40 @@ export function createGithubAccess(config, store, request = fetch) {
       throw accessError(
         "This repository is not assigned to your Butler project.",
       );
-    const resources = JSON.parse(project.resources);
+    let resources = JSON.parse(project.resources);
+    const installed = await installation(userId);
     if (
       !Number.isSafeInteger(resources.githubRepositoryId) ||
-      !resources.githubRepositoryId
-    )
-      throw accessError(
-        "This project’s selected repository needs to be reconnected.",
-        409,
+      !resources.githubRepositoryId ||
+      resources.githubInstallationId !== installed.id
+    ) {
+      const metadata = await token(userId, null, { metadata: "read" });
+      const found = await api(`/repos/${repo}`, metadata);
+      if (
+        !Number.isSafeInteger(found.id) ||
+        found.owner?.id !== installed.account.id ||
+        found.full_name?.toLowerCase() !== repo.toLowerCase() ||
+        (resources.githubRepositoryId &&
+          resources.githubRepositoryId !== found.id)
+      )
+        throw accessError(
+          "The selected GitHub repository does not match this saved project.",
+          409,
+        );
+      resources = {
+        ...JSON.parse(
+          store.get("SELECT resources FROM projects WHERE id=?", project.id)
+            .resources,
+        ),
+        githubRepositoryId: found.id,
+        githubInstallationId: installed.id,
+      };
+      store.run(
+        "UPDATE projects SET resources=? WHERE id=?",
+        JSON.stringify(resources),
+        project.id,
       );
-    const installed = await installation(userId);
-    if (resources.githubInstallationId !== installed.id)
-      throw accessError(
-        "Reconnect the GitHub installation assigned to this project.",
-        409,
-      );
+    }
     return token(userId, resources.githubRepositoryId, repositoryPermissions);
   }
   async function github(userId, endpoint, method = "GET", body, raw = false) {

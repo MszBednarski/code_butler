@@ -230,6 +230,67 @@ test("old OAuth repository grants are quarantined immediately and revoked, with 
   assert.deepEqual(second, { revoked: 1, pending: 0 });
   assert.equal(f.store.connection(f.user.id, "github_legacy_revoke"), null);
 });
+
+test("existing projects automatically recover repository IDs after connecting the limited app without recreating any work", async (t) => {
+  const f = await fixture(t),
+    project = f.project(),
+    grants = [];
+  f.store.run(
+    "UPDATE projects SET resources=? WHERE id=?",
+    JSON.stringify({ app: { deployment: "keep-this" } }),
+    project.id,
+  );
+  const access = createGithubAccess(f.config, f.store, async (url, options) => {
+    if (url.endsWith("/app/installations/99"))
+      return Response.json(f.installation);
+    if (url.endsWith("/access_tokens")) {
+      const body = JSON.parse(options.body);
+      grants.push(body);
+      return Response.json({
+        token: body.repository_ids ? "one-repo" : "metadata-only",
+        expires_at: new Date(Date.now() + 3600000).toISOString(),
+      });
+    }
+    assert.equal(url, "https://api.github.com/repos/lead/butler-fixture");
+    assert.equal(options.headers.Authorization, "Bearer metadata-only");
+    return Response.json({ id: 7, full_name: project.repo, owner: { id: 42 } });
+  });
+  assert.equal(
+    await access.repositoryToken(f.user.id, project.repo),
+    "one-repo",
+  );
+  assert.deepEqual(grants, [
+    { permissions: { metadata: "read" } },
+    { repository_ids: [7], permissions: repositoryPermissions },
+  ]);
+  const resources = JSON.parse(
+    f.store.get("SELECT resources FROM projects WHERE id=?", project.id)
+      .resources,
+  );
+  assert.deepEqual(resources, {
+    app: { deployment: "keep-this" },
+    githubRepositoryId: 7,
+    githubInstallationId: 99,
+  });
+  assert.equal(
+    await access.repositoryToken(f.user.id, project.repo),
+    "one-repo",
+  );
+  assert.equal(grants.length, 2);
+  f.store.run(
+    "UPDATE projects SET resources=? WHERE id=?",
+    JSON.stringify({
+      ...resources,
+      githubInstallationId: 55,
+      githubRepositoryId: 88,
+    }),
+    project.id,
+  );
+  await assert.rejects(
+    access.repositoryToken(f.user.id, project.repo),
+    /does not match/,
+  );
+});
 test("manifest registration is browser-bound, requests only the limited permissions and saves app keys encrypted without returning secrets", async (t) => {
   const f = await fixture(t),
     setup = token(),
