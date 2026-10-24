@@ -1772,7 +1772,7 @@ function Workspace({
       window.removeEventListener("focus", focus);
     };
   }, [refresh, refreshSession]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     localStorage.setItem(
       chatId && project?.isOwner
         ? `butler-draft-${projectId}-chat-${chatId}`

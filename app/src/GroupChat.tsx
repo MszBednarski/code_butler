@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import Reactions from "./Reactions";
 import type { ReactionSummary, ReactionTarget } from "./Reactions";
@@ -47,7 +47,7 @@ export default function GroupChat({
     lastMessage = useRef(""),
     afterSend = useRef(false),
     nearBottom = useRef(true);
-  useEffect(() => {
+  useLayoutEffect(() => {
     localStorage.setItem(storageKey, text);
     if (textarea.current) {
       textarea.current.style.height = "auto";
