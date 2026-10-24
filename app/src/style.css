@@ -2445,6 +2445,33 @@ small {
   line-height: 1.6;
 }
 
+.artifact-card-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.dismiss-preview {
+  font-size: 11px;
+  color: #7c8972;
+}
+.saved-preview-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  background: #f6f7f1;
+}
+.saved-preview-card > strong {
+  display: block;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 6px 0 10px;
+  overflow-wrap: anywhere;
+}
+.saved-preview-card .small-label {
+  font-size: 8px;
+}
+
 .website-toolbar {
   display: flex;
   align-items: center;
@@ -2951,6 +2978,23 @@ html.workspace-open,
 }
 .tour-chat-composer .button {
   font-size: 11px;
+}
+.tour-preview-reactions {
+  padding: 6px 18px;
+  border-top: 1px solid var(--line);
+}
+.tour-proposal,
+.tour-saved-preview {
+  margin: 0 0 14px;
+}
+.tour-proposal p,
+.tour-saved-preview p {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.landing-tour .reactions {
+  margin-top: 9px;
 }
 .tour-invite-panel {
   min-height: 516px;

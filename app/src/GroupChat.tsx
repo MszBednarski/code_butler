@@ -172,7 +172,12 @@ export default function GroupChat({
             maxLength={4000}
             onChange={(event) => setText(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+              if (
+                event.key === "Enter" &&
+                !event.shiftKey &&
+                !event.nativeEvent.isComposing &&
+                event.keyCode !== 229
+              ) {
                 event.preventDefault();
                 send();
               }
@@ -189,7 +194,7 @@ export default function GroupChat({
         </div>
         <div className="composer-note">
           <span>For everyone on this project.</span>
-          <span>⌘ / Ctrl + Enter</span>
+          <span>Enter sends · Shift+Enter for a new line</span>
         </div>
       </form>
     </section>

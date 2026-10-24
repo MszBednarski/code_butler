@@ -2,6 +2,24 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chatBubbles, explainButler } from "../src/communication.ts";
 
+test("saved preview controls remain in history next to matching assistant text", () => {
+  const messages = [
+    { id: "reply", jobId: "job", role: "assistant", text: "Colourful jumps" },
+    {
+      id: "saved",
+      jobId: "job",
+      role: "assistant",
+      kind: "saved-preview",
+      text: "Colourful jumps",
+    },
+    { id: "next", jobId: "job", role: "assistant", text: "Colourful jumps" },
+  ];
+  assert.deepEqual(
+    chatBubbles(messages).map((m) => m.id),
+    ["reply", "saved", "next"],
+  );
+});
+
 test("repeated explanations form one bubble without losing developer evidence or changing history", () => {
   const messages = [
     { id: "1", jobId: "job", role: "user", text: "Make the game multiplayer" },

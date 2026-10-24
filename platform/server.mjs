@@ -249,6 +249,7 @@ export function createPlatform(
       ![
         "/api/projects/:projectId/reactions",
         "/api/projects/:projectId/group/messages",
+        "/api/projects/:projectId/jobs/:jobId/visibility",
       ].includes(req.route?.path) &&
       !(
         req.project.owner_id === req.account.id &&
@@ -274,8 +275,8 @@ export function createPlatform(
     const saved = user && store.connection(user.id, "boat");
     return Boolean(
       saved?.access_token &&
-        saved.environmentId &&
-        Date.parse(saved.expiresAt) > now(),
+      saved.environmentId &&
+      Date.parse(saved.expiresAt) > now(),
     );
   };
   const hostingFor = (user) =>
@@ -552,11 +553,12 @@ export function createPlatform(
         p.id,
         req.account.id,
       ),
-      messages: store.chatMessages(chat.id),
+      messages: store.chatMessages(chat.id, req.account.id),
       reactions: store.reactionSummary(p.id, req.account.id),
       groupMessages: store.groupMessages(p.id, req.account.id),
       jobs: store.all(
-        "SELECT id,member_id AS memberId,request_key AS requestKey,text,state,result,error,pr_number AS prNumber,pr_url AS prUrl,preview_url AS previewUrl,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt,merged_at AS mergedAt,published_at AS publishedAt,change_sha AS changeSha,pr_title AS prTitle,artifact_url AS artifactUrl,artifact_ready_at AS artifactReadyAt,(SELECT inspected_at FROM preview_inspections i WHERE i.job_id=jobs.id AND i.user_id=? AND i.sha=jobs.change_sha) AS inspectedAt,approved_at AS approvedAt FROM jobs WHERE member_id=? ORDER BY created_at,rowid",
+        "SELECT id,member_id AS memberId,request_key AS requestKey,text,state,result,error,pr_number AS prNumber,pr_url AS prUrl,preview_url AS previewUrl,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt,merged_at AS mergedAt,published_at AS publishedAt,change_sha AS changeSha,pr_title AS prTitle,artifact_url AS artifactUrl,artifact_ready_at AS artifactReadyAt,(SELECT inspected_at FROM preview_inspections i WHERE i.job_id=jobs.id AND i.user_id=? AND i.sha=jobs.change_sha) AS inspectedAt,approved_at AS approvedAt,request_revision AS requestRevision,(SELECT dismissed_at FROM preview_visibility v WHERE v.job_id=jobs.id AND v.user_id=? AND v.hidden_revision=jobs.request_revision) AS dismissedAt FROM jobs WHERE member_id=? ORDER BY created_at,rowid",
+        req.account.id,
         req.account.id,
         chat.id,
       ),
@@ -808,6 +810,58 @@ export function createPlatform(
       res.status(202).json({ jobId });
     },
   );
+  app.post(
+    "/api/projects/:projectId/jobs/:jobId/visibility",
+    signed,
+    membership,
+    (req, res) => {
+      const job = store.get(
+        "SELECT * FROM jobs WHERE id=? AND project_id=?",
+        req.params.jobId,
+        req.project.id,
+      );
+      if (!job || !(job.artifact_url || job.preview_url))
+        return res
+          .status(404)
+          .json({ error: "This preview isn’t in your project." });
+      const { dismissed, revision, sha } = req.body || {};
+      if (typeof dismissed !== "boolean" || !Number.isSafeInteger(revision))
+        return res
+          .status(400)
+          .json({
+            error: "Choose whether to dismiss or restore this preview.",
+          });
+      if (revision !== job.request_revision || sha !== job.change_sha)
+        return res
+          .status(409)
+          .json({
+            error:
+              "This preview has been updated. Open its latest version and try again.",
+          });
+      if (dismissed) {
+        const current = store.get(
+          "SELECT hidden_revision FROM preview_visibility WHERE job_id=? AND user_id=?",
+          job.id,
+          req.account.id,
+        );
+        if (current?.hidden_revision !== revision)
+          store.run(
+            "INSERT INTO preview_visibility VALUES(?,?,?,?,?) ON CONFLICT(job_id,user_id) DO UPDATE SET hidden_revision=excluded.hidden_revision,dismissed_at=excluded.dismissed_at,title=excluded.title",
+            job.id,
+            req.account.id,
+            revision,
+            now(),
+            job.pr_title || "Your proposed change",
+          );
+      } else
+        store.run(
+          "UPDATE preview_visibility SET hidden_revision=NULL WHERE job_id=? AND user_id=?",
+          job.id,
+          req.account.id,
+        );
+      res.json({ ok: true });
+    },
+  );
   function ownedJob(req, res, next) {
     req.job = store.get(
       "SELECT * FROM jobs WHERE id=? AND project_id=? AND (member_id=? OR ?=1)",
@@ -862,6 +916,19 @@ export function createPlatform(
         error: "The preview changed. Inspect the latest version first.",
       });
     if (job.approved_at) return res.json({ ok: true, jobId: job.id });
+    if (
+      store.get(
+        "SELECT 1 FROM preview_visibility WHERE job_id=? AND user_id=? AND hidden_revision=?",
+        job.id,
+        req.account.id,
+        job.request_revision,
+      )
+    )
+      return res
+        .status(409)
+        .json({
+          error: "Restore this preview from chat history before publishing it.",
+        });
     if (
       store.get(
         "SELECT 1 FROM jobs WHERE member_id=? AND request_key NOT LIKE 'review-fix:%' AND created_at>? LIMIT 1",

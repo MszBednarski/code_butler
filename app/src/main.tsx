@@ -68,6 +68,8 @@ type Job = {
   artifactReadyAt?: number;
   inspectedAt?: number;
   approvedAt?: number;
+  dismissedAt?: number;
+  requestRevision?: number;
 };
 type Project = {
   id: string;
@@ -490,15 +492,18 @@ function Landing({ session, error }: { session: Session; error: string }) {
             <h3>See it happen together.</h3>
             <p>
               Each person gets a Butler. Follow each other’s chats, see what’s
-              being made, and try changes on the same shared website.
+              being made, and talk in the group chat. React to messages and
+              previews so your team knows what you love.
             </p>
           </article>
           <article>
             <span>✓</span>
             <h3>Try it. Then make it live.</h3>
             <p>
-              A preview first, your say next. Butler checks approved changes and
-              updates the website for everyone.
+              Inspect changes inside your workspace. Approve your own or, as
+              team lead, a teammate’s. Dismiss a preview and recover it from
+              chat history whenever you like. Butler checks and publishes
+              approved changes for everyone.
             </p>
           </article>
         </div>
@@ -1631,18 +1636,19 @@ function Workspace({
   const [frameReload, setFrameReload] = useState(0);
   const [artifact, setArtifact] = useState<Job | null>(null);
   const [approvalBusy, setApprovalBusy] = useState(false);
+  const [visibilityBusy, setVisibilityBusy] = useState("");
   const [inspection, setInspection] = useState("");
   const workspaceVisible = Boolean(
     project &&
-      !(
-        project.isOwner &&
-        !project.codingReady &&
-        !codexReady &&
-        (project.state !== "ready" ||
-          project.jobs.every(
-            (job) => job.requestKey === "initial" && job.state === "queued",
-          ))
-      ),
+    !(
+      project.isOwner &&
+      !project.codingReady &&
+      !codexReady &&
+      (project.state !== "ready" ||
+        project.jobs.every(
+          (job) => job.requestKey === "initial" && job.state === "queued",
+        ))
+    ),
   );
   useEffect(
     () => (workspaceVisible ? attachWorkspaceViewport() : undefined),
@@ -1902,6 +1908,22 @@ function Workspace({
       setError((e as Error).message);
     }
   }
+  async function setPreviewDismissed(job: Job, dismissed: boolean) {
+    setVisibilityBusy(job.id);
+    setError("");
+    try {
+      await api(
+        `/api/projects/${projectId}/jobs/${job.id}/visibility${memberId ? "?member=" + memberId : ""}`,
+        { dismissed, revision: job.requestRevision || 0, sha: job.changeSha },
+      );
+      if (dismissed && artifact?.id === job.id) setArtifact(null);
+      await refresh();
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setVisibilityBusy("");
+    }
+  }
   async function react(
     targetType: ReactionTarget,
     targetId: string,
@@ -1973,8 +1995,11 @@ function Workspace({
     : null;
   const canApprove =
     (shownArtifact?.memberId === project.member.id || project.isOwner) &&
-    shownArtifact?.state === "awaiting_approval";
-  const latestPreview = project.jobs.filter((job) => jobPreviewUrl(job)).at(-1);
+    shownArtifact?.state === "awaiting_approval" &&
+    !shownArtifact.dismissedAt;
+  const latestPreview = project.jobs
+    .filter((job) => jobPreviewUrl(job) && !job.dismissedAt)
+    .at(-1);
   const latestHumanRequest = project.jobs
     .filter((job) => !job.requestKey?.startsWith("review-fix:"))
     .at(-1);
@@ -2367,6 +2392,18 @@ function Workspace({
               </button>
             </div>
           )}
+          {shownArtifact?.dismissedAt && (
+            <div className="preview-approval">
+              <span>This preview is saved in your chat history.</span>
+              <button
+                className="button secondary compact"
+                disabled={visibilityBusy === shownArtifact.id}
+                onClick={() => setPreviewDismissed(shownArtifact, false)}
+              >
+                Restore preview
+              </button>
+            </div>
+          )}
         </section>
         <section className="conversation-panel">
           <div className="panel-top">
@@ -2538,21 +2575,49 @@ function Workspace({
                         {message.authorRole === "lead" ? " · team lead" : ""}
                       </small>
                     )}
-                    {message.kind && message.kind !== "message" && (
-                      <small className="message-caption">
-                        {message.kind === "review"
-                          ? "Website checks"
-                          : message.kind === "error"
-                            ? "Update failed"
-                            : message.kind === "status"
-                              ? "Butler"
-                              : "Codex"}
-                        {message.createdAt
-                          ? ` · ${new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
-                          : ""}
-                      </small>
-                    )}
-                    {message.role === "user" ? (
+                    {message.kind &&
+                      message.kind !== "message" &&
+                      message.kind !== "saved-preview" && (
+                        <small className="message-caption">
+                          {message.kind === "review"
+                            ? "Website checks"
+                            : message.kind === "error"
+                              ? "Update failed"
+                              : message.kind === "status"
+                                ? "Butler"
+                                : "Codex"}
+                          {message.createdAt
+                            ? ` · ${new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+                            : ""}
+                        </small>
+                      )}
+                    {message.kind === "saved-preview" && job ? (
+                      <article className="saved-preview-card">
+                        <small className="small-label">
+                          {job.dismissedAt
+                            ? "DISMISSED · SAVED HERE"
+                            : "PREVIEW IN CHAT HISTORY"}
+                        </small>
+                        <strong>{job.prTitle || message.text}</strong>
+                        <div className="artifact-card-actions">
+                          {job.dismissedAt && (
+                            <button
+                              className="button secondary compact"
+                              disabled={visibilityBusy === job.id}
+                              onClick={() => setPreviewDismissed(job, false)}
+                            >
+                              Restore preview
+                            </button>
+                          )}
+                          <button
+                            className="text-button"
+                            onClick={() => inspect(job)}
+                          >
+                            View preview <Icon name="arrow" size={13} />
+                          </button>
+                        </div>
+                      </article>
+                    ) : message.role === "user" ? (
                       <p>{message.text}</p>
                     ) : (
                       <ButlerText
@@ -2566,12 +2631,14 @@ function Workspace({
                       lastRequestByJob.get(message.jobId) === message.id && (
                         <JobState job={job} clock={clock} />
                       )}
-                    <Reactions
-                      targetType="message"
-                      targetId={message.id}
-                      summary={project.reactions}
-                      onReact={react}
-                    />
+                    {message.kind !== "saved-preview" && (
+                      <Reactions
+                        targetType="message"
+                        targetId={message.id}
+                        summary={project.reactions}
+                        onReact={react}
+                      />
+                    )}
                   </div>
                 </div>
               );
@@ -2641,6 +2708,7 @@ function Workspace({
                 (j) =>
                   j.state === "awaiting_approval" &&
                   j.artifactUrl &&
+                  !j.dismissedAt &&
                   j.id === currentUnpublished?.id,
               )
               .slice(-1)
@@ -2657,13 +2725,23 @@ function Workspace({
                         ? "Your teammate can inspect and approve this change."
                         : "Try your change before it goes to the shared website."}
                   </p>
-                  <button
-                    className="button primary compact"
-                    onClick={() => inspect(job)}
-                  >
-                    <Icon name="grid" size={16} />
-                    Inspect preview <Icon name="arrow" size={16} />
-                  </button>
+                  <div className="artifact-card-actions">
+                    <button
+                      className="button primary compact"
+                      onClick={() => inspect(job)}
+                    >
+                      <Icon name="grid" size={16} />
+                      Inspect preview <Icon name="arrow" size={16} />
+                    </button>
+                    <button
+                      className="text-button dismiss-preview"
+                      title="Hide this card for you. Restore it from chat history anytime."
+                      disabled={visibilityBusy === job.id}
+                      onClick={() => setPreviewDismissed(job, true)}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
                   <Reactions
                     targetType="preview"
                     targetId={job.id}
@@ -2673,7 +2751,7 @@ function Workspace({
                 </article>
               ))}
             {project.jobs
-              .filter((j) => j.previewUrl)
+              .filter((j) => j.previewUrl && !j.dismissedAt)
               .slice(-1)
               .map((job) => (
                 <button
@@ -2735,7 +2813,12 @@ function Workspace({
                   maxLength={20000}
                   rows={2}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                    if (
+                      e.key === "Enter" &&
+                      !e.shiftKey &&
+                      !e.nativeEvent.isComposing &&
+                      e.keyCode !== 229
+                    ) {
                       e.preventDefault();
                       send();
                     }
@@ -2758,7 +2841,7 @@ function Workspace({
                       ? "Your lead is connecting Codex. Requests wait safely."
                       : "Type it. Dictate it. Make it happen."}
                 </span>
-                <span>↵ ⌘ / Ctrl</span>
+                <span>Enter sends · Shift+Enter for a new line</span>
               </div>
             </form>
           )}

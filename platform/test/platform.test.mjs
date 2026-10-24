@@ -1033,6 +1033,217 @@ test("follow-ups reuse one draft and preview, retain reactions, and reject stale
   );
 });
 
+test("dismissed previews are private, recoverable history without publishing or losing work", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    inv = await f.invite(p.id);
+  const alice = await f.join(inv.url, "Alice"),
+    bob = await f.join(inv.url, "Bob");
+  f.store.run(
+    "UPDATE projects SET state='ready',repo='lead/site' WHERE id=?",
+    p.id,
+  );
+  const sent = await (
+    await f.call(
+      `/api/projects/${p.id}/messages`,
+      { text: "Add colourful jumps", requestKey: id() },
+      alice,
+    )
+  ).json();
+  const job = f.store.get("SELECT * FROM jobs WHERE id=?", sent.jobId),
+    sha = "a".repeat(40);
+  f.store.run(
+    "UPDATE jobs SET state='awaiting_approval',change_sha=?,pr_title='Add colourful jumps',artifact_url='https://preview.example.test',artifact_ready_at=? WHERE id=?",
+    sha,
+    now(),
+    job.id,
+  );
+  const base = `/api/projects/${p.id}/jobs/${job.id}`,
+    payload = { dismissed: true, revision: 0, sha };
+  const watched = `/api/projects/${p.id}?chat=${job.member_id}`;
+  const before = f.store.get("SELECT COUNT(*) AS n FROM tasks").n;
+  const data = async (cookie) =>
+    (await f.call(watched, undefined, cookie)).json();
+  assert.equal((await f.call(base + "/inspect", { sha }, alice)).status, 200);
+  await f.call(
+    `/api/projects/${p.id}/reactions`,
+    { targetType: "preview", targetId: job.id, emoji: "🔥", active: true },
+    bob,
+  );
+  assert.equal(
+    (await f.call(base + "/visibility", payload, alice)).status,
+    200,
+  );
+  assert.equal(
+    (await f.call(base + "/visibility", payload, alice)).status,
+    200,
+  );
+  const hidden = await data(alice);
+  assert.ok(hidden.jobs[0].dismissedAt);
+  assert.equal(
+    hidden.messages.filter((m) => m.kind === "saved-preview").length,
+    1,
+  );
+  assert.equal(hidden.reactions["preview:" + job.id][0].count, 1);
+  assert.equal((await f.call(base + "/approve", { sha }, alice)).status, 409);
+  assert.equal((await data(bob)).jobs[0].dismissedAt, null);
+  assert.equal(
+    (await data(bob)).messages.filter((m) => m.kind === "saved-preview").length,
+    0,
+  );
+  // A teammate may dismiss a watched proposal for themselves without gaining agent controls.
+  assert.equal(
+    (await f.call(base + `/visibility?chat=${job.member_id}`, payload, bob))
+      .status,
+    200,
+  );
+  assert.ok((await data(bob)).jobs[0].dismissedAt);
+  assert.equal((await data(f.owner)).jobs[0].dismissedAt, null);
+  assert.equal((await f.call(base + "/visibility", payload, "")).status, 401);
+  assert.equal(
+    (
+      await f.call(base + "/visibility", payload, alice, {
+        origin: "https://elsewhere.example",
+      })
+    ).status,
+    403,
+  );
+  assert.equal(
+    (await f.call(base + "/visibility", { ...payload, revision: 1 }, alice))
+      .status,
+    409,
+  );
+  assert.equal(
+    (
+      await f.call(
+        base + "/visibility",
+        { ...payload, sha: "b".repeat(40) },
+        alice,
+      )
+    ).status,
+    409,
+  );
+  assert.equal(
+    (
+      await f.call(
+        base + "/visibility",
+        { ...payload, dismissed: "true" },
+        alice,
+      )
+    ).status,
+    400,
+  );
+  const other = await f.create("Other project");
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${other.id}/jobs/${job.id}/visibility`,
+        payload,
+      )
+    ).status,
+    404,
+  );
+  const outsider = f.store.guest("Outsider");
+  assert.equal(
+    (
+      await f.call(
+        base + "/visibility",
+        payload,
+        `butler_account=${f.store.session(outsider.id)}`,
+      )
+    ).status,
+    404,
+  );
+  assert.equal(
+    (
+      await f.call(
+        base + "/visibility",
+        { ...payload, dismissed: false },
+        alice,
+      )
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await f.call(
+        base + "/visibility",
+        { ...payload, dismissed: false },
+        alice,
+      )
+    ).status,
+    200,
+  );
+  const restored = await data(alice);
+  assert.equal(restored.jobs[0].dismissedAt, null);
+  assert.equal(
+    restored.messages.filter((m) => m.kind === "saved-preview").length,
+    1,
+  );
+  assert.equal(
+    f.store.get("SELECT COUNT(*) AS n FROM tasks").n,
+    before + 1,
+    "Only the other project creation adds a task",
+  );
+  const saved = f.store.get("SELECT * FROM jobs WHERE id=?", job.id);
+  assert.equal(saved.state, "awaiting_approval");
+  assert.equal(saved.change_sha, sha);
+  assert.equal(saved.approved_at, null);
+  assert.equal(
+    f.store.get("SELECT COUNT(*) AS n FROM tasks WHERE kind='open-pr'").n,
+    0,
+  );
+  // Storage reopen preserves each account's preference and its history.
+  const reopened = createStore(f.dir);
+  assert.equal(
+    reopened
+      .chatMessages(job.member_id, f.lead.id)
+      .filter((m) => m.kind === "saved-preview").length,
+    0,
+  );
+  const bobUser = f.store.get(
+    "SELECT user_id FROM members WHERE project_id=? AND name='Bob'",
+    p.id,
+  ).user_id;
+  assert.ok(
+    reopened.get(
+      "SELECT dismissed_at FROM preview_visibility WHERE job_id=? AND user_id=?",
+      job.id,
+      bobUser,
+    ),
+  );
+  reopened.mergeUsers(bobUser, outsider.id);
+  assert.ok(
+    reopened.get(
+      "SELECT dismissed_at FROM preview_visibility WHERE job_id=? AND user_id=?",
+      job.id,
+      outsider.id,
+    ),
+  );
+  reopened.close();
+  // Editing the proposal shows the new version, preserving the earlier history marker.
+  await f.call(base + "/visibility", payload, alice);
+  const followup = await (
+    await f.call(
+      `/api/projects/${p.id}/messages`,
+      { text: "Make the jumps blue", requestKey: id() },
+      alice,
+    )
+  ).json();
+  assert.equal(followup.jobId, job.id);
+  const updated = await data(alice);
+  assert.equal(updated.jobs[0].requestRevision, 1);
+  assert.equal(updated.jobs[0].dismissedAt, null);
+  assert.equal(
+    updated.messages.filter((m) => m.kind === "saved-preview").length,
+    1,
+  );
+  assert.equal(
+    (await f.call(base + "/visibility", payload, alice)).status,
+    409,
+  );
+});
+
 test("the lead can steer a teammate and approve their preview after personally inspecting it", async (t) => {
   const f = await fixture(t),
     p = await f.create(),

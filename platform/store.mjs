@@ -106,6 +106,10 @@ export function createStore(directory) {
     CREATE TABLE IF NOT EXISTS request_receipts (
       member_id TEXT NOT NULL REFERENCES members(id), request_key TEXT NOT NULL,
       job_id TEXT NOT NULL REFERENCES jobs(id), PRIMARY KEY(member_id,request_key));
+    CREATE TABLE IF NOT EXISTS preview_visibility (
+      job_id TEXT NOT NULL REFERENCES jobs(id), user_id TEXT NOT NULL REFERENCES users(id),
+      hidden_revision INTEGER, dismissed_at INTEGER NOT NULL, title TEXT NOT NULL,
+      PRIMARY KEY(job_id,user_id));
   `);
   if (
     !db
@@ -318,6 +322,12 @@ export function createStore(directory) {
       );
       run("DELETE FROM preview_inspections WHERE user_id=?", from);
       run("UPDATE jobs SET approved_by=? WHERE approved_by=?", to, from);
+      run(
+        "UPDATE OR IGNORE preview_visibility SET user_id=? WHERE user_id=?",
+        to,
+        from,
+      );
+      run("DELETE FROM preview_visibility WHERE user_id=?", from);
       run("UPDATE projects SET owner_id=? WHERE owner_id=?", to, from);
       revokeAccess(from);
       run(
@@ -418,7 +428,7 @@ export function createStore(directory) {
     ))
       recordEvent(job.id, key, kind, text, at);
   }
-  function chatMessages(member) {
+  function chatMessages(member, viewer = null) {
     const rows = all(
       `SELECT m.id,m.job_id AS jobId,m.role,m.text,m.created_at AS createdAt,'message' AS kind,CASE m.role WHEN 'user' THEN 0 ELSE 2 END AS position,m.rowid AS sequence,NULL AS eventKey,NULL AS prNumber,u.name AS authorName,a.role AS authorRole FROM messages m LEFT JOIN message_authors a ON a.message_id=m.id LEFT JOIN users u ON u.id=a.user_id WHERE m.member_id=?
        UNION ALL SELECT j.id||':'||e.event_key,j.id,'assistant',e.text,e.created_at,e.kind,1,e.rowid,e.event_key,j.pr_number,NULL,NULL FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.member_id=?
@@ -426,6 +436,24 @@ export function createStore(directory) {
       member,
       member,
     );
+    if (viewer) {
+      rows.push(
+        ...all(
+          `SELECT 'saved-preview:'||j.id AS id,j.id AS jobId,'assistant' AS role,v.title AS text,
+         v.dismissed_at AS createdAt,'saved-preview' AS kind,3 AS position,v.rowid AS sequence,
+         NULL AS eventKey,NULL AS prNumber,NULL AS authorName,NULL AS authorRole
+         FROM preview_visibility v JOIN jobs j ON j.id=v.job_id WHERE j.member_id=? AND v.user_id=?`,
+          member,
+          viewer,
+        ),
+      );
+      rows.sort(
+        (a, b) =>
+          a.createdAt - b.createdAt ||
+          a.position - b.position ||
+          a.sequence - b.sequence,
+      );
+    }
     const seen = new Set();
     return rows
       .filter((message) => {

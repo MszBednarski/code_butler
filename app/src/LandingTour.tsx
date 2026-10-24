@@ -1,6 +1,8 @@
 import { useState } from "react";
 
 import { horseDemoWebsite } from "./horse-demo";
+import Reactions from "./Reactions";
+import type { ReactionSummary, ReactionTarget } from "./Reactions";
 
 export default function LandingTour() {
   const [panel, setPanel] = useState(() =>
@@ -9,13 +11,53 @@ export default function LandingTour() {
         : "website",
     ),
     [person, setPerson] = useState("Maya"),
-    [draft, setDraft] = useState(false),
+    [draft, setDraft] = useState(true),
+    [dismissed, setDismissed] = useState(false),
+    [saved, setSaved] = useState(false),
     [published, setPublished] = useState(false),
     [preview, setPreview] = useState(false),
     [refresh, setRefresh] = useState(0),
-    [copied, setCopied] = useState(false);
+    [copied, setCopied] = useState(false),
+    [reactions, setReactions] = useState<ReactionSummary>({
+      "message:Maya": [
+        { emoji: "🔥", count: 2, reacted: false, names: ["Sam", "You (demo)"] },
+      ],
+      "message:Sam": [
+        { emoji: "👍", count: 1, reacted: false, names: ["Maya"] },
+      ],
+      "message:group": [
+        { emoji: "❤️", count: 2, reacted: false, names: ["Maya", "Sam"] },
+      ],
+      "preview:jumps": [
+        { emoji: "🎉", count: 2, reacted: false, names: ["Maya", "Sam"] },
+      ],
+    });
+  async function react(
+    type: ReactionTarget,
+    id: string,
+    emoji: string,
+    active: boolean,
+  ) {
+    setReactions((current) => {
+      const key = type + ":" + id;
+      const items = [...(current[key] || [])];
+      const previous = items.find((item) => item.emoji === emoji);
+      if (Boolean(previous?.reacted) === active) return current;
+      const count = (previous?.count || 0) + (active ? 1 : -1);
+      const names = (previous?.names || []).filter((name) => name !== "You");
+      if (active) names.push("You");
+      return {
+        ...current,
+        [key]: [
+          ...items.filter((item) => item.emoji !== emoji),
+          ...(count ? [{ emoji, count, reacted: active, names }] : []),
+        ],
+      };
+    });
+  }
   function requestChange() {
     setDraft(true);
+    setDismissed(false);
     setPreview(true);
     setPanel("website");
   }
@@ -47,7 +89,8 @@ export default function LandingTour() {
         {[
           ["website", "Website"],
           ["chat", "Team chats"],
-          ["invite", "Invite your team"],
+          ["group", "Group chat"],
+          ["invite", "Invite"],
         ].map(([value, label]) => (
           <button
             key={value}
@@ -73,7 +116,7 @@ export default function LandingTour() {
               <button
                 role="tab"
                 aria-selected={preview}
-                disabled={!draft}
+                disabled={!draft || dismissed}
                 onClick={() => setPreview(true)}
               >
                 Change preview
@@ -102,6 +145,16 @@ export default function LandingTour() {
             }
             sandbox="allow-scripts"
           />
+          {preview && (
+            <div className="tour-preview-reactions">
+              <Reactions
+                targetType="preview"
+                targetId="jumps"
+                summary={reactions}
+                onReact={react}
+              />
+            </div>
+          )}
           <div className="tour-next" aria-live="polite">
             {preview ? (
               <>
@@ -113,6 +166,7 @@ export default function LandingTour() {
                   className="button primary compact"
                   onClick={() => {
                     setPublished(true);
+                    setDraft(false);
                     setPreview(false);
                   }}
                 >
@@ -175,7 +229,7 @@ export default function LandingTour() {
             ))}
           </div>
           <p className="tour-chat-note">
-            Everyone gets a Butler. Everyone can follow along.
+            Follow your team’s agents. React to ideas before they go live.
           </p>
           <div className="tour-message tour-from-user">
             <small>{person}</small>
@@ -184,6 +238,12 @@ export default function LandingTour() {
                 ? "Can the horse jump colourful showjumping fences?"
                 : "Can we make this easy to use on a phone?"}
             </p>
+            <Reactions
+              targetType="message"
+              targetId={person}
+              summary={reactions}
+              onReact={react}
+            />
           </div>
           <div className="tour-message tour-from-butler">
             <small>✳ Butler</small>
@@ -200,10 +260,103 @@ export default function LandingTour() {
                 : "Making your changes · 12s"}
             </span>
           </div>
+          {draft && !dismissed && (
+            <article className="artifact-card tour-proposal">
+              <span className="small-label">PREVIEW READY · NOT PUBLISHED</span>
+              <strong>Add colourful jumps to Jump Club</strong>
+              <p>
+                Try it here. The team lead can approve a teammate’s preview too.
+              </p>
+              <div className="artifact-card-actions">
+                <button
+                  className="button primary compact"
+                  onClick={requestChange}
+                >
+                  Inspect preview →
+                </button>
+                <button
+                  className="text-button dismiss-preview"
+                  onClick={() => {
+                    setDismissed(true);
+                    setSaved(true);
+                    setPreview(false);
+                  }}
+                >
+                  Dismiss
+                </button>
+              </div>
+              <Reactions
+                targetType="preview"
+                targetId="jumps"
+                summary={reactions}
+                onReact={react}
+              />
+            </article>
+          )}
+          {saved && (
+            <article className="saved-preview-card tour-saved-preview">
+              <small className="small-label">
+                {dismissed
+                  ? "DISMISSED · SAVED HERE"
+                  : "PREVIEW IN CHAT HISTORY"}
+              </small>
+              <strong>Add colourful jumps to Jump Club</strong>
+              <p>Changed your mind? Your preview stays in chat history.</p>
+              {dismissed && (
+                <button
+                  className="button secondary compact"
+                  onClick={() => setDismissed(false)}
+                >
+                  Restore preview
+                </button>
+              )}
+            </article>
+          )}
           <div className="tour-chat-composer">
             <span>Sample conversation · no live AI is running.</span>
-            <button className="button primary compact" onClick={requestChange}>
-              {draft ? "View the sample preview" : "See the sample preview"} →
+            {!dismissed && (
+              <button className="text-button" onClick={requestChange}>
+                {draft ? "View the sample preview" : "See the sample preview"} →
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+      {panel === "group" && (
+        <div className="tour-chat-panel">
+          <p className="tour-chat-note">
+            A place for your people, alongside their agents.
+          </p>
+          <div className="tour-message tour-from-butler">
+            <small>Maya</small>
+            <p>The new jumps are in my preview. What do you think?</p>
+          </div>
+          <div className="tour-message tour-from-butler">
+            <small>Sam</small>
+            <p>Love them! Let’s try it on our phones before we make it live.</p>
+            <Reactions
+              targetType="message"
+              targetId="group"
+              summary={reactions}
+              onReact={react}
+            />
+          </div>
+          <div className="tour-message tour-from-user">
+            <small>You · team lead</small>
+            <p>
+              Looking good. I’ll inspect the preview and approve it for
+              everyone.
+            </p>
+          </div>
+          <div className="tour-chat-composer">
+            <span>
+              Sample group chat. Humans talking to humans; agents keep working.
+            </span>
+            <button
+              className="button primary compact"
+              onClick={() => setPanel("chat")}
+            >
+              See what the team is making →
             </button>
           </div>
         </div>

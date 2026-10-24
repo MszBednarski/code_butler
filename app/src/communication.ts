@@ -18,6 +18,8 @@ export function chatBubbles<T extends ChatMessage>(messages: T[]) {
     if (
       message.role === "assistant" &&
       last?.role === "assistant" &&
+      message.kind !== "saved-preview" &&
+      last.kind !== "saved-preview" &&
       last.jobId === message.jobId &&
       (!(last.kind === "agent" || message.kind === "agent") ||
         last.text.trim() === message.text.trim()) &&
