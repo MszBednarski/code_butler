@@ -92,7 +92,7 @@ export function installAuth(app, config, store, provider) {
       "github",
       config.githubClientId,
       "https://github.com/login/oauth/authorize",
-      "read:user repo",
+      "read:user",
     ),
   );
   app.get(
