@@ -89,6 +89,15 @@ export function createStore(directory) {
       "ALTER TABLE projects ADD COLUMN codex_ready INTEGER NOT NULL DEFAULT 0",
     );
   const get = (sql, ...args) => db.prepare(sql).get(...args);
+  if (
+    !db
+      .prepare("PRAGMA table_info(projects)")
+      .all()
+      .some((column) => column.name === "hosting_provider")
+  )
+    db.exec(
+      "ALTER TABLE projects ADD COLUMN hosting_provider TEXT NOT NULL DEFAULT 'railway'",
+    );
   const all = (sql, ...args) => db.prepare(sql).all(...args);
   const run = (sql, ...args) => db.prepare(sql).run(...args);
   const transaction = (fn) => {
@@ -173,7 +182,10 @@ export function createStore(directory) {
     run("DELETE FROM sessions WHERE user_id=?", userId);
     run("DELETE FROM oauth_states WHERE user_id=?", userId);
     run("DELETE FROM email_links WHERE user_id=?", userId);
-    run("UPDATE users SET recovery_hash=NULL,recovery_secret=NULL WHERE id=?", userId);
+    run(
+      "UPDATE users SET recovery_hash=NULL,recovery_secret=NULL WHERE id=?",
+      userId,
+    );
   }
   function mergeUsers(from, to) {
     if (!from || from === to) return;

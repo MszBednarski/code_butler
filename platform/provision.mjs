@@ -13,6 +13,7 @@ import path from "node:path";
 import { x as extract } from "tar";
 import { setTimeout as delay } from "node:timers/promises";
 import { now } from "./store.mjs";
+import { createBoatProvisioner } from "./boat-provision.mjs";
 
 const exec = promisify(execFile);
 const ENVIRONMENTS = "environments{edges{node{id name}}}";
@@ -41,6 +42,12 @@ export function createProvisioner(
 ) {
   let stopped = false,
     active = false;
+  const boat = createBoatProvisioner(config, store, provider, {
+    source,
+    markPublished,
+    pause,
+    isStopped: () => stopped,
+  });
   function resources(project) {
     return JSON.parse(
       store.get("SELECT resources FROM projects WHERE id=?", project.id)
@@ -334,6 +341,11 @@ export function createProvisioner(
     );
   }
   async function provision(project) {
+    if (project.hosting_provider === "boat") {
+      state(project, "repository");
+      await repo(project);
+      return boat.provision(project);
+    }
     if (!store.connection(project.owner_id, "railway"))
       throw new Error("Connect Railway to prepare this project.");
     if (!project.workspace_id) {
@@ -553,6 +565,8 @@ export function createProvisioner(
     }
   }
   async function deploy(project, payload) {
+    if (project.hosting_provider === "boat")
+      return boat.deploy(project, payload);
     const { sha, prNumber } = payload;
     if (!SHA.test(sha)) throw new Error("Invalid deployment revision.");
     const app = resources(project).app;
@@ -655,6 +669,8 @@ export function createProvisioner(
     }
   }
   async function cleanup(project, { prNumber }) {
+    if (project.hosting_provider === "boat")
+      return boat.cleanup(project, { prNumber });
     const preview = store.get(
       "SELECT * FROM previews WHERE project_id=? AND pr_number=?",
       project.id,
@@ -700,6 +716,7 @@ export function createProvisioner(
           await deploy(project, JSON.parse(task.payload));
         else if (task.kind === "cleanup")
           await cleanup(project, JSON.parse(task.payload));
+        else if (task.kind === "boat-wake") await boat.ensure(project);
         else throw new Error("Unknown background task");
         store.run(
           "UPDATE tasks SET state='done',error=NULL,updated_at=? WHERE id=?",

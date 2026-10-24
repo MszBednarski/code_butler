@@ -28,7 +28,7 @@ export function publicUser(user) {
     : null;
 }
 export function safeReturn(value) {
-  return typeof value === "string" && /^\/(?:p\/[a-f0-9-]{36})?$/.test(value)
+  return typeof value === "string" && /^\/(?:p\/[a-f0-9-]{36}|connect\/boat)?$/.test(value)
     ? value
     : "/";
 }

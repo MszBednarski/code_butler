@@ -11,5 +11,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 WORKDIR /srv
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY *.mjs *.json ./
+COPY *.mjs verdict.schema.json ./
 CMD ["node", "server.mjs"]

@@ -11,10 +11,12 @@ type User = {
 };
 type Session = {
   user: User | null;
-  connections: { github: boolean; railway: boolean };
+  connections: { github: boolean; railway: boolean; boat?: boolean };
+  hostingProvider?: "railway" | "boat";
   capabilities: {
     github: boolean;
     githubRepositories?: boolean;
+    boat?: boolean;
     railway: boolean;
     email: boolean;
   };
@@ -43,6 +45,7 @@ type Project = {
   repoUrl?: string;
   isOwner: boolean;
   codingReady: boolean;
+  hostingProvider?: "railway" | "boat";
   member: Member;
   members: Member[];
   ownMemberships: Member[];
@@ -473,6 +476,138 @@ function ProjectCards({ projects }: { projects: Summary[] }) {
     </section>
   );
 }
+type BoatConnectionState = {
+  state: string;
+  url?: string;
+  code?: string;
+  message?: string;
+};
+function BoatConnection({ onConnected }: { onConnected: () => Promise<void> }) {
+  const [connection, setConnection] = useState<BoatConnectionState>({
+      state: "loading",
+    }),
+    [error, setError] = useState(""),
+    [busy, setBusy] = useState(false);
+  const halted = useRef(false);
+  useEffect(() => {
+    let alive = true;
+    const check = () =>
+      halted.current
+        ? Promise.resolve()
+        : api<BoatConnectionState>("/api/auth/boat")
+            .then((value) => {
+              if (!alive) return;
+              setConnection(value);
+              setError("");
+              if (value.state === "connected") onConnected();
+            })
+            .catch((e) => {
+              if (alive) {
+                halted.current = true;
+                setConnection({ state: "signed_out" });
+                setError(e.message);
+              }
+            });
+    check();
+    const timer = setInterval(() => {
+      if (document.visibilityState === "visible") check();
+    }, 5000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [onConnected]);
+  async function start() {
+    halted.current = false;
+    setBusy(true);
+    setError("");
+    try {
+      setConnection(await api<BoatConnectionState>("/api/auth/boat", {}));
+    } catch (e) {
+      halted.current = true;
+      setConnection({ state: "signed_out" });
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="boat-connection">
+      {error && <Alert>{error}</Alert>}
+      {connection.state === "pending" && connection.url ? (
+        <>
+          <p>
+            Open Boat and sign in with your own account. Enter this Boat device
+            code when asked:
+          </p>
+          <div className="device-code">
+            <strong>{connection.code}</strong>
+          </div>
+          <a
+            className="button primary full"
+            href={connection.url}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Open Boat sign-in
+            <Icon name="external" size={17} />
+          </a>
+          <p className="quiet-note">
+            Return here afterward. This step updates automatically.
+          </p>
+        </>
+      ) : connection.state === "billing" && connection.url ? (
+        <>
+          <p>{connection.message}</p>
+          <a
+            className="button primary full"
+            href={connection.url}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Activate my Boat account
+            <Icon name="external" size={17} />
+          </a>
+          <p className="quiet-note">
+            Check Boat’s trial and payment terms before confirming. Return here
+            when activation is complete.
+          </p>
+        </>
+      ) : connection.state === "connected" ? (
+        <p className="inline-status">
+          <Spinner />
+          Your hosting is ready…
+        </p>
+      ) : connection.state === "loading" && !error ? (
+        <p className="inline-status">
+          <Spinner />
+          Checking your Boat account…
+        </p>
+      ) : (
+        <>
+          <p>
+            Sign in to Boat, then Butler will create your team’s workspace. No
+            API key to copy.
+          </p>
+          <button
+            className="button primary full"
+            disabled={busy}
+            onClick={start}
+          >
+            {busy ? <Spinner /> : <Icon name="link" />}
+            {busy
+              ? "Preparing sign-in…"
+              : connection.state === "expired" || error
+                ? "Try Boat sign-in again"
+                : "Continue with Boat"}
+            <Icon name="arrow" size={18} />
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
 function Dashboard({
   session,
   refresh,
@@ -505,6 +640,7 @@ function Dashboard({
     sessionStorage.setItem("butler-create-key", key);
     return key;
   });
+  const useBoat = session.hostingProvider === "boat";
   const workspaceKey = `butler-hosting-${session.user!.id}`;
   useEffect(() => {
     let alive = true;
@@ -528,7 +664,7 @@ function Dashboard({
     localStorage.setItem("butler-project-idea", description);
   }, [description]);
   useEffect(() => {
-    if (!session.connections.railway) return;
+    if (useBoat || !session.connections.railway) return;
     let alive = true;
     setHostingLoaded(false);
     setHostingFailed(false);
@@ -558,16 +694,20 @@ function Dashboard({
     return () => {
       alive = false;
     };
-  }, [session.connections.railway, workspaceKey, hostingAttempt]);
+  }, [useBoat, session.connections.railway, workspaceKey, hostingAttempt]);
   const memberOnly =
     projects.length > 0 &&
     (!session.user?.githubLogin || projects.every((p) => p.isOwner === false));
   const step =
     !session.user?.githubLogin || !session.connections.github
       ? 0
-      : !session.connections.railway || !hostingLoaded || !hostingConfirmed
-        ? 1
-        : 2;
+      : useBoat
+        ? !session.connections.boat
+          ? 1
+          : 2
+        : !session.connections.railway || !hostingLoaded || !hostingConfirmed
+          ? 1
+          : 2;
   const githubAvailable = session.user?.githubLogin
     ? session.capabilities.githubRepositories
     : session.capabilities.github;
@@ -583,7 +723,7 @@ function Dashboard({
           "Our next idea",
         description,
         requestKey: createKey,
-        workspaceId: workspace,
+        workspaceId: useBoat ? undefined : workspace,
       });
       localStorage.removeItem("butler-project-idea");
       sessionStorage.removeItem("butler-create-key");
@@ -655,7 +795,7 @@ function Dashboard({
             {step === 0
               ? "Let Butler create and save your project for you."
               : step === 1
-                ? "Butler uses your Railway account to host your app and your team’s agents."
+                ? `Butler uses your ${useBoat ? "Boat" : "Railway"} account to host your app and your team’s agents.`
                 : "Describe the idea in your own words. Butler will set everything up."}
           </p>
           {(error || authError) && <Alert>{error || authError}</Alert>}
@@ -694,7 +834,16 @@ function Dashboard({
               </p>
             </section>
           )}
-          {step === 1 && (
+          {step === 1 && useBoat && (
+            <section className="create-card onboarding-card">
+              <span className="round-icon">
+                <Icon name="grid" />
+              </span>
+              <h2>Let Butler prepare your workspace.</h2>
+              <BoatConnection onConnected={refresh} />
+            </section>
+          )}
+          {step === 1 && !useBoat && (
             <section className="create-card onboarding-card">
               <span className="round-icon">
                 <Icon name="railway" />
@@ -808,9 +957,7 @@ function Dashboard({
               </p>
             </form>
           )}
-          {step === 2 && projects.length > 0 && (
-            <ProjectCards projects={projects} />
-          )}
+          {projects.length > 0 && <ProjectCards projects={projects} />}
         </main>
       )}
       {memberSaving && projects.length > 0 && (
@@ -1275,6 +1422,20 @@ function Workspace({
     }
   }, [projectId, memberId]);
   const connected = useCallback(() => setCodexReady(true), []);
+  useEffect(() => {
+    if (project?.hostingProvider !== "boat") return;
+    const wake = () => {
+      if (document.visibilityState === "visible")
+        api(`/api/projects/${projectId}/wake`, {}).catch(() => {});
+    };
+    wake();
+    const timer = setInterval(wake, 60000);
+    window.addEventListener("focus", wake);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", wake);
+    };
+  }, [project?.hostingProvider, projectId]);
   useEffect(() => {
     refresh();
     const timer = setInterval(() => {
@@ -2220,6 +2381,10 @@ function App() {
       setLoaded(true);
     }
   }, []);
+  const boatConnected = useCallback(async () => {
+    await refresh();
+    navigate("/", true);
+  }, [refresh]);
   useEffect(() => {
     const value = new URLSearchParams(location.search).get("auth_error");
     if (value) {
@@ -2257,6 +2422,36 @@ function App() {
       <div className="loading-page">
         <Brand />
         <Spinner />
+      </div>
+    );
+  if (route === "/connect/boat")
+    return (
+      <div className="dashboard">
+        <header className="site-header">
+          <Brand />
+        </header>
+        <main className="dashboard-main onboarding-main">
+          <div className="eyebrow">BOAT HOSTING PILOT</div>
+          <h1>A new home for your team.</h1>
+          <p className="page-description">
+            Try Boat for new projects. Your existing projects stay where they
+            are.
+          </p>
+          <section className="create-card onboarding-card">
+            {(error || authError) && <Alert>{error || authError}</Alert>}
+            {session.user?.githubLogin ? (
+              <BoatConnection onConnected={boatConnected} />
+            ) : (
+              <a
+                className="button primary full"
+                href="/auth/github?returnTo=%2Fconnect%2Fboat"
+              >
+                Continue with GitHub
+                <Icon name="arrow" size={18} />
+              </a>
+            )}
+          </section>
+        </main>
       </div>
     );
   return session.user ? (

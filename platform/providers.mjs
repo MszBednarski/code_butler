@@ -1,4 +1,5 @@
 import { createGithubAccess } from "./github-app.mjs";
+import { createBoat } from "./boat.mjs";
 export class ProviderError extends Error {
   constructor(provider, status, message) {
     super(`${provider}: ${message}`);
@@ -96,5 +97,12 @@ export function providers(config, store, { fetch: request = fetch } = {}) {
       );
     return response.json();
   }
-  return { ...githubAccess, railway, railwayToken, worker, request };
+  return {
+    ...githubAccess,
+    ...createBoat(config, store, request),
+    railway,
+    railwayToken,
+    worker,
+    request,
+  };
 }

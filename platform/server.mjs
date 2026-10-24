@@ -240,6 +240,16 @@ export function createPlatform(
     req.project.owner_id === req.account.id
       ? next()
       : res.status(403).json({ error: "Only the project lead can do that." });
+  const boatConnected = (user) => {
+    const saved = user && store.connection(user.id, "boat");
+    return Boolean(
+      saved?.access_token &&
+      saved.environmentId &&
+      Date.parse(saved.expiresAt) > now(),
+    );
+  };
+  const hostingFor = (user) =>
+    boatConnected(user) ? "boat" : config.defaultHostingProvider || "railway";
   app.get("/api/session", (req, res) => {
     const github =
       req.account && store.connection(req.account.id, "github_installation");
@@ -250,6 +260,7 @@ export function createPlatform(
         railway: Boolean(
           req.account && store.connection(req.account.id, "railway"),
         ),
+        boat: boatConnected(req.account),
       },
       capabilities: {
         github: Boolean(
@@ -257,9 +268,11 @@ export function createPlatform(
         ),
         githubRepositories: githubAppReady(config),
         railway: Boolean(config.railwayClientId && config.railwayClientSecret),
+        boat: true,
         email: Boolean(config.emailKey && config.emailFrom),
       },
       commit: config.commit,
+      hostingProvider: hostingFor(req.account),
     });
   });
   app.get("/api/projects", signed, (req, res) =>
@@ -273,6 +286,21 @@ export function createPlatform(
         .map((project) => ({ ...project, isOwner: Boolean(project.isOwner) })),
     }),
   );
+  const verifiedLead = (req, res, next) =>
+    req.account.github_id
+      ? next()
+      : res
+          .status(403)
+          .json({ error: "Sign in with GitHub before connecting hosting." });
+  app.get("/api/auth/boat", signed, verifiedLead, async (req, res) =>
+    res.json(await provider.boatAuth.status(req.account.id)),
+  );
+  app.post("/api/auth/boat", signed, verifiedLead, async (req, res) =>
+    res.json(await provider.boatAuth.start(req.account.id)),
+  );
+  app.post("/api/auth/boat/billing", signed, verifiedLead, async (req, res) =>
+    res.json(await provider.boatAuth.billing(req.account.id)),
+  );
   app.get("/api/railway/workspaces", signed, async (req, res) =>
     res.json(
       (await provider.railway(req.account.id, "query{me{workspaces{id name}}}"))
@@ -280,15 +308,16 @@ export function createPlatform(
     ),
   );
   app.post("/api/projects", signed, (req, res) => {
+    const hosting = hostingFor(req.account);
     if (
       !req.account.github_id ||
       !githubAppReady(config) ||
       !store.connection(req.account.id, "github_installation") ||
-      !store.connection(req.account.id, "railway")
+      !store.connection(req.account.id, hosting)
     )
-      return res
-        .status(409)
-        .json({ error: "Connect GitHub and Railway first." });
+      return res.status(409).json({
+        error: `Connect GitHub and ${hosting === "boat" ? "Boat" : "Railway"} first.`,
+      });
     const b = req.body || {};
     if (
       !name(b.name) ||
@@ -319,7 +348,7 @@ export function createPlatform(
     }-${projectId.slice(0, 8)}`;
     store.transaction(() => {
       store.run(
-        `INSERT INTO projects(id,owner_id,name,description,slug,invite_hash,invite_secret,worker_secret,worker_hash,webhook_secret,workspace_id,create_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO projects(id,owner_id,name,description,slug,invite_hash,invite_secret,worker_secret,worker_hash,webhook_secret,workspace_id,create_key,created_at,hosting_provider) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         projectId,
         req.account.id,
         b.name.trim(),
@@ -333,6 +362,7 @@ export function createPlatform(
         uuid(b.workspaceId) ? b.workspaceId : null,
         b.requestKey,
         now(),
+        hosting,
       );
       store.run(
         "INSERT INTO members(id,project_id,user_id,name,prefix,role,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -449,6 +479,7 @@ export function createPlatform(
       repoUrl: p.repo ? `https://github.com/${p.repo}` : null,
       isOwner: p.owner_id === req.account.id,
       codingReady: Boolean(p.codex_ready),
+      hostingProvider: p.hosting_provider,
       member: memberView(req.member),
       members: store.all(
         "SELECT id,name,prefix,role FROM members WHERE project_id=? ORDER BY created_at",
@@ -480,6 +511,15 @@ export function createPlatform(
             )
           : [],
     });
+  });
+  app.post("/api/projects/:projectId/wake", signed, membership, (req, res) => {
+    if (req.project.hosting_provider === "boat")
+      store.enqueue(
+        req.project.id,
+        "boat-wake",
+        `boat-wake:${req.project.id}:${Math.floor(now() / 60000)}`,
+      );
+    res.json({ ok: true });
   });
   app.get(
     "/api/projects/:projectId/invite",
@@ -654,11 +694,14 @@ if (process.argv[1] && import.meta.filename === path.resolve(process.argv[1])) {
     platform = createPlatform(config);
   const retire = async () => {
     const legacy = await retireLegacyGithub(config, platform.store);
+    await platform.provider.boatAuth?.retire();
     console.log(
       `[github] Legacy grants revoked: ${legacy.revoked}; quarantined pending revocation: ${legacy.pending}`,
     );
   };
-  await retire();
+  retire().catch(() =>
+    console.error("[github] Legacy grant cleanup will retry."),
+  );
   const retireTimer = setInterval(
     () =>
       retire().catch(() =>

@@ -48,6 +48,9 @@ export function configuration(env = process.env) {
     emailFrom: env.EMAIL_FROM,
     githubApi: "https://api.github.com",
     railwayApi: "https://backboard.railway.app/graphql/v2",
+    boatOrigin: "https://boat.dev",
+    defaultHostingProvider:
+      env.DEFAULT_HOSTING_PROVIDER === "boat" ? "boat" : "railway",
     commit: env.RAILWAY_GIT_COMMIT_SHA || "dev",
   };
 }

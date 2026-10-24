@@ -4,6 +4,8 @@ The product direction and acceptance demo are tracked in [issue #9](https://gith
 
 Pocket Butler gives a lead one place to connect GitHub, Railway and an existing Codex subscription. Teammates open an invitation, choose a name and start asking for website changes. They need no provider accounts or repository permissions.
 
+An optional [Boat hosting pilot](BOAT.md) is available for new projects through `/connect/boat`. It preserves existing Railway projects and is not the global default until real-account acceptance passes.
+
 ## Run the new platform
 
 Build from the repository root:
