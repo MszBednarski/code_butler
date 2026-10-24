@@ -130,7 +130,7 @@ function workerCall(f, project, path, body) {
     headers: {
       authorization: `Bearer ${f.store.open(project.worker_secret)}`,
       "x-butler-project": project.id,
-      "x-butler-protocol": "2",
+      "x-butler-protocol": "3",
       "content-type": "application/json",
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -858,6 +858,181 @@ test("group chat persists human messages for the project without creating agent 
   reopened.close();
 });
 
+test("follow-ups reuse one draft and preview, retain reactions, and reject stale worker results or inspection", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    inv = await f.invite(p.id),
+    alice = await f.join(inv.url, "Alice");
+  f.store.run(
+    "UPDATE projects SET state='ready',repo='lead/site' WHERE id=?",
+    p.id,
+  );
+  f.store.run("UPDATE jobs SET state='unchanged' WHERE project_id=?", p.id);
+  const project = f.store.get("SELECT * FROM projects WHERE id=?", p.id),
+    receipts = [];
+  const send = async (text) => {
+    const request = { text, requestKey: id() };
+    receipts.push(request);
+    return (
+      await (
+        await f.call(`/api/projects/${p.id}/messages`, request, alice)
+      ).json()
+    ).jobId;
+  };
+  const jobId = await send("Add sound effects");
+  assert.equal(await send("Enable sound by default"), jobId);
+  let job = f.store.get("SELECT * FROM jobs WHERE id=?", jobId);
+  assert.match(job.text, /Add sound effects/);
+  assert.match(job.text, /Enable sound by default/);
+  const before = job.request_revision;
+  assert.equal(
+    (
+      await (
+        await f.call(`/api/projects/${p.id}/messages`, receipts[0], alice)
+      ).json()
+    ).jobId,
+    jobId,
+  );
+  assert.equal(
+    f.store.get("SELECT request_revision FROM jobs WHERE id=?", jobId)
+      .request_revision,
+    before,
+  );
+  const oldClaim = await f.call("/api/worker/claim", {}, "", {
+    authorization: `Bearer ${f.store.open(project.worker_secret)}`,
+    "x-butler-project": p.id,
+    "x-butler-protocol": "2",
+  });
+  assert.equal(
+    (await oldClaim.json()).job,
+    null,
+    "Old workers cannot replay a saved result as a follow-up",
+  );
+  let claimed = (await (await workerCall(f, project, "/claim", {})).json()).job;
+  assert.equal(claimed.id, jobId);
+  assert.equal(await send("And add vibration"), jobId);
+  const result = (revision, sha) =>
+    workerCall(f, project, `/jobs/${jobId}/result`, {
+      revision,
+      state: "building_preview",
+      text: "Updated sound and vibration.",
+      sha,
+      branch: claimed.member.prefix + "/draft",
+      title: "Enable sound and vibration",
+      description: "Default sound and vibration on.",
+    });
+  assert.equal(
+    (await result(claimed.request_revision, "a".repeat(40))).status,
+    200,
+  );
+  job = f.store.get("SELECT * FROM jobs WHERE id=?", jobId);
+  assert.equal(job.state, "queued");
+  assert.match(job.text, /add vibration/i);
+  assert.equal(
+    f.store.get(
+      "SELECT COUNT(*) AS n FROM tasks WHERE project_id=? AND kind='artifact'",
+      p.id,
+    ).n,
+    0,
+    "Don't build an outdated intermediate preview",
+  );
+  assert.equal(
+    (await result(claimed.request_revision, "a".repeat(40))).status,
+    409,
+  );
+  claimed = (await (await workerCall(f, project, "/claim", {})).json()).job;
+  assert.equal(
+    (await result(claimed.request_revision, "b".repeat(40))).status,
+    200,
+  );
+  assert.equal(
+    await send("Make vibration gentler"),
+    jobId,
+    "A follow-up during preview building stays on this draft",
+  );
+  assert.ok(f.store.resumeFollowups(jobId));
+  claimed = (await (await workerCall(f, project, "/claim", {})).json()).job;
+  assert.equal(
+    (await result(claimed.request_revision, "c".repeat(40))).status,
+    200,
+  );
+  f.store.run(
+    "UPDATE jobs SET state='awaiting_approval',artifact_url='https://preview.example.test',artifact_number=-12,artifact_ready_at=? WHERE id=?",
+    now(),
+    jobId,
+  );
+  const base = `/api/projects/${p.id}/jobs/${jobId}`;
+  assert.equal(
+    (await f.call(base + "/inspect", { sha: "c".repeat(40) }, alice)).status,
+    200,
+  );
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${p.id}/reactions`,
+        { targetType: "preview", targetId: jobId, emoji: "🔥", active: true },
+        alice,
+      )
+    ).status,
+    200,
+  );
+  assert.equal(await send("Keep sound optional after all"), jobId);
+  assert.equal(
+    (await f.call(base + "/approve", { sha: "c".repeat(40) }, alice)).status,
+    409,
+  );
+  assert.equal(
+    f.store.get(
+      "SELECT COUNT(*) AS n FROM preview_inspections WHERE job_id=?",
+      jobId,
+    ).n,
+    0,
+  );
+  assert.equal(
+    f.store.get("SELECT artifact_number FROM jobs WHERE id=?", jobId)
+      .artifact_number,
+    -12,
+  );
+  claimed = (await (await workerCall(f, project, "/claim", {})).json()).job;
+  assert.equal(
+    (await result(claimed.request_revision, "d".repeat(40))).status,
+    200,
+  );
+  f.store.run(
+    "UPDATE jobs SET state='awaiting_approval',artifact_ready_at=? WHERE id=?",
+    now(),
+    jobId,
+  );
+  const data = await (
+    await f.call(`/api/projects/${p.id}`, undefined, alice)
+  ).json();
+  assert.equal(data.jobs.length, 1);
+  assert.equal(data.reactions["preview:" + jobId][0].count, 1);
+  assert.equal(
+    data.messages.filter((m) => m.role === "user").length,
+    receipts.length,
+  );
+  assert.equal(
+    (await f.call(base + "/inspect", { sha: "d".repeat(40) }, alice)).status,
+    200,
+  );
+  assert.equal(
+    (await f.call(base + "/approve", { sha: "d".repeat(40) }, alice)).status,
+    202,
+  );
+  assert.equal(
+    (await f.call(base + "/approve", { sha: "d".repeat(40) }, alice)).status,
+    200,
+  );
+  assert.equal(
+    f.store.get(
+      "SELECT COUNT(*) AS n FROM tasks WHERE project_id=? AND kind='open-pr'",
+      p.id,
+    ).n,
+    1,
+  );
+});
+
 test("the lead can steer a teammate and approve their preview after personally inspecting it", async (t) => {
   const f = await fixture(t),
     p = await f.create(),
@@ -876,8 +1051,8 @@ test("the lead can steer a teammate and approve their preview after personally i
       alice,
     )
   ).json();
-  const job = f.store.get("SELECT * FROM jobs WHERE id=?", sent.jobId),
-    sha = "a".repeat(40);
+  const job = f.store.get("SELECT * FROM jobs WHERE id=?", sent.jobId);
+  let sha = "a".repeat(40);
   f.store.run(
     "UPDATE jobs SET state='awaiting_approval',change_sha=?,branch='alice/draft',pr_title='Make a race',pr_body='Add racing.',artifact_url='https://preview.example.test',artifact_ready_at=? WHERE id=?",
     sha,
@@ -922,7 +1097,8 @@ test("the lead can steer a teammate and approve their preview after personally i
     await f.call(`/api/projects/${p.id}`, undefined, alice)
   ).json();
   const leadMessage = messages.messages.find(
-    (m) => m.jobId === steered.jobId && m.role === "user",
+    (m) =>
+      m.jobId === steered.jobId && m.role === "user" && m.authorRole === "lead",
   );
   assert.equal(leadMessage.text, instruction.text);
   assert.equal(leadMessage.authorName, "Test Lead");
@@ -934,6 +1110,27 @@ test("the lead can steer a teammate and approve their preview after personally i
     job.member_id,
     "Steering keeps the teammate's agent and worktree",
   );
+  sha = "c".repeat(40);
+  assert.equal(
+    (
+      await workerCall(f, project, `/jobs/${job.id}/result`, {
+        revision: claimed.job.request_revision,
+        state: "building_preview",
+        text: "Clearer countdown ready.",
+        branch: claimed.job.member.prefix + "/draft",
+        sha,
+        title: "Make the countdown clearer",
+        description: "Clarify the countdown.",
+      })
+    ).status,
+    200,
+  );
+  f.store.run(
+    "UPDATE jobs SET state='awaiting_approval',artifact_ready_at=? WHERE id=?",
+    now(),
+    job.id,
+  );
+
   assert.equal((await f.call(base + "/inspect", { sha }, bob)).status, 404);
   assert.equal((await f.call(base + "/approve", { sha }, bob)).status, 404);
   assert.equal(
@@ -1570,7 +1767,7 @@ test("Codex connection and worker requests require the right project and role; a
   const workerHeaders = {
     authorization: `Bearer ${secret}`,
     "x-butler-project": p.id,
-    "x-butler-protocol": "2",
+    "x-butler-protocol": "3",
   };
   assert.equal(
     (

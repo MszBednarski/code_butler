@@ -752,7 +752,7 @@ export function createProvisioner(
       await markPublished(project, sha);
     }
   }
-  async function artifact(project, { jobId, sha }) {
+  async function artifact(project, { jobId, sha, revision = 0 }) {
     const job = store.get(
       "SELECT *,rowid AS rowNumber FROM jobs WHERE id=? AND project_id=?",
       jobId,
@@ -760,6 +760,7 @@ export function createProvisioner(
     );
     if (
       !job ||
+      job.request_revision !== revision ||
       job.change_sha !== sha ||
       !["building_preview", "preview_failed"].includes(job.state)
     )
@@ -782,6 +783,16 @@ export function createProvisioner(
     );
     if (preview?.state !== "ready" || preview.commit_sha !== sha)
       throw new Error("The artifact preview did not finish.");
+    const current = store.get(
+      "SELECT request_revision,state FROM jobs WHERE id=?",
+      job.id,
+    );
+    if (
+      current.request_revision !== revision ||
+      !["building_preview", "preview_failed"].includes(current.state)
+    )
+      return;
+    if (store.resumeFollowups(job.id)) return;
     store.run(
       "UPDATE jobs SET state='awaiting_approval',artifact_url=?,artifact_ready_at=?,error=NULL,updated_at=? WHERE id=? AND change_sha=?",
       preview.url,
@@ -957,6 +968,20 @@ export function createProvisioner(
         );
       } catch (error) {
         const message = error.message.slice(0, 350);
+        if (
+          task.kind === "artifact" &&
+          /The Boat build stopped before it passed/.test(message)
+        ) {
+          const payload = JSON.parse(task.payload);
+          if (store.resumeFollowups(payload.jobId)) {
+            store.run(
+              "UPDATE tasks SET state='done',error=NULL,updated_at=? WHERE id=?",
+              now(),
+              task.id,
+            );
+            return;
+          }
+        }
         if (error.code === "worker_busy") {
           store.run(
             "UPDATE tasks SET state='queued',available_at=?,updated_at=? WHERE id=?",

@@ -323,6 +323,46 @@ test("real git transport and app builds carry a teammate request through PR revi
     now(),
     job.id,
   );
+  const followup = await (
+    await call(
+      `/api/projects/${projectId}/messages`,
+      {
+        text: "Keep this preview but make the heading the default",
+        requestKey: id(),
+      },
+      memberCookie,
+    )
+  ).json();
+  assert.equal(followup.jobId, job.id);
+  await agent.codeOne();
+  const updated = store.get("SELECT * FROM jobs WHERE id=?", job.id);
+  assert.equal(updated.state, "building_preview");
+  assert.equal(
+    updated.branch,
+    job.branch,
+    "A follow-up updates the existing draft branch",
+  );
+  assert.equal(
+    updated.artifact_number,
+    -1,
+    "A follow-up retains the preview URL and hosting port",
+  );
+  assert.equal(updated.request_revision, 1);
+  assert.equal(
+    store.get("SELECT COUNT(*) AS n FROM jobs WHERE member_id=?", job.member_id)
+      .n,
+    1,
+  );
+  assert.equal(
+    pr,
+    null,
+    "Refining an unpublished preview never creates another PR",
+  );
+  store.run(
+    "UPDATE jobs SET state='awaiting_approval',artifact_ready_at=? WHERE id=?",
+    now(),
+    job.id,
+  );
   const approvalUrl = `/api/projects/${projectId}/jobs/${job.id}`;
   assert.equal(
     (
@@ -473,7 +513,9 @@ test("real git transport and app builds carry a teammate request through PR revi
     .trim()
     .split("\n")
     .map(JSON.parse);
-  assert.equal(invocations.length, 2);
-  assert.ok(invocations[1].includes("resume"));
-  assert.ok(invocations[1].includes(member.thread_id));
+  assert.equal(invocations.length, 3);
+  for (const invocation of invocations.slice(1)) {
+    assert.ok(invocation.includes("resume"));
+    assert.ok(invocation.includes(member.thread_id));
+  }
 });

@@ -798,33 +798,13 @@ export function createPlatform(
           });
         return approveJob(req, res, job, job.change_sha);
       }
-      const jobId = store.transaction(() => {
-        const existing = store.get(
-          "SELECT id FROM jobs WHERE member_id=? AND request_key=?",
-          chat.id,
-          req.body.requestKey,
-        );
-        if (existing) return existing.id;
-        const value = id();
-        store.run(
-          "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at,approval_required) VALUES(?,?,?,?,?,?,?,1)",
-          value,
-          req.project.id,
-          chat.id,
-          req.body.requestKey,
-          text.trim(),
-          now(),
-          now(),
-        );
-        store.humanMessage(
-          req.project.id,
-          chat.id,
-          value,
-          req.account,
-          text.trim(),
-        );
-        return value;
-      });
+      const jobId = store.requestChange(
+        req.project.id,
+        chat,
+        req.account,
+        text.trim(),
+        req.body.requestKey,
+      );
       res.status(202).json({ jobId });
     },
   );
@@ -882,6 +862,17 @@ export function createPlatform(
         error: "The preview changed. Inspect the latest version first.",
       });
     if (job.approved_at) return res.json({ ok: true, jobId: job.id });
+    if (
+      store.get(
+        "SELECT 1 FROM jobs WHERE member_id=? AND request_key NOT LIKE 'review-fix:%' AND created_at>? LIMIT 1",
+        job.member_id,
+        job.created_at,
+      )
+    )
+      return res.status(409).json({
+        error:
+          "This preview has been updated. Inspect the latest version in this chat.",
+      });
     if (
       job.state !== "awaiting_approval" ||
       !store.get(

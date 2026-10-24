@@ -66,7 +66,10 @@ export function installWorkerApi(app, config, store, provider) {
       job:
         req.project.state === "ready"
           ? store.claimJob(req.project.id, {
-              supportsApproval: req.headers["x-butler-protocol"] === "2",
+              supportsApproval: ["2", "3"].includes(
+                req.headers["x-butler-protocol"],
+              ),
+              supportsRevisions: req.headers["x-butler-protocol"] === "3",
             })
           : null,
     }),
@@ -195,6 +198,11 @@ export function installWorkerApi(app, config, store, provider) {
       req.project.id,
     );
     if (!job) return res.status(404).json({ error: "Unknown request." });
+    if ((req.body?.revision || 0) !== job.request_revision)
+      return res.status(409).json({
+        error:
+          "This preview has a newer follow-up. The saved result is out of date.",
+      });
     if (
       !["reviewing", "unchanged", "failed", "building_preview"].includes(
         req.body?.state,
@@ -270,12 +278,28 @@ export function installWorkerApi(app, config, store, provider) {
           req.body.description,
           job.id,
         );
-        store.enqueue(
-          req.project.id,
-          "artifact",
-          `artifact:${job.id}:${req.body.sha}`,
-          { jobId: job.id, sha: req.body.sha },
-        );
+        if (!job.pending_text)
+          store.enqueue(
+            req.project.id,
+            "artifact",
+            `artifact:${job.id}:${req.body.sha}`,
+            {
+              jobId: job.id,
+              sha: req.body.sha,
+              revision: job.request_revision,
+            },
+            true,
+          );
+        if (!job.pending_text)
+          store.run(
+            "UPDATE tasks SET payload=? WHERE dedupe_key=?",
+            JSON.stringify({
+              jobId: job.id,
+              sha: req.body.sha,
+              revision: job.request_revision,
+            }),
+            `artifact:${job.id}:${req.body.sha}`,
+          );
       }
       if (branch)
         store.run(
@@ -292,23 +316,12 @@ export function installWorkerApi(app, config, store, provider) {
         last?.text && req.body.text.startsWith(last.text)
           ? req.body.text.slice(last.text.length).trim()
           : req.body.text;
-      if (
-        text &&
-        !store.get(
-          "SELECT id FROM messages WHERE job_id=? AND role=?",
+      if (text)
+        store.recordEvent(
           job.id,
-          "assistant",
-        )
-      )
-        store.run(
-          "INSERT INTO messages VALUES(?,?,?,?,?,?,?)",
-          id(),
-          req.project.id,
-          job.member_id,
-          job.id,
-          "assistant",
+          `result:${job.request_revision}`,
+          "message",
           text,
-          now(),
         );
       if (pr && SHA.test(req.body.sha || ""))
         store.enqueue(
@@ -317,6 +330,7 @@ export function installWorkerApi(app, config, store, provider) {
           `preview:${req.project.id}:${pr}:${req.body.sha}`,
           { prNumber: pr, sha: req.body.sha },
         );
+      store.resumeFollowups(job.id);
     });
     res.json({ ok: true });
   });

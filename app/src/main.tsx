@@ -1549,6 +1549,7 @@ const jobLabel: Record<string, string> = {
   preview_failed: "Preview couldn’t load",
   publish_failed: "Website hasn’t updated",
   needs_attention: "Changes need more work",
+  superseded: "Updated in a newer preview",
 };
 function elapsed(start: number, end: number) {
   const seconds = Math.max(0, Math.floor((end - start) / 1000));
@@ -1974,6 +1975,28 @@ function Workspace({
     (shownArtifact?.memberId === project.member.id || project.isOwner) &&
     shownArtifact?.state === "awaiting_approval";
   const latestPreview = project.jobs.filter((job) => jobPreviewUrl(job)).at(-1);
+  const latestHumanRequest = project.jobs
+    .filter((job) => !job.requestKey?.startsWith("review-fix:"))
+    .at(-1);
+  const currentUnpublished =
+    latestHumanRequest &&
+    !latestHumanRequest.approvedAt &&
+    !latestHumanRequest.prUrl &&
+    [
+      "queued",
+      "working",
+      "building_preview",
+      "awaiting_approval",
+      "preview_failed",
+      "failed",
+    ].includes(latestHumanRequest.state)
+      ? latestHumanRequest
+      : undefined;
+  const lastRequestByJob = new Map(
+    project.messages
+      .filter((message) => message.role === "user")
+      .map((message) => [message.jobId, message.id]),
+  );
   const websiteUrl = shownArtifact
     ? jobPreviewUrl(shownArtifact)
     : project.appUrl;
@@ -2271,7 +2294,10 @@ function Workspace({
               <iframe
                 key={
                   shownArtifact
-                    ? shownArtifact.id + shownArtifact.changeSha + frameReload
+                    ? shownArtifact.id +
+                      shownArtifact.changeSha +
+                      (shownArtifact.artifactReadyAt || 0) +
+                      frameReload
                     : previewVersion + frameReload
                 }
                 src={
@@ -2535,9 +2561,11 @@ function Workspace({
                         diagnostics={message.diagnostics}
                       />
                     )}
-                    {message.role === "user" && job && (
-                      <JobState job={job} clock={clock} />
-                    )}
+                    {message.role === "user" &&
+                      job &&
+                      lastRequestByJob.get(message.jobId) === message.id && (
+                        <JobState job={job} clock={clock} />
+                      )}
                     <Reactions
                       targetType="message"
                       targetId={message.id}
@@ -2609,7 +2637,13 @@ function Workspace({
                 </div>
               )}
             {project.jobs
-              .filter((j) => j.state === "awaiting_approval" && j.artifactUrl)
+              .filter(
+                (j) =>
+                  j.state === "awaiting_approval" &&
+                  j.artifactUrl &&
+                  j.id === currentUnpublished?.id,
+              )
+              .slice(-1)
               .map((job) => (
                 <article className="artifact-card" key={job.id}>
                   <span className="small-label">

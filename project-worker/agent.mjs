@@ -37,7 +37,7 @@ export function createAgent({
       headers: {
         Authorization: `Bearer ${secret}`,
         "X-Butler-Project": projectId,
-        "X-Butler-Protocol": "2",
+        "X-Butler-Protocol": "3",
         "Content-Type": "application/json",
       },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -213,6 +213,15 @@ export function createAgent({
     if (workspace.code !== 0)
       await git(["worktree", "add", "--detach", cwd, "origin/main"]);
     let recovery = await load(file);
+    if ((recovery.requestRevision || 0) !== (job.request_revision || 0)) {
+      recovery = {
+        branch: recovery.branch || job.branch,
+        threadId: recovery.threadId || member.thread_id,
+        phase: "started",
+        requestRevision: job.request_revision,
+      };
+      await save(file, recovery);
+    }
     let branch = recovery.branch;
     if (!branch) {
       const dirty = (await git(["status", "--porcelain"], cwd)).stdout.trim();
@@ -267,7 +276,11 @@ export function createAgent({
         branch = `${member.prefix}/task-${job.id.slice(0, 8)}`;
         await git(["switch", "-c", branch, "origin/main"], cwd);
       }
-      recovery = { branch, phase: "started" };
+      recovery = {
+        branch,
+        phase: "started",
+        requestRevision: job.request_revision || 0,
+      };
       await save(file, recovery);
     }
     if ((await git(["branch", "--show-current"], cwd)).stdout.trim() !== branch)
@@ -427,6 +440,7 @@ export function createAgent({
       ).code === 0
     ) {
       await api(`/jobs/${job.id}/result`, {
+        revision: job.request_revision || 0,
         state: "unchanged",
         threadId: recovery.threadId,
         text: final || "The website already matches this request.",
@@ -441,6 +455,7 @@ export function createAgent({
     await save(file, recovery);
     if (job.approval_required) {
       await api(`/jobs/${job.id}/result`, {
+        revision: job.request_revision || 0,
         state: "building_preview",
         threadId: recovery.threadId,
         text: `${final}\n\nI’m building your preview. Inspect it, then choose “Make this the website” when you want this change reviewed and published.`,
@@ -458,6 +473,7 @@ export function createAgent({
       description: metadata?.description || final,
     });
     await api(`/jobs/${job.id}/result`, {
+      revision: job.request_revision || 0,
       state: "reviewing",
       threadId: recovery.threadId,
       text: `${final || "Your change is ready."}\n\nI’ve sent it for review. The preview and live website will update here.`,
@@ -490,6 +506,7 @@ export function createAgent({
       console.error(`[agent] request ${job.id} interrupted: ${error.name}`);
       const recovery = await load(`${dataDir}/jobs/${job.id}.json`);
       await api(`/jobs/${job.id}/result`, {
+        revision: job.request_revision || 0,
         state: "failed",
         threadId: recovery.threadId,
         branch: recovery.branch,

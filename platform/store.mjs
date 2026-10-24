@@ -103,6 +103,9 @@ export function createStore(directory) {
     CREATE TABLE IF NOT EXISTS preview_inspections (
       job_id TEXT NOT NULL REFERENCES jobs(id), user_id TEXT NOT NULL REFERENCES users(id),
       sha TEXT NOT NULL, inspected_at INTEGER NOT NULL, PRIMARY KEY(job_id,user_id));
+    CREATE TABLE IF NOT EXISTS request_receipts (
+      member_id TEXT NOT NULL REFERENCES members(id), request_key TEXT NOT NULL,
+      job_id TEXT NOT NULL REFERENCES jobs(id), PRIMARY KEY(member_id,request_key));
   `);
   if (
     !db
@@ -170,9 +173,16 @@ export function createStore(directory) {
     inspected_at: "INTEGER",
     approved_at: "INTEGER",
     approved_by: "TEXT",
+    request_revision: "INTEGER NOT NULL DEFAULT 0",
+    pending_text: "TEXT",
   }))
     if (!jobColumns.has(column))
       db.exec(`ALTER TABLE jobs ADD COLUMN ${column} ${type}`);
+  db.exec(`INSERT OR IGNORE INTO request_receipts SELECT member_id,request_key,id FROM jobs;
+    UPDATE jobs SET state='superseded',error=NULL WHERE approval_required=1 AND approved_at IS NULL AND pr_number IS NULL AND state='awaiting_approval'
+    AND EXISTS (SELECT 1 FROM jobs newer WHERE newer.member_id=jobs.member_id AND newer.request_key NOT LIKE 'review-fix:%'
+      AND (newer.created_at>jobs.created_at OR (newer.created_at=jobs.created_at AND newer.rowid>jobs.rowid)));
+  `);
   // Preserve older outcomes without pretending their historical start/merge times were recorded.
   db.exec(`INSERT OR IGNORE INTO releases(project_id,pr_number,title,author,merge_sha,merged_at,published_at,is_live)
     SELECT j.project_id,j.pr_number,substr(j.text,1,100),m.name,j.merge_sha,j.merged_at,j.published_at,(j.state='live')
@@ -351,12 +361,16 @@ export function createStore(directory) {
         dedupeKey,
       );
   }
-  function claimJob(project, { supportsApproval = true } = {}) {
+  function claimJob(
+    project,
+    { supportsApproval = true, supportsRevisions = true } = {},
+  ) {
     return transaction(() => {
       const job = get(
-        "SELECT * FROM jobs WHERE project_id=? AND (approval_required=0 OR ?=1) AND (state='queued' OR (state='working' AND lease_until<?)) ORDER BY created_at LIMIT 1",
+        "SELECT * FROM jobs WHERE project_id=? AND (approval_required=0 OR ?=1) AND (request_revision=0 OR ?=1) AND (state='queued' OR (state='working' AND lease_until<?)) ORDER BY created_at LIMIT 1",
         project,
         supportsApproval ? 1 : 0,
+        supportsRevisions ? 1 : 0,
         now(),
       );
       if (!job) return null;
@@ -369,7 +383,7 @@ export function createStore(directory) {
       );
       recordEvent(
         job.id,
-        job.started_at ? `resume:${now()}` : "started",
+        job.started_at ? `resume:${now()}` : `started:${job.request_revision}`,
         "status",
         job.started_at
           ? "Resuming your saved request."
@@ -508,6 +522,91 @@ export function createStore(directory) {
         actor.id,
       );
   }
+  function resumeFollowups(jobId) {
+    const job = get("SELECT * FROM jobs WHERE id=?", jobId);
+    if (!job?.pending_text) return false;
+    run("DELETE FROM preview_inspections WHERE job_id=?", job.id);
+    run(
+      "UPDATE jobs SET text=pending_text,pending_text=NULL,request_revision=request_revision+1,state='queued',error=NULL,result=NULL,started_at=NULL,finished_at=NULL,lease_until=NULL,inspected_at=NULL,artifact_ready_at=NULL,updated_at=? WHERE id=?",
+      now(),
+      job.id,
+    );
+    recordEvent(
+      job.id,
+      `update-preview:${job.request_revision + 1}`,
+      "status",
+      "I’m updating your existing preview with your follow-up.",
+    );
+    return true;
+  }
+  function requestChange(project, member, actor, text, requestKey) {
+    return transaction(() => {
+      const existing =
+        get(
+          "SELECT job_id AS id FROM request_receipts WHERE member_id=? AND request_key=?",
+          member.id,
+          requestKey,
+        ) ||
+        get(
+          "SELECT id FROM jobs WHERE member_id=? AND request_key=?",
+          member.id,
+          requestKey,
+        );
+      if (existing) return existing.id;
+      const job = get(
+        "SELECT * FROM jobs WHERE project_id=? AND member_id=? AND approval_required=1 AND approved_at IS NULL AND pr_number IS NULL AND state IN ('queued','working','building_preview','preview_failed','awaiting_approval','failed') ORDER BY created_at DESC,rowid DESC LIMIT 1",
+        project,
+        member.id,
+      );
+      const jobId = job?.id || id();
+      if (job) {
+        run("DELETE FROM preview_inspections WHERE job_id=?", job.id);
+        if (["working", "building_preview"].includes(job.state))
+          run(
+            "UPDATE jobs SET pending_text=?,inspected_at=NULL,updated_at=? WHERE id=?",
+            [job.pending_text, text].filter(Boolean).join("\n\nFollow-up:\n"),
+            now(),
+            job.id,
+          );
+        else {
+          const nextText =
+            job.state === "queued"
+              ? job.text + "\n\nFollow-up:\n" + text
+              : text;
+          run(
+            "UPDATE jobs SET text=?,state='queued',request_revision=request_revision+1,pending_text=NULL,result=NULL,error=NULL,started_at=NULL,finished_at=NULL,lease_until=NULL,inspected_at=NULL,artifact_ready_at=NULL,updated_at=? WHERE id=?",
+            nextText,
+            now(),
+            job.id,
+          );
+        }
+        recordEvent(
+          job.id,
+          `follow-up:${requestKey}`,
+          "status",
+          "I’ll update this preview with your follow-up.",
+        );
+      } else
+        run(
+          "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at,approval_required) VALUES(?,?,?,?,?,?,?,1)",
+          jobId,
+          project,
+          member.id,
+          requestKey,
+          text,
+          now(),
+          now(),
+        );
+      run(
+        "INSERT INTO request_receipts VALUES(?,?,?)",
+        member.id,
+        requestKey,
+        jobId,
+      );
+      humanMessage(project, member.id, jobId, actor, text);
+      return jobId;
+    });
+  }
   function recordMerge(project, number, sha, metadata = {}) {
     return transaction(() => {
       recordRelease(project, number, sha, metadata);
@@ -574,6 +673,8 @@ export function createStore(directory) {
     reactionSummary,
     groupMessages,
     humanMessage,
+    requestChange,
+    resumeFollowups,
     recordRelease,
     close: () => db.close(),
   };
