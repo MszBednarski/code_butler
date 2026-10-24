@@ -1,0 +1,624 @@
+import express from "express";
+import { createServer } from "node:http";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import QRCode from "qrcode";
+import { createStore, id, token, digest, now } from "./store.mjs";
+import { configuration } from "./config.mjs";
+import { providers } from "./providers.mjs";
+import { installAuth, publicUser, cookie, accountForRequest } from "./auth.mjs";
+import { installWorkerApi } from "./worker-api.mjs";
+import { installGitProxy } from "./git-proxy.mjs";
+import { createProvisioner } from "./provision.mjs";
+import { installSetup } from "./setup.mjs";
+
+const uuid = (value) =>
+  typeof value === "string" && /^[a-f0-9-]{36}$/.test(value);
+const name = (value) =>
+  typeof value === "string" &&
+  value.trim().length >= 1 &&
+  value.trim().length <= 50 &&
+  !/[\x00-\x1f]/.test(value);
+const memberView = (m) => ({
+  id: m.id,
+  name: m.name,
+  prefix: m.prefix,
+  role: m.role,
+});
+
+export function createPlatform(
+  config,
+  {
+    store = createStore(config.dataDir),
+    provider = providers(config, store),
+    provisioner = createProvisioner(config, store, provider),
+    gitOptions,
+  } = {},
+) {
+  const app = express(),
+    server = createServer(app),
+    limits = new Map();
+  app.set("trust proxy", true);
+  app.disable("x-powered-by");
+  app.use((req, res, next) => {
+    res.set("Content-Security-Policy", "frame-ancestors 'self'");
+    res.set("X-Content-Type-Options", "nosniff");
+    res.set("Referrer-Policy", "no-referrer");
+    if (req.path.startsWith("/api/") || req.path.startsWith("/auth/"))
+      res.set("Cache-Control", "no-store");
+    if (
+      !["GET", "HEAD"].includes(req.method) &&
+      !req.path.startsWith("/api/worker/") &&
+      !req.path.startsWith("/api/git/") &&
+      !req.path.startsWith("/api/hooks/") &&
+      req.headers.origin !== config.publicUrl
+    )
+      return res.status(403).json({ error: "Invalid request origin." });
+    next();
+  });
+  app.get("/healthz", (_req, res) => res.type("text").send("ok"));
+  app.post(
+    "/api/hooks/github/:projectId",
+    express.raw({ type: "application/json", limit: "1mb" }),
+    (req, res) => {
+      const project = store.get(
+        "SELECT * FROM projects WHERE id=?",
+        req.params.projectId,
+      );
+      if (!project || !Buffer.isBuffer(req.body)) return res.sendStatus(403);
+      const actual = Buffer.from(req.headers["x-hub-signature-256"] || ""),
+        expected = Buffer.from(
+          "sha256=" +
+            createHmac("sha256", store.open(project.webhook_secret))
+              .update(req.body)
+              .digest("hex"),
+        );
+      if (
+        actual.length !== expected.length ||
+        !timingSafeEqual(actual, expected)
+      )
+        return res.sendStatus(403);
+      let event;
+      try {
+        event = JSON.parse(req.body.toString());
+      } catch {
+        return res.sendStatus(400);
+      }
+      if (
+        event.repository?.full_name?.toLowerCase() !==
+        project.repo?.toLowerCase()
+      )
+        return res.sendStatus(403);
+      const kind = req.headers["x-github-event"];
+      if (
+        kind === "push" &&
+        event.ref === "refs/heads/main" &&
+        /^[a-f0-9]{40}$/.test(event.after)
+      )
+        store.enqueue(
+          project.id,
+          "deploy",
+          `main:${project.id}:${event.after}`,
+          { sha: event.after },
+        );
+      if (kind === "pull_request" && Number.isSafeInteger(event.number)) {
+        if (
+          event.action === "closed" &&
+          event.pull_request.merged &&
+          /^[a-f0-9]{40}$/.test(event.pull_request.merge_commit_sha || "")
+        )
+          store.recordMerge(
+            project.id,
+            event.number,
+            event.pull_request.merge_commit_sha,
+          );
+        if (
+          ["opened", "reopened", "synchronize"].includes(event.action) &&
+          event.pull_request.base.ref === "main"
+        ) {
+          store.run(
+            "DELETE FROM tasks WHERE project_id=? AND dedupe_key=? AND state='queued'",
+            project.id,
+            `cleanup:${project.id}:${event.number}`,
+          );
+          store.enqueue(
+            project.id,
+            "deploy",
+            `preview:${project.id}:${event.number}:${event.pull_request.head.sha}`,
+            { prNumber: event.number, sha: event.pull_request.head.sha },
+            event.action === "reopened",
+          );
+        }
+        if (event.action === "closed" && !event.pull_request.merged)
+          store.enqueue(
+            project.id,
+            "cleanup",
+            `cleanup:${project.id}:${event.number}`,
+            { prNumber: event.number },
+            true,
+          );
+      }
+      res.sendStatus(202);
+    },
+  );
+  installGitProxy(app, store, gitOptions);
+  app.use(express.json({ limit: "128kb" }));
+  app.use("/api", (req, res, next) => {
+    if (req.path.startsWith("/worker/")) return next();
+    const restrictive =
+      req.path.startsWith("/auth/email") ||
+      req.path.startsWith("/auth/recover") ||
+      req.path.startsWith("/invites/");
+    const account = restrictive ? null : accountForRequest(req, store);
+    const budget = ["GET", "HEAD"].includes(req.method) ? "read" : "write";
+    const identity = account ? `user:${account.id}` : `ip:${req.ip}`;
+    const key = restrictive ? `${req.ip}:${req.path}` : `${identity}:${budget}`,
+      interval = restrictive ? 600000 : 60000,
+      maximum = restrictive ? 25 : 240;
+    const entry = limits.get(key);
+    if (entry?.until > now() && entry.count >= maximum)
+      return res
+        .status(429)
+        .set("Retry-After", "60")
+        .json({ error: "Please wait a moment and try again." });
+    if (entry?.until > now()) entry.count++;
+    else limits.set(key, { count: 1, until: now() + interval });
+    if (limits.size > 5000)
+      for (const [k, value] of limits)
+        if (value.until < now()) limits.delete(k);
+    next();
+  });
+  installSetup(app, config, store);
+  installWorkerApi(app, config, store, provider);
+  installAuth(app, config, store, provider);
+  const signed = (req, res, next) =>
+    req.account
+      ? next()
+      : res
+          .status(401)
+          .json({ error: "Sign in or open your team invitation." });
+  function membership(req, res, next) {
+    req.project = uuid(req.params.projectId)
+      ? store.get("SELECT * FROM projects WHERE id=?", req.params.projectId)
+      : null;
+    req.member =
+      req.account && req.project
+        ? store.get(
+            `SELECT * FROM members WHERE project_id=? AND user_id=? ${req.query.member ? "AND id=?" : ""} ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END,created_at DESC LIMIT 1`,
+            req.project.id,
+            req.account.id,
+            ...(req.query.member ? [String(req.query.member)] : []),
+          )
+        : null;
+    if (!req.member)
+      return res.status(404).json({
+        error:
+          "This project is not in your account. Open its invitation to join.",
+      });
+    next();
+  }
+  const owner = (req, res, next) =>
+    req.project.owner_id === req.account.id
+      ? next()
+      : res.status(403).json({ error: "Only the project lead can do that." });
+  app.get("/api/session", (req, res) => {
+    const github = req.account && store.connection(req.account.id, "github");
+    res.json({
+      user: publicUser(req.account),
+      connections: {
+        github: Boolean(
+          github && String(github.scope).split(/[ ,]/).includes("repo"),
+        ),
+        railway: Boolean(
+          req.account && store.connection(req.account.id, "railway"),
+        ),
+      },
+      capabilities: {
+        github: Boolean(config.githubClientId && config.githubClientSecret),
+        railway: Boolean(config.railwayClientId && config.railwayClientSecret),
+        email: Boolean(config.emailKey && config.emailFrom),
+      },
+      commit: config.commit,
+    });
+  });
+  app.get("/api/projects", signed, (req, res) =>
+    res.json({
+      projects: store.all(
+        "SELECT DISTINCT p.id,p.name,p.description,p.state,p.app_url AS appUrl,p.created_at AS createdAt FROM projects p JOIN members m ON m.project_id=p.id WHERE m.user_id=? ORDER BY p.created_at DESC",
+        req.account.id,
+      ),
+    }),
+  );
+  app.get("/api/railway/workspaces", signed, async (req, res) =>
+    res.json(
+      (await provider.railway(req.account.id, "query{me{workspaces{id name}}}"))
+        .me.workspaces,
+    ),
+  );
+  app.post("/api/projects", signed, (req, res) => {
+    if (
+      !req.account.github_id ||
+      !store.connection(req.account.id, "github") ||
+      !store.connection(req.account.id, "railway")
+    )
+      return res
+        .status(409)
+        .json({ error: "Connect GitHub and Railway first." });
+    const b = req.body || {};
+    if (
+      !name(b.name) ||
+      typeof b.description !== "string" ||
+      b.description.trim().length < 3 ||
+      b.description.length > 10000 ||
+      !uuid(b.requestKey)
+    )
+      return res
+        .status(400)
+        .json({ error: "Add a project name and a short description." });
+    const duplicate = store.get(
+      "SELECT id FROM projects WHERE owner_id=? AND create_key=?",
+      req.account.id,
+      b.requestKey,
+    );
+    if (duplicate) return res.json({ id: duplicate.id });
+    const projectId = id(),
+      memberId = id(),
+      invitation = token(),
+      worker = token();
+    const slug = `${
+      b.name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "")
+        .slice(0, 28) || "project"
+    }-${projectId.slice(0, 8)}`;
+    store.transaction(() => {
+      store.run(
+        `INSERT INTO projects(id,owner_id,name,description,slug,invite_hash,invite_secret,worker_secret,worker_hash,webhook_secret,workspace_id,create_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        projectId,
+        req.account.id,
+        b.name.trim(),
+        b.description.trim(),
+        slug,
+        digest(invitation),
+        store.seal(invitation),
+        store.seal(worker),
+        digest(worker),
+        store.seal(token()),
+        uuid(b.workspaceId) ? b.workspaceId : null,
+        b.requestKey,
+        now(),
+      );
+      store.run(
+        "INSERT INTO members(id,project_id,user_id,name,prefix,role,created_at) VALUES(?,?,?,?,?,?,?)",
+        memberId,
+        projectId,
+        req.account.id,
+        req.account.name,
+        `lead-${memberId.slice(0, 8)}`,
+        "owner",
+        now(),
+      );
+      store.enqueue(projectId, "provision", `provision:${projectId}`);
+      const jobId = id();
+      store.run(
+        "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+        jobId,
+        projectId,
+        memberId,
+        "initial",
+        `Build the first version of this website: ${b.description.trim()}`,
+        now(),
+        now(),
+      );
+      store.run(
+        "INSERT INTO messages VALUES(?,?,?,?,?,?,?)",
+        id(),
+        projectId,
+        memberId,
+        jobId,
+        "user",
+        b.description.trim(),
+        now(),
+      );
+    });
+    res.status(201).json({ id: projectId });
+  });
+  app.post("/api/invites/inspect", (req, res) => {
+    const project =
+      typeof req.body?.token === "string" && req.body.token.length <= 100
+        ? store.get(
+            "SELECT p.id,p.name,p.state,u.name AS ownerName FROM projects p JOIN users u ON u.id=p.owner_id WHERE invite_hash=?",
+            digest(req.body.token),
+          )
+        : null;
+    if (!project)
+      return res.status(404).json({
+        error: "This invitation has expired. Ask the team lead for a new one.",
+      });
+    res.json(project);
+  });
+  app.post("/api/invites/join", (req, res) => {
+    const project =
+      typeof req.body?.token === "string" && req.body.token.length <= 100
+        ? store.get(
+            "SELECT * FROM projects WHERE invite_hash=?",
+            digest(req.body.token),
+          )
+        : null;
+    if (!project)
+      return res.status(403).json({
+        error: "This invitation has expired. Ask the team lead for a new one.",
+      });
+    if (!name(req.body.name))
+      return res
+        .status(400)
+        .json({ error: "Tell us what to call you (up to 50 characters)." });
+    const existing =
+      req.account &&
+      store.get(
+        "SELECT id FROM members WHERE project_id=? AND user_id=?",
+        project.id,
+        req.account.id,
+      );
+    if (existing) return res.json({ projectId: project.id });
+    if (
+      store.get(
+        "SELECT COUNT(*) AS total FROM members WHERE project_id=?",
+        project.id,
+      ).total >= 20
+    )
+      return res.status(409).json({
+        error: "This team is full. Ask the lead to make another project.",
+      });
+    const user = req.account || store.guest(req.body.name.trim()),
+      memberId = id();
+    const prefix = `${
+      req.body.name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "")
+        .slice(0, 12) || "teammate"
+    }-${memberId.slice(0, 4)}`;
+    store.run(
+      "INSERT INTO members(id,project_id,user_id,name,prefix,created_at) VALUES(?,?,?,?,?,?)",
+      memberId,
+      project.id,
+      user.id,
+      req.body.name.trim(),
+      prefix,
+      now(),
+    );
+    cookie(res, config, "butler_account", store.session(user.id));
+    res.status(201).json({ projectId: project.id });
+  });
+  app.get("/api/projects/:projectId", signed, membership, (req, res) => {
+    const p = req.project;
+    res.json({
+      id: p.id,
+      name: p.name,
+      description: p.description,
+      state: p.state,
+      error: p.error,
+      appUrl: p.app_url,
+      repoUrl: p.repo ? `https://github.com/${p.repo}` : null,
+      isOwner: p.owner_id === req.account.id,
+      codingReady: Boolean(p.codex_ready),
+      member: memberView(req.member),
+      members: store.all(
+        "SELECT id,name,prefix,role FROM members WHERE project_id=? ORDER BY created_at",
+        p.id,
+      ),
+      ownMemberships: store.all(
+        "SELECT id,name,prefix,role FROM members WHERE project_id=? AND user_id=?",
+        p.id,
+        req.account.id,
+      ),
+      messages: store.all(
+        "SELECT id,job_id AS jobId,role,text,created_at AS createdAt FROM messages WHERE member_id=? ORDER BY created_at,rowid",
+        req.member.id,
+      ),
+      jobs: store.all(
+        "SELECT id,request_key AS requestKey,text,state,result,error,pr_url AS prUrl,preview_url AS previewUrl,created_at AS createdAt FROM jobs WHERE member_id=? ORDER BY created_at",
+        req.member.id,
+      ),
+      activity: store.all(
+        "SELECT j.id,substr(j.text,1,100) AS text,j.state,j.pr_url AS prUrl,j.preview_url AS previewUrl,m.name FROM jobs j JOIN members m ON m.id=j.member_id WHERE j.project_id=? ORDER BY j.created_at DESC LIMIT 15",
+        p.id,
+      ),
+      tasks:
+        p.owner_id === req.account.id
+          ? store.all(
+              "SELECT kind,state,error,attempts FROM tasks WHERE project_id=? AND state!=? ORDER BY updated_at DESC LIMIT 10",
+              p.id,
+              "done",
+            )
+          : [],
+    });
+  });
+  app.get(
+    "/api/projects/:projectId/invite",
+    signed,
+    membership,
+    owner,
+    async (req, res) => {
+      const link = `${config.publicUrl}/join#invite=${store.open(req.project.invite_secret)}`;
+      res.json({
+        url: link,
+        qr: await QRCode.toDataURL(link, {
+          width: 320,
+          margin: 2,
+          color: { dark: "#153e35", light: "#ffffff" },
+          errorCorrectionLevel: "M",
+        }),
+      });
+    },
+  );
+  app.post(
+    "/api/projects/:projectId/invite/rotate",
+    signed,
+    membership,
+    owner,
+    (req, res) => {
+      const value = token();
+      store.run(
+        "UPDATE projects SET invite_hash=?,invite_secret=? WHERE id=?",
+        digest(value),
+        store.seal(value),
+        req.project.id,
+      );
+      res.json({ ok: true });
+    },
+  );
+  app.post(
+    "/api/projects/:projectId/messages",
+    signed,
+    membership,
+    (req, res) => {
+      const text = req.body?.text;
+      if (
+        typeof text !== "string" ||
+        !text.trim() ||
+        text.length > 20000 ||
+        text.includes("\0") ||
+        !uuid(req.body.requestKey)
+      )
+        return res
+          .status(400)
+          .json({ error: "Send a request between 1 and 20,000 characters." });
+      const jobId = store.transaction(() => {
+        const existing = store.get(
+          "SELECT id FROM jobs WHERE member_id=? AND request_key=?",
+          req.member.id,
+          req.body.requestKey,
+        );
+        if (existing) return existing.id;
+        const value = id();
+        store.run(
+          "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+          value,
+          req.project.id,
+          req.member.id,
+          req.body.requestKey,
+          text.trim(),
+          now(),
+          now(),
+        );
+        store.run(
+          "INSERT INTO messages VALUES(?,?,?,?,?,?,?)",
+          id(),
+          req.project.id,
+          req.member.id,
+          value,
+          "user",
+          text.trim(),
+          now(),
+        );
+        return value;
+      });
+      res.status(202).json({ jobId });
+    },
+  );
+  app.get(
+    "/api/projects/:projectId/codex",
+    signed,
+    membership,
+    owner,
+    async (req, res) => {
+      const status = await provider.worker(req.project, "/auth/status");
+      store.run(
+        "UPDATE projects SET codex_ready=? WHERE id=?",
+        status.state === "connected" ? 1 : 0,
+        req.project.id,
+      );
+      res.json(status);
+    },
+  );
+  app.post(
+    "/api/projects/:projectId/codex",
+    signed,
+    membership,
+    owner,
+    async (req, res) => {
+      if (req.project.state !== "ready")
+        return res.status(409).json({
+          error:
+            "Your workspace is still being prepared. You can invite teammates now.",
+        });
+      res.json(await provider.worker(req.project, "/auth/start", "POST"));
+    },
+  );
+  app.post(
+    "/api/projects/:projectId/retry",
+    signed,
+    membership,
+    owner,
+    (req, res) => {
+      store.run(
+        "UPDATE tasks SET state='queued',attempts=0,error=NULL,available_at=? WHERE project_id=? AND state='failed'",
+        now(),
+        req.project.id,
+      );
+      store.run(
+        "UPDATE projects SET state=CASE WHEN state='failed' THEN 'queued' ELSE state END,error=NULL WHERE id=?",
+        req.project.id,
+      );
+      res.json({ ok: true });
+    },
+  );
+  app.use("/api", (_req, res) =>
+    res.status(404).json({ error: "Unknown Butler endpoint." }),
+  );
+  if (existsSync(config.frontend))
+    app.use(express.static(config.frontend, { index: false, maxAge: "1h" }));
+  app.get("/{*path}", (_req, res) => {
+    if (!existsSync(path.join(config.frontend, "index.html")))
+      return res
+        .status(503)
+        .type("text")
+        .send(
+          "Build the Butler frontend with cd app && npm ci && npm run build.",
+        );
+    res
+      .set("Cache-Control", "no-store")
+      .sendFile(path.join(config.frontend, "index.html"));
+  });
+  app.use((error, _req, res, _next) => {
+    console.error(`[platform] ${error.provider || error.name}: request failed`);
+    if (res.headersSent) return res.end();
+    const status =
+      error.type === "entity.too.large"
+        ? 413
+        : error.status >= 400 && error.status < 500
+          ? error.status
+          : 502;
+    res.status(status).json({
+      error: error.provider
+        ? error.message.slice(0, 350)
+        : status === 413
+          ? "This request is too large."
+          : "Something interrupted this request. Please try again.",
+    });
+  });
+  return { app, server, store, provider, provisioner };
+}
+
+if (process.argv[1] && import.meta.filename === path.resolve(process.argv[1])) {
+  process.umask(0o077);
+  const config = configuration(),
+    platform = createPlatform(config);
+  const stop = platform.provisioner.start();
+  platform.server.listen(config.port, "0.0.0.0", () =>
+    console.log(`Butler portal listening on ${config.port}`),
+  );
+  for (const signal of ["SIGTERM", "SIGINT"])
+    process.once(signal, () => {
+      stop();
+      platform.server.close(() => {
+        platform.store.close();
+        process.exit(0);
+      });
+      setTimeout(() => process.exit(0), 15000).unref();
+    });
+}
