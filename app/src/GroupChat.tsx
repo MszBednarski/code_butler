@@ -1,7 +1,11 @@
 import { useLayoutEffect, useRef, useState } from "react";
-import type { FormEvent } from "react";
+import type { FormEvent, ReactNode } from "react";
 import Reactions from "./Reactions";
 import type { ReactionSummary, ReactionTarget } from "./Reactions";
+import { chatBubbles, explainButler } from "./communication";
+import type { ChatMessage } from "./communication";
+import { useLatestChat } from "./latest-chat";
+import type { Job } from "./workspace-types";
 
 export type GroupMessage = {
   id: string;
@@ -10,6 +14,12 @@ export type GroupMessage = {
   text: string;
   createdAt: number;
   isOwn: boolean;
+  jobId?: string;
+};
+export type GroupAgent = {
+  member: { id: string; name: string };
+  messages: ChatMessage[];
+  jobs: Job[];
 };
 
 export default function GroupChat({
@@ -20,6 +30,17 @@ export default function GroupChat({
   onSend,
   onReact,
   onClose,
+  agent,
+  onInspect,
+  onDismiss,
+  onRetry,
+  renderStatus,
+  visibilityBusy,
+  onRead,
+  historyBefore,
+  historyLoading,
+  historyVersion,
+  onHistory,
 }: {
   projectId: string;
   memberId: string;
@@ -33,6 +54,17 @@ export default function GroupChat({
     active: boolean,
   ) => Promise<void>;
   onClose: () => void;
+  agent?: GroupAgent | null;
+  onInspect: (job: Job) => void;
+  onDismiss: (job: Job, dismissed: boolean) => void;
+  onRetry: (job: Job) => void;
+  renderStatus: (job: Job) => ReactNode;
+  visibilityBusy: string;
+  onRead: () => void;
+  historyBefore?: string | null;
+  historyLoading: boolean;
+  historyVersion: number;
+  onHistory: () => void;
 }) {
   const storageKey = `butler-group-draft-${projectId}-${memberId}`;
   const [text, setText] = useState(
@@ -43,10 +75,25 @@ export default function GroupChat({
   const pending = useRef<{ text: string; key: string } | null>(null),
     scroll = useRef<HTMLDivElement>(null),
     textarea = useRef<HTMLTextAreaElement>(null),
-    opened = useRef(false),
-    lastMessage = useRef(""),
-    afterSend = useRef(false),
-    nearBottom = useRef(true);
+    afterSend = useRef(false);
+  const timeline = [
+    ...messages.map((m) => ({ ...m, role: "user", kind: "human" })),
+    ...chatBubbles(agent?.messages || []).map((m) => ({
+      ...m,
+      name: "@Butler",
+      isOwn: false,
+    })),
+  ].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  const latestJob = agent?.jobs.at(-1);
+  const preview =
+    latestJob?.state === "awaiting_approval" &&
+    !latestJob.dismissedAt &&
+    latestJob.artifactUrl
+      ? latestJob
+      : null;
+  const lastRequest = new Map(
+    messages.filter((m) => m.jobId).map((m) => [m.jobId, m.id]),
+  );
   useLayoutEffect(() => {
     localStorage.setItem(storageKey, text);
     if (textarea.current) {
@@ -55,19 +102,15 @@ export default function GroupChat({
         Math.min(textarea.current.scrollHeight, 120) + "px";
     }
   }, [text, storageKey]);
+  const trackScroll = useLatestChat(
+    scroll,
+    storageKey,
+    historyVersion,
+    afterSend,
+  );
   useLayoutEffect(() => {
-    const panel = scroll.current,
-      latest = messages.at(-1)?.id || "";
-    if (!panel || (opened.current && latest === lastMessage.current)) return;
-    if (!opened.current || afterSend.current || nearBottom.current)
-      panel.scrollTo({
-        top: panel.scrollHeight,
-        behavior: opened.current ? "smooth" : "auto",
-      });
-    opened.current = true;
-    lastMessage.current = latest;
-    afterSend.current = false;
-  }, [messages]);
+    if (scroll.current && Math.abs(scroll.current.scrollTop) < 140) onRead();
+  }, [messages, agent?.messages, onRead]);
   async function send(event?: FormEvent) {
     event?.preventDefault();
     if (!text.trim() || sending) return;
@@ -94,7 +137,11 @@ export default function GroupChat({
       <div className="panel-top">
         <div className="group-chat-heading">
           <strong>Group chat</strong>
-          <small>You and your teammates</small>
+          <small>
+            {latestJob
+              ? renderStatus(latestJob)
+              : "Your team and a shared @Butler"}
+          </small>
         </div>
         <button
           className="icon-button close-side-panel"
@@ -105,56 +152,168 @@ export default function GroupChat({
         </button>
       </div>
       <div
-        className="conversation-scroll group-chat-scroll"
+        className="conversation-scroll group-chat-scroll latest-chat"
         ref={scroll}
         role="log"
         aria-label="Team messages"
         aria-live="polite"
         aria-relevant="additions text"
         onScroll={() => {
-          const panel = scroll.current;
-          if (panel)
-            nearBottom.current =
-              panel.scrollHeight - panel.scrollTop - panel.clientHeight < 140;
+          trackScroll();
+          if (scroll.current && Math.abs(scroll.current.scrollTop) < 140)
+            onRead();
         }}
       >
-        {!messages.length && (
-          <div className="group-empty">
-            <strong>Say hello to your team.</strong>
-            <p>Share ideas, give feedback, and celebrate what you’ve made.</p>
-          </div>
-        )}
-        {messages.map((message) => (
-          <article
-            key={message.id}
-            className={
-              "message group-message " +
-              (message.isOwn ? "message-user" : "message-teammate")
-            }
-          >
-            <div className="message-content">
-              <div className="group-message-author">
-                <strong>
-                  {message.name}
-                  {message.isOwn ? " (you)" : ""}
-                </strong>
-                <time dateTime={new Date(message.createdAt).toISOString()}>
-                  {new Date(message.createdAt).toLocaleTimeString([], {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
-                </time>
+        <div className="conversation-history">
+          {historyBefore && (
+            <button
+              className="text-button load-history"
+              disabled={historyLoading}
+              onClick={onHistory}
+            >
+              {historyLoading
+                ? "Loading earlier messages…"
+                : "Load earlier messages"}
+            </button>
+          )}
+          {!timeline.length && (
+            <div className="group-empty">
+              <strong>Say hello to your team.</strong>
+              <p>
+                Talk to your team, or tag @Butler to give the shared agent a
+                task.
+              </p>
+            </div>
+          )}
+          {timeline.map((message) => {
+            const job = agent?.jobs.find((j) => j.id === message.jobId);
+            const display =
+              message.kind === "human"
+                ? message.text
+                : explainButler(message.text, message.kind);
+            return (
+              <article
+                key={message.id}
+                className={
+                  "message group-message " +
+                  (message.isOwn ? "message-user" : "message-teammate")
+                }
+              >
+                <div className="message-content">
+                  <div className="group-message-author">
+                    <strong>
+                      {message.name}
+                      {message.isOwn ? " (you)" : ""}
+                    </strong>
+                    <time
+                      dateTime={new Date(message.createdAt || 0).toISOString()}
+                    >
+                      {new Date(message.createdAt || 0).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </time>
+                  </div>
+                  {message.kind === "saved-preview" && job ? (
+                    <article className="saved-preview-card">
+                      <small>
+                        {job.dismissedAt
+                          ? "DISMISSED · SAVED HERE"
+                          : "PREVIEW IN CHAT HISTORY"}
+                      </small>
+                      <strong>{job.prTitle || message.text}</strong>
+                      <div className="artifact-card-actions">
+                        {job.dismissedAt && (
+                          <button
+                            className="button secondary compact"
+                            disabled={visibilityBusy === job.id}
+                            onClick={() => onDismiss(job, false)}
+                          >
+                            Restore preview
+                          </button>
+                        )}
+                        <button
+                          className="text-button"
+                          onClick={() => onInspect(job)}
+                        >
+                          View preview →
+                        </button>
+                      </div>
+                    </article>
+                  ) : (
+                    <p>{display}</p>
+                  )}
+                  {display !== message.text &&
+                    message.kind !== "saved-preview" && (
+                      <details className="developer-details">
+                        <summary>Details for developers</summary>
+                        <pre>{message.text}</pre>
+                      </details>
+                    )}
+                  {job &&
+                    message.kind === "human" &&
+                    lastRequest.get(job.id) === message.id &&
+                    renderStatus(job)}
+                  {message.kind !== "saved-preview" && (
+                    <Reactions
+                      targetType="message"
+                      targetId={message.id}
+                      summary={reactions}
+                      onReact={onReact}
+                    />
+                  )}
+                </div>
+              </article>
+            );
+          })}
+          {preview && (
+            <article className="artifact-card group-preview-card">
+              <span className="small-label">GROUP PREVIEW · NOT PUBLISHED</span>
+              <strong>
+                {preview.prTitle || "Your group’s change is ready"}
+              </strong>
+              <p>
+                {preview.canApprove
+                  ? "Try it, then choose Make this the website when you’re happy."
+                  : "Try it and react. The requester or team lead can approve it."}
+              </p>
+              <div className="artifact-card-actions">
+                <button
+                  className="button primary compact"
+                  onClick={() => onInspect(preview)}
+                >
+                  Inspect preview →
+                </button>
+                <button
+                  className="text-button dismiss-preview"
+                  disabled={visibilityBusy === preview.id}
+                  onClick={() => onDismiss(preview, true)}
+                >
+                  Dismiss
+                </button>
               </div>
-              <p>{message.text}</p>
               <Reactions
-                targetType="message"
-                targetId={message.id}
+                targetType="preview"
+                targetId={preview.id}
                 summary={reactions}
                 onReact={onReact}
               />
+            </article>
+          )}
+          {latestJob?.error && (
+            <div className="group-send-error" role="status">
+              <p>{explainButler(latestJob.error, "error")}</p>
+              {latestJob.canApprove && latestJob.state === "preview_failed" && (
+                <button
+                  className="text-button"
+                  onClick={() => onRetry(latestJob)}
+                >
+                  Retry preview
+                </button>
+              )}
             </div>
-          </article>
-        ))}
+          )}
+        </div>
       </div>
       <form className="composer group-composer" onSubmit={send}>
         {error && (
@@ -166,7 +325,7 @@ export default function GroupChat({
           <textarea
             ref={textarea}
             value={text}
-            placeholder="Message your team…"
+            placeholder="Message your team, or @Butler…"
             aria-label="Message your team"
             rows={2}
             maxLength={4000}
@@ -193,7 +352,20 @@ export default function GroupChat({
           </button>
         </div>
         <div className="composer-note">
-          <span>For everyone on this project.</span>
+          <button
+            type="button"
+            className="text-button mention-butler"
+            onClick={() => {
+              setText((current) =>
+                /(?:^|\s)@butler\b/i.test(current)
+                  ? current
+                  : `@Butler ${current}`,
+              );
+              textarea.current?.focus({ preventScroll: true });
+            }}
+          >
+            @Butler <span>Give the shared agent a task</span>
+          </button>
           <span>Enter sends · Shift+Enter for a new line</span>
         </div>
       </form>

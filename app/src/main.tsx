@@ -2,6 +2,7 @@ import React, {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -14,7 +15,11 @@ import LandingTour from "./LandingTour";
 import Reactions from "./Reactions";
 import type { ReactionSummary, ReactionTarget } from "./Reactions";
 import GroupChat from "./GroupChat";
-import type { GroupMessage } from "./GroupChat";
+import type { Job } from "./workspace-types";
+import { useLatestChat, mergeHistory } from "./latest-chat";
+import { activityNotices } from "./activity";
+import type { Notice } from "./activity";
+import type { GroupAgent, GroupMessage } from "./GroupChat";
 
 type User = {
   id: string;
@@ -50,32 +55,7 @@ type Member = {
   startedAt?: number;
   finishedAt?: number;
 };
-type Job = {
-  id: string;
-  requestKey: string;
-  text: string;
-  state: string;
-  result?: string;
-  error?: string;
-  prUrl?: string;
-  previewUrl?: string;
-  createdAt: number;
-  name?: string;
-  memberId?: string;
-  prNumber?: number;
-  startedAt?: number;
-  finishedAt?: number;
-  mergedAt?: number;
-  publishedAt?: number;
-  changeSha?: string;
-  prTitle?: string;
-  artifactUrl?: string;
-  artifactReadyAt?: number;
-  inspectedAt?: number;
-  approvedAt?: number;
-  dismissedAt?: number;
-  requestRevision?: number;
-};
+
 type Project = {
   id: string;
   name: string;
@@ -97,6 +77,10 @@ type Project = {
   messages: ChatMessage[];
   reactions?: ReactionSummary;
   groupMessages?: GroupMessage[];
+  groupAgent?: GroupAgent | null;
+  personalUpdateAt?: number;
+  historyBefore?: string | null;
+  groupHistoryBefore?: string | null;
   jobs: Job[];
   activity: Job[];
   releases?: {
@@ -169,6 +153,7 @@ function useRoute() {
 function Icon({ name, size = 20 }: { name: string; size?: number }) {
   const paths: Record<string, React.ReactNode> = {
     arrow: <path d="m5 12 14 0m-6-6 6 6-6 6" />,
+    bell: <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" />,
     plus: <path d="M12 5v14M5 12h14" />,
     check: <path d="m5 12 4 4L19 6" />,
     close: <path d="m6 6 12 12M6 18 18 6" />,
@@ -497,8 +482,9 @@ function Landing({ session, error }: { session: Session; error: string }) {
             <h3>See it happen together.</h3>
             <p>
               Each person gets a Butler. Follow each other’s chats, see what’s
-              being made, and talk in the group chat. React to messages and
-              previews so your team knows what you love.
+              being made, and talk in the group chat. Tag @Butler to give your
+              shared agent a task while everyone keeps building. React to
+              messages and previews so your team knows what you love.
             </p>
           </article>
           <article>
@@ -508,7 +494,8 @@ function Landing({ session, error }: { session: Session; error: string }) {
               Inspect changes inside your workspace. Approve your own or, as
               team lead, a teammate’s. Dismiss a preview and recover it from
               chat history whenever you like. Butler checks and publishes
-              approved changes for everyone.
+              approved changes for everyone. Unread badges and What’s new bring
+              fresh messages, ready previews and website updates to you.
             </p>
           </article>
         </div>
@@ -1630,8 +1617,6 @@ function Workspace({
   );
   const conversation = useRef<HTMLDivElement>(null),
     textarea = useRef<HTMLTextAreaElement>(null),
-    lastMessage = useRef(""),
-    lastChat = useRef(""),
     scrollAfterSend = useRef(false),
     pendingKey = useRef<{ text: string; key: string } | null>(null),
     lastLive = useRef("");
@@ -1641,6 +1626,83 @@ function Workspace({
   const [approvalBusy, setApprovalBusy] = useState(false);
   const [visibilityBusy, setVisibilityBusy] = useState("");
   const [inspection, setInspection] = useState("");
+  const [historyLoading, setHistoryLoading] = useState("");
+  const [historyVersion, setHistoryVersion] = useState({ chat: 0, group: 0 });
+  const [catchUp, setCatchUp] = useState(false);
+  const seenKey = `butler-seen-${projectId}-${session.user?.id || "guest"}`;
+  function savedSeen(key: string): Record<string, number> {
+    try {
+      const value = JSON.parse(localStorage.getItem(key) || "{}");
+      return value && typeof value === "object" && !Array.isArray(value)
+        ? value
+        : {};
+    } catch {
+      return {};
+    }
+  }
+  const [seenState, setSeenState] = useState(() => ({
+    key: seenKey,
+    values: savedSeen(seenKey),
+  }));
+  const seen = useMemo(
+    () => (seenState.key === seenKey ? seenState.values : savedSeen(seenKey)),
+    [seenState, seenKey],
+  );
+  const notices = useMemo(
+    () => (project ? activityNotices(project, seen) : []),
+    [project, seen],
+  );
+  const markNotices = useCallback(
+    (items: Notice[]) =>
+      setSeenState((state) => {
+        const current =
+          state.key === seenKey ? state.values : savedSeen(seenKey);
+        const updates = items.filter((n) => n.at > (current[n.id] || 0));
+        if (!updates.length)
+          return state.key === seenKey
+            ? state
+            : { key: seenKey, values: current };
+        const next = { ...current };
+        for (const item of updates) next[item.id] = item.at;
+        localStorage.setItem(seenKey, JSON.stringify(next));
+        return { key: seenKey, values: next };
+      }),
+    [seenKey],
+  );
+  const readGroup = useCallback(
+    () => markNotices(notices.filter((n) => n.channel === "group")),
+    [markNotices, notices],
+  );
+  useEffect(() => {
+    if (!project || !sidebarOpen || websiteExpanded) return;
+    if (["updates", "team"].includes(tab))
+      markNotices(notices.filter((n) => n.channel === tab));
+  }, [tab, project, sidebarOpen, websiteExpanded, notices, markNotices]);
+  function openNotice(notice: Notice) {
+    markNotices([notice]);
+    setCatchUp(false);
+    setWebsiteExpanded(false);
+    if (notice.job?.isGroup || notice.channel === "group") selectPanel("group");
+    else if (notice.channel === "updates") selectPanel("updates");
+    else if (notice.memberId) viewChat(notice.memberId);
+    if (notice.job && notice.job.state === "awaiting_approval")
+      inspect(notice.job);
+  }
+  const unseen = notices.filter((n) => n.unread).length;
+  const activeAgents = notices.filter((n) => n.active).length;
+  const badge = (channel: string) => {
+    const count = notices.filter(
+      (n) => n.unread && n.channel === channel,
+    ).length;
+    return count ? (
+      <span
+        className="unread-badge"
+        aria-label={`${count} new ${channel} updates`}
+      >
+        {count > 99 ? "99+" : count}
+      </span>
+    ) : null;
+  };
   const workspaceVisible = Boolean(
     project &&
     !(
@@ -1670,7 +1732,38 @@ function Workspace({
       const data = await api<Project>(
         `/api/projects/${projectId}?${new URLSearchParams({ ...(memberId ? { member: memberId } : {}), ...(chatId ? { chat: chatId } : {}) })}`,
       );
-      setProject(data);
+      setProject((current) => {
+        if (!current || current.id !== data.id) return data;
+        const sameChat =
+          (current.chatMember?.id || current.member.id) ===
+          (data.chatMember?.id || data.member.id);
+        return {
+          ...data,
+          messages: sameChat
+            ? mergeHistory(current.messages, data.messages)
+            : data.messages,
+          jobs: sameChat ? mergeHistory(current.jobs, data.jobs) : data.jobs,
+          historyBefore: sameChat ? current.historyBefore : data.historyBefore,
+          groupMessages: mergeHistory(
+            current.groupMessages || [],
+            data.groupMessages || [],
+          ),
+          groupHistoryBefore: current.groupHistoryBefore,
+          groupAgent: data.groupAgent
+            ? {
+                ...data.groupAgent,
+                jobs: mergeHistory(
+                  current.groupAgent?.jobs || [],
+                  data.groupAgent.jobs,
+                ),
+                messages: mergeHistory(
+                  current.groupAgent?.messages || [],
+                  data.groupAgent.messages,
+                ),
+              }
+            : current.groupAgent,
+        };
+      });
       setError("");
       const live =
         data.releases?.find((release) => release.isLive)?.sha ||
@@ -1795,26 +1888,87 @@ function Workspace({
         Math.min(textarea.current.scrollHeight, 150) + "px";
     }
   }, [text, projectId, chatId, project?.isOwner]);
+  const trackChatScroll = useLatestChat(
+    conversation,
+    project?.chatMember?.id || project?.member.id || "",
+    historyVersion.chat,
+    scrollAfterSend,
+  );
   useLayoutEffect(() => {
-    const latest = project?.messages.at(-1)?.id;
-    const chat = project?.chatMember?.id || project?.member.id;
-    if (latest && latest !== lastMessage.current) {
-      lastMessage.current = latest;
-      const panel = conversation.current;
-      if (
-        panel &&
-        (scrollAfterSend.current ||
-          lastChat.current !== chat ||
-          panel.scrollHeight - panel.scrollTop - panel.clientHeight < 140)
-      )
-        panel.scrollTo({
-          top: panel.scrollHeight,
-          behavior: lastChat.current === chat ? "smooth" : "auto",
-        });
-      lastChat.current = chat || "";
-      scrollAfterSend.current = false;
+    const panel = conversation.current;
+    if (
+      project &&
+      tab === "chat" &&
+      sidebarOpen &&
+      !websiteExpanded &&
+      (!project.chatMember || project.chatMember.id === project.member.id) &&
+      panel &&
+      Math.abs(panel.scrollTop) < 140
+    )
+      markNotices(notices.filter((n) => n.channel === "chat" && !n.job));
+  }, [
+    project?.messages,
+    tab,
+    sidebarOpen,
+    websiteExpanded,
+    notices,
+    markNotices,
+  ]);
+  async function loadHistory(channel: "chat" | "group") {
+    if (!project || historyLoading) return;
+    const cursor =
+      channel === "group" ? project.groupHistoryBefore : project.historyBefore;
+    if (!cursor) return;
+    const selectedChat = project.chatMember?.id || project.member.id;
+    setHistoryLoading(channel);
+    try {
+      const page = await api<{
+        items: (ChatMessage & GroupMessage)[];
+        before: string | null;
+        jobs?: Job[];
+      }>(
+        `/api/projects/${projectId}/history?${new URLSearchParams({ channel, before: cursor, ...(memberId ? { member: memberId } : {}), ...(channel === "chat" ? { chat: selectedChat } : {}) })}`,
+      );
+      setProject((current) => {
+        if (!current || current.id !== projectId) return current;
+        if (channel === "group")
+          return {
+            ...current,
+            groupMessages: mergeHistory(
+              page.items.filter((m) => m.kind === "human"),
+              current.groupMessages || [],
+            ),
+            groupAgent: current.groupAgent
+              ? {
+                  ...current.groupAgent,
+                  jobs: mergeHistory(page.jobs || [], current.groupAgent.jobs),
+                  messages: mergeHistory(
+                    page.items.filter((m) => m.kind !== "human"),
+                    current.groupAgent.messages,
+                  ),
+                }
+              : null,
+            groupHistoryBefore: page.before,
+          };
+        if ((current.chatMember?.id || current.member.id) !== selectedChat)
+          return current;
+        return {
+          ...current,
+          messages: mergeHistory(page.items, current.messages),
+          jobs: mergeHistory(page.jobs || [], current.jobs),
+          historyBefore: page.before,
+        };
+      });
+      setHistoryVersion((current) => ({
+        ...current,
+        [channel]: current[channel] + 1,
+      }));
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setHistoryLoading("");
     }
-  }, [project?.messages]);
+  }
   async function send(event?: React.FormEvent) {
     event?.preventDefault();
     if (
@@ -1868,7 +2022,9 @@ function Workspace({
   async function markInspected(job: Job) {
     if (
       !project ||
-      (job.memberId !== project.member.id && !project.isOwner) ||
+      (job.memberId !== project.member.id &&
+        !project.isOwner &&
+        !job.canApprove) ||
       job.state !== "awaiting_approval"
     )
       return;
@@ -1892,7 +2048,7 @@ function Workspace({
         { sha: job.changeSha },
       );
       setArtifact(null);
-      setTab("chat");
+      setTab(job.isGroup ? "group" : "chat");
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -1966,6 +2122,7 @@ function Workspace({
           }
         : current,
     );
+    if (response.message.jobId) await refresh();
   }
   if (!project)
     return (
@@ -1993,14 +2150,19 @@ function Workspace({
   const chatMember = project.chatMember || project.member,
     readOnly = Boolean(project.readOnly && !project.canSteerChat),
     steering = Boolean(project.readOnly && project.canSteerChat);
+  const allJobs = [...project.jobs, ...(project.groupAgent?.jobs || [])];
   const shownArtifact = artifact
-    ? project.jobs.find((j) => j.id === artifact.id) || artifact
+    ? allJobs.find((j) => j.id === artifact.id) || artifact
     : null;
   const canApprove =
-    (shownArtifact?.memberId === project.member.id || project.isOwner) &&
+    (shownArtifact?.memberId === project.member.id ||
+      project.isOwner ||
+      shownArtifact?.canApprove) &&
     shownArtifact?.state === "awaiting_approval" &&
     !shownArtifact.dismissedAt;
-  const latestPreview = project.jobs
+  const latestPreview = (
+    tab === "group" ? project.groupAgent?.jobs || project.jobs : project.jobs
+  )
     .filter((job) => jobPreviewUrl(job) && !job.dismissedAt)
     .at(-1);
   const latestHumanRequest = project.jobs
@@ -2148,6 +2310,7 @@ function Workspace({
           ].map(([value, icon, label]) => (
             <button
               key={value}
+              aria-label={label}
               aria-pressed={
                 sidebarOpen &&
                 (value === "chat"
@@ -2158,10 +2321,25 @@ function Workspace({
             >
               <Icon name={icon} size={15} />
               {label}
+              {badge(value)}
             </button>
           ))}
         </nav>
         <div className="workspace-header-actions">
+          <button
+            className="catch-up-button"
+            onClick={() => setCatchUp(true)}
+            aria-label="What’s new"
+          >
+            <Icon name="bell" size={16} />
+            <span>What’s new</span>
+            {activeAgents > 0 && (
+              <small className="working-glance">{activeAgents} working</small>
+            )}
+            {unseen > 0 && (
+              <b className="unread-badge">{unseen > 99 ? "99+" : unseen}</b>
+            )}
+          </button>
           <button
             className="avatar-stack team-toggle"
             aria-label="Show your team"
@@ -2200,13 +2378,14 @@ function Workspace({
           <button
             key={value}
             role="tab"
-            aria-label={value === "group" ? "Group chat" : undefined}
+            aria-label={value === "group" ? "Group chat" : label}
             aria-selected={tab === value}
             className={tab === value ? "selected" : ""}
             onClick={() => selectPanel(value)}
           >
             <Icon name={icon} size={16} />
             {label}
+            {badge(value)}
           </button>
         ))}
       </div>
@@ -2229,7 +2408,7 @@ function Workspace({
               title="Back to chat"
               onClick={() => {
                 setWebsiteExpanded(false);
-                selectPanel("chat");
+                selectPanel(shownArtifact?.isGroup ? "group" : "chat");
               }}
             >
               <Icon name="arrow" size={18} />
@@ -2266,6 +2445,15 @@ function Workspace({
               </button>
             </div>
             <div className="website-toolbar-actions">
+              <button
+                className="icon-button viewer-notices"
+                aria-label="What’s new in your project"
+                title="What’s new"
+                onClick={() => setCatchUp(true)}
+              >
+                <Icon name="bell" size={16} />
+                {unseen > 0 && <span className="unread-dot" />}
+              </button>
               <button
                 className="icon-button"
                 disabled={!websiteUrl}
@@ -2469,335 +2657,358 @@ function Workspace({
               </button>
             </div>
           </div>
-          <div className="conversation-scroll" ref={conversation}>
-            {preparing && (
-              <div className="provision-card">
-                <span className="small-label">MAKING ROOM FOR YOUR TEAM</span>
-                <h3>
-                  {project.state === "failed"
-                    ? "Let’s get your workspace ready."
-                    : project.state === "retrying"
-                      ? "Giving setup another try…"
-                      : "Your workspace is taking shape."}
-                </h3>
-                <p>Your ideas are saved while we prepare everything.</p>
-                <div className="setup-steps">
-                  {[
-                    "Create project",
-                    "Prepare workspace",
-                    "Publish website",
-                  ].map((label, i) => (
-                    <span
-                      key={label}
-                      className={
-                        stage > i + 1
-                          ? "complete"
-                          : stage === i + 1
-                            ? "current"
-                            : ""
-                      }
-                    >
-                      {stage > i + 1 ? <Icon name="check" size={12} /> : <i />}
-                      {label}
-                    </span>
-                  ))}
-                </div>
-                {project.error && project.isOwner && (
-                  <>
-                    <div className="setup-error">
-                      <ButlerText text={project.error} kind="error" />
-                    </div>
-                    <button className="text-button" onClick={retry}>
-                      Try again <Icon name="refresh" size={13} />
-                    </button>
-                  </>
-                )}
-              </div>
-            )}
-            {project.isOwner &&
-              !readOnly &&
-              project.state === "ready" &&
-              project.tasks
-                .filter((task) => task.state === "failed")
-                .map((task, index) => (
-                  <Alert key={task.kind + index}>
-                    <strong>
-                      {task.kind === "worker-update"
-                        ? "Butler couldn’t update its workspace"
-                        : task.kind === "sync-history"
-                          ? "Website history could not be loaded"
-                          : task.kind === "artifact"
-                            ? "Your preview isn’t ready yet"
-                            : "Your website hasn’t updated yet"}
-                    </strong>
-                    <ButlerText
-                      text={
-                        task.error || "Your work is saved. Try this step again."
-                      }
-                      kind="error"
-                    />
-                    <button className="text-button" onClick={retry}>
-                      Retry{" "}
-                      {task.kind === "worker-update"
-                        ? "workspace update"
-                        : task.kind === "sync-history"
-                          ? "history sync"
-                          : task.kind === "artifact"
-                            ? "preview"
-                            : "publishing"}{" "}
-                      <Icon name="refresh" size={13} />
-                    </button>
-                  </Alert>
-                ))}
-            {project.isOwner && !readOnly && (
-              <CodexConnection project={project} onConnected={connected} />
-            )}
-            <div className="agent-welcome">
-              <span className="mini-butler">✳</span>
-              <div>
-                <p>
-                  {steering
-                    ? `You can guide ${chatMember.name}’s agent and approve their previews.`
-                    : readOnly
-                      ? `You’re watching ${chatMember.name}’s conversation.`
-                      : `Hi ${project.member.name.split(" ")[0]}. What would you like to make?`}
-                </p>
-                <small>
-                  {readOnly
-                    ? "Everyone on this project can follow the work here. Send requests from your own chat."
-                    : "Tell me in your own words. I’ll make a preview. Try it, then choose Make this the website when you’re happy with it."}
-                </small>
-              </div>
-            </div>
-            {chatBubbles(project.messages).map((message) => {
-              const job = project.jobs.find((j) => j.id === message.jobId);
-              return (
-                <div
-                  key={message.id}
-                  className={
-                    "message message-" +
-                    message.role +
-                    " message-kind-" +
-                    (message.kind || "message")
-                  }
+          <div
+            className="conversation-scroll latest-chat"
+            key={chatMember.id}
+            ref={conversation}
+            onScroll={trackChatScroll}
+          >
+            <div className="conversation-history">
+              {project.historyBefore && (
+                <button
+                  className="text-button load-history"
+                  disabled={historyLoading === "chat"}
+                  onClick={() => loadHistory("chat")}
                 >
-                  {message.role === "assistant" && (
-                    <span className="mini-butler">✳</span>
-                  )}
-                  <div className="message-content">
-                    {message.authorName && (
-                      <small className="message-caption">
-                        {message.authorName}
-                        {message.authorRole === "lead" ? " · team lead" : ""}
-                      </small>
-                    )}
-                    {message.kind &&
-                      message.kind !== "message" &&
-                      message.kind !== "saved-preview" && (
-                        <small className="message-caption">
-                          {message.kind === "review"
-                            ? "Website checks"
-                            : message.kind === "error"
-                              ? "Update failed"
-                              : message.kind === "status"
-                                ? "Butler"
-                                : "Codex"}
-                          {message.createdAt
-                            ? ` · ${new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
-                            : ""}
-                        </small>
-                      )}
-                    {message.kind === "saved-preview" && job ? (
-                      <article className="saved-preview-card">
-                        <small className="small-label">
-                          {job.dismissedAt
-                            ? "DISMISSED · SAVED HERE"
-                            : "PREVIEW IN CHAT HISTORY"}
-                        </small>
-                        <strong>{job.prTitle || message.text}</strong>
-                        <div className="artifact-card-actions">
-                          {job.dismissedAt && (
-                            <button
-                              className="button secondary compact"
-                              disabled={visibilityBusy === job.id}
-                              onClick={() => setPreviewDismissed(job, false)}
-                            >
-                              Restore preview
-                            </button>
-                          )}
-                          <button
-                            className="text-button"
-                            onClick={() => inspect(job)}
-                          >
-                            View preview <Icon name="arrow" size={13} />
-                          </button>
-                        </div>
-                      </article>
-                    ) : message.role === "user" ? (
-                      <p>{message.text}</p>
-                    ) : (
-                      <ButlerText
-                        text={message.text}
-                        kind={message.kind}
-                        diagnostics={message.diagnostics}
-                      />
-                    )}
-                    {message.role === "user" &&
-                      job &&
-                      lastRequestByJob.get(message.jobId) === message.id && (
-                        <JobState job={job} clock={clock} />
-                      )}
-                    {message.kind !== "saved-preview" && (
-                      <Reactions
-                        targetType="message"
-                        targetId={message.id}
-                        summary={project.reactions}
-                        onReact={react}
-                      />
-                    )}
+                  {historyLoading === "chat"
+                    ? "Loading earlier messages…"
+                    : "Load earlier messages"}
+                </button>
+              )}
+              {preparing && (
+                <div className="provision-card">
+                  <span className="small-label">MAKING ROOM FOR YOUR TEAM</span>
+                  <h3>
+                    {project.state === "failed"
+                      ? "Let’s get your workspace ready."
+                      : project.state === "retrying"
+                        ? "Giving setup another try…"
+                        : "Your workspace is taking shape."}
+                  </h3>
+                  <p>Your ideas are saved while we prepare everything.</p>
+                  <div className="setup-steps">
+                    {[
+                      "Create project",
+                      "Prepare workspace",
+                      "Publish website",
+                    ].map((label, i) => (
+                      <span
+                        key={label}
+                        className={
+                          stage > i + 1
+                            ? "complete"
+                            : stage === i + 1
+                              ? "current"
+                              : ""
+                        }
+                      >
+                        {stage > i + 1 ? (
+                          <Icon name="check" size={12} />
+                        ) : (
+                          <i />
+                        )}
+                        {label}
+                      </span>
+                    ))}
                   </div>
-                </div>
-              );
-            })}
-            {latestJob?.error && (
-              <Alert>
-                <strong>{statusLabel(latestJob)}</strong>
-                <ButlerText
-                  text={latestJob.error}
-                  kind="error"
-                  developerUrl={latestJob.prUrl}
-                />
-                {!readOnly && latestJob.state === "preview_failed" ? (
-                  <button
-                    className="text-button"
-                    onClick={() => retryPreview(latestJob)}
-                  >
-                    Retry {latestJob.approvedAt ? "publishing" : "preview"}{" "}
-                    <Icon name="refresh" size={13} />
-                  </button>
-                ) : (
-                  !readOnly &&
-                  !/automatically|bwrap|namespace/i.test(latestJob.error) && (
-                    <button
-                      className="text-button"
-                      onClick={() => {
-                        setText(
-                          "Please finish my changes and fix the problem you found.",
-                        );
-                        textarea.current?.focus({ preventScroll: true });
-                      }}
-                    >
-                      Ask Butler to fix this <Icon name="arrow" size={13} />
-                    </button>
-                  )
-                )}
-              </Alert>
-            )}
-            {latestJob &&
-              [
-                "working",
-                "reviewing",
-                "deploying",
-                "building_preview",
-                "creating_pr",
-              ].includes(latestJob.state) && (
-                <div className="working-line">
-                  <span className="mini-butler">✳</span>
-                  <Spinner />
-                  <span>
-                    {latestJob.state === "working"
-                      ? "Working on your idea…"
-                      : latestJob.state === "building_preview"
-                        ? "Building your preview…"
-                        : latestJob.state === "creating_pr"
-                          ? "Getting your change ready for the website…"
-                          : latestJob.state === "reviewing"
-                            ? "Making sure everything works together…"
-                            : "Publishing your change…"}
-                    {latestJob.startedAt &&
-                      ` · ${elapsed(latestJob.startedAt, clock)}`}
-                  </span>
+                  {project.error && project.isOwner && (
+                    <>
+                      <div className="setup-error">
+                        <ButlerText text={project.error} kind="error" />
+                      </div>
+                      <button className="text-button" onClick={retry}>
+                        Try again <Icon name="refresh" size={13} />
+                      </button>
+                    </>
+                  )}
                 </div>
               )}
-            {project.jobs
-              .filter(
-                (j) =>
-                  j.state === "awaiting_approval" &&
-                  j.artifactUrl &&
-                  !j.dismissedAt &&
-                  j.id === currentUnpublished?.id,
-              )
-              .slice(-1)
-              .map((job) => (
-                <article className="artifact-card" key={job.id}>
-                  <span className="small-label">
-                    PREVIEW READY · NOT PUBLISHED
-                  </span>
-                  <strong>{job.prTitle || "Your change is ready"}</strong>
+              {project.isOwner &&
+                !readOnly &&
+                project.state === "ready" &&
+                project.tasks
+                  .filter((task) => task.state === "failed")
+                  .map((task, index) => (
+                    <Alert key={task.kind + index}>
+                      <strong>
+                        {task.kind === "worker-update"
+                          ? "Butler couldn’t update its workspace"
+                          : task.kind === "sync-history"
+                            ? "Website history could not be loaded"
+                            : task.kind === "artifact"
+                              ? "Your preview isn’t ready yet"
+                              : "Your website hasn’t updated yet"}
+                      </strong>
+                      <ButlerText
+                        text={
+                          task.error ||
+                          "Your work is saved. Try this step again."
+                        }
+                        kind="error"
+                      />
+                      <button className="text-button" onClick={retry}>
+                        Retry{" "}
+                        {task.kind === "worker-update"
+                          ? "workspace update"
+                          : task.kind === "sync-history"
+                            ? "history sync"
+                            : task.kind === "artifact"
+                              ? "preview"
+                              : "publishing"}{" "}
+                        <Icon name="refresh" size={13} />
+                      </button>
+                    </Alert>
+                  ))}
+              {project.isOwner && !readOnly && (
+                <CodexConnection project={project} onConnected={connected} />
+              )}
+              <div className="agent-welcome">
+                <span className="mini-butler">✳</span>
+                <div>
                   <p>
                     {steering
-                      ? "Inspect this change, then approve it for the shared website."
+                      ? `You can guide ${chatMember.name}’s agent and approve their previews.`
                       : readOnly
-                        ? "Your teammate can inspect and approve this change."
-                        : "Try your change before it goes to the shared website."}
+                        ? `You’re watching ${chatMember.name}’s conversation.`
+                        : `Hi ${project.member.name.split(" ")[0]}. What would you like to make?`}
                   </p>
-                  <div className="artifact-card-actions">
-                    <button
-                      className="button primary compact"
-                      onClick={() => inspect(job)}
-                    >
-                      <Icon name="grid" size={16} />
-                      Inspect preview <Icon name="arrow" size={16} />
-                    </button>
-                    <button
-                      className="text-button dismiss-preview"
-                      title="Hide this card for you. Restore it from chat history anytime."
-                      disabled={visibilityBusy === job.id}
-                      onClick={() => setPreviewDismissed(job, true)}
-                    >
-                      Dismiss
-                    </button>
+                  <small>
+                    {readOnly
+                      ? "Everyone on this project can follow the work here. Send requests from your own chat."
+                      : "Tell me in your own words. I’ll make a preview. Try it, then choose Make this the website when you’re happy with it."}
+                  </small>
+                </div>
+              </div>
+              {chatBubbles(project.messages).map((message) => {
+                const job = project.jobs.find((j) => j.id === message.jobId);
+                return (
+                  <div
+                    key={message.id}
+                    className={
+                      "message message-" +
+                      message.role +
+                      " message-kind-" +
+                      (message.kind || "message")
+                    }
+                  >
+                    {message.role === "assistant" && (
+                      <span className="mini-butler">✳</span>
+                    )}
+                    <div className="message-content">
+                      {message.authorName && (
+                        <small className="message-caption">
+                          {message.authorName}
+                          {message.authorRole === "lead" ? " · team lead" : ""}
+                        </small>
+                      )}
+                      {message.kind &&
+                        message.kind !== "message" &&
+                        message.kind !== "saved-preview" && (
+                          <small className="message-caption">
+                            {message.kind === "review"
+                              ? "Website checks"
+                              : message.kind === "error"
+                                ? "Update failed"
+                                : message.kind === "status"
+                                  ? "Butler"
+                                  : "Codex"}
+                            {message.createdAt
+                              ? ` · ${new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+                              : ""}
+                          </small>
+                        )}
+                      {message.kind === "saved-preview" && job ? (
+                        <article className="saved-preview-card">
+                          <small className="small-label">
+                            {job.dismissedAt
+                              ? "DISMISSED · SAVED HERE"
+                              : "PREVIEW IN CHAT HISTORY"}
+                          </small>
+                          <strong>{job.prTitle || message.text}</strong>
+                          <div className="artifact-card-actions">
+                            {job.dismissedAt && (
+                              <button
+                                className="button secondary compact"
+                                disabled={visibilityBusy === job.id}
+                                onClick={() => setPreviewDismissed(job, false)}
+                              >
+                                Restore preview
+                              </button>
+                            )}
+                            <button
+                              className="text-button"
+                              onClick={() => inspect(job)}
+                            >
+                              View preview <Icon name="arrow" size={13} />
+                            </button>
+                          </div>
+                        </article>
+                      ) : message.role === "user" ? (
+                        <p>{message.text}</p>
+                      ) : (
+                        <ButlerText
+                          text={message.text}
+                          kind={message.kind}
+                          diagnostics={message.diagnostics}
+                        />
+                      )}
+                      {message.role === "user" &&
+                        job &&
+                        lastRequestByJob.get(message.jobId) === message.id && (
+                          <JobState job={job} clock={clock} />
+                        )}
+                      {message.kind !== "saved-preview" && (
+                        <Reactions
+                          targetType="message"
+                          targetId={message.id}
+                          summary={project.reactions}
+                          onReact={react}
+                        />
+                      )}
+                    </div>
                   </div>
-                  <Reactions
-                    targetType="preview"
-                    targetId={job.id}
-                    summary={project.reactions}
-                    onReact={react}
+                );
+              })}
+              {latestJob?.error && (
+                <Alert>
+                  <strong>{statusLabel(latestJob)}</strong>
+                  <ButlerText
+                    text={latestJob.error}
+                    kind="error"
+                    developerUrl={latestJob.prUrl}
                   />
-                </article>
-              ))}
-            {project.jobs
-              .filter((j) => j.previewUrl && !j.dismissedAt)
-              .slice(-1)
-              .map((job) => (
+                  {!readOnly && latestJob.state === "preview_failed" ? (
+                    <button
+                      className="text-button"
+                      onClick={() => retryPreview(latestJob)}
+                    >
+                      Retry {latestJob.approvedAt ? "publishing" : "preview"}{" "}
+                      <Icon name="refresh" size={13} />
+                    </button>
+                  ) : (
+                    !readOnly &&
+                    !/automatically|bwrap|namespace/i.test(latestJob.error) && (
+                      <button
+                        className="text-button"
+                        onClick={() => {
+                          setText(
+                            "Please finish my changes and fix the problem you found.",
+                          );
+                          textarea.current?.focus({ preventScroll: true });
+                        }}
+                      >
+                        Ask Butler to fix this <Icon name="arrow" size={13} />
+                      </button>
+                    )
+                  )}
+                </Alert>
+              )}
+              {latestJob &&
+                [
+                  "working",
+                  "reviewing",
+                  "deploying",
+                  "building_preview",
+                  "creating_pr",
+                ].includes(latestJob.state) && (
+                  <div className="working-line">
+                    <span className="mini-butler">✳</span>
+                    <Spinner />
+                    <span>
+                      {latestJob.state === "working"
+                        ? "Working on your idea…"
+                        : latestJob.state === "building_preview"
+                          ? "Building your preview…"
+                          : latestJob.state === "creating_pr"
+                            ? "Getting your change ready for the website…"
+                            : latestJob.state === "reviewing"
+                              ? "Making sure everything works together…"
+                              : "Publishing your change…"}
+                      {latestJob.startedAt &&
+                        ` · ${elapsed(latestJob.startedAt, clock)}`}
+                    </span>
+                  </div>
+                )}
+              {project.jobs
+                .filter(
+                  (j) =>
+                    j.state === "awaiting_approval" &&
+                    j.artifactUrl &&
+                    !j.dismissedAt &&
+                    j.id === currentUnpublished?.id,
+                )
+                .slice(-1)
+                .map((job) => (
+                  <article className="artifact-card" key={job.id}>
+                    <span className="small-label">
+                      PREVIEW READY · NOT PUBLISHED
+                    </span>
+                    <strong>{job.prTitle || "Your change is ready"}</strong>
+                    <p>
+                      {steering
+                        ? "Inspect this change, then approve it for the shared website."
+                        : readOnly
+                          ? "Your teammate can inspect and approve this change."
+                          : "Try your change before it goes to the shared website."}
+                    </p>
+                    <div className="artifact-card-actions">
+                      <button
+                        className="button primary compact"
+                        onClick={() => inspect(job)}
+                      >
+                        <Icon name="grid" size={16} />
+                        Inspect preview <Icon name="arrow" size={16} />
+                      </button>
+                      <button
+                        className="text-button dismiss-preview"
+                        title="Hide this card for you. Restore it from chat history anytime."
+                        disabled={visibilityBusy === job.id}
+                        onClick={() => setPreviewDismissed(job, true)}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                    <Reactions
+                      targetType="preview"
+                      targetId={job.id}
+                      summary={project.reactions}
+                      onReact={react}
+                    />
+                  </article>
+                ))}
+              {project.jobs
+                .filter((j) => j.previewUrl && !j.dismissedAt)
+                .slice(-1)
+                .map((job) => (
+                  <button
+                    key={job.id}
+                    className="preview-link"
+                    onClick={() =>
+                      job.state === "live" ? showCurrentWebsite() : inspect(job)
+                    }
+                  >
+                    <Icon name="grid" size={16} />
+                    {job.state === "live"
+                      ? "View current website"
+                      : "View change preview"}
+                    <Icon name="arrow" size={14} />
+                  </button>
+                ))}
+              {session.user?.isGuest && project.messages.length > 0 && (
                 <button
-                  key={job.id}
-                  className="preview-link"
-                  onClick={() =>
-                    job.state === "live" ? showCurrentWebsite() : inspect(job)
-                  }
+                  className="save-access-card"
+                  onClick={() => setSaving(true)}
                 >
-                  <Icon name="grid" size={16} />
-                  {job.state === "live"
-                    ? "View current website"
-                    : "View change preview"}
-                  <Icon name="arrow" size={14} />
+                  <Icon name="lock" size={16} />
+                  <span>
+                    <strong>Make yourself at home.</strong>
+                    <small>Save access to return from any device.</small>
+                  </span>
+                  <Icon name="arrow" size={16} />
                 </button>
-              ))}
-            {session.user?.isGuest && project.messages.length > 0 && (
-              <button
-                className="save-access-card"
-                onClick={() => setSaving(true)}
-              >
-                <Icon name="lock" size={16} />
-                <span>
-                  <strong>Make yourself at home.</strong>
-                  <small>Save access to return from any device.</small>
-                </span>
-                <Icon name="arrow" size={16} />
-              </button>
-            )}
-            {error && <Alert>{error}</Alert>}
+              )}
+              {error && <Alert>{error}</Alert>}
+            </div>
           </div>
           {readOnly ? (
             <div className="composer read-only-notice">
@@ -2872,6 +3083,17 @@ function Workspace({
             onSend={sendGroupMessage}
             onReact={react}
             onClose={() => setSidebarOpen(false)}
+            agent={project.groupAgent}
+            onInspect={inspect}
+            onDismiss={setPreviewDismissed}
+            onRetry={retryPreview}
+            visibilityBusy={visibilityBusy}
+            renderStatus={(job) => <JobState job={job} clock={clock} />}
+            onRead={readGroup}
+            historyBefore={project.groupHistoryBefore}
+            historyLoading={historyLoading === "group"}
+            historyVersion={historyVersion.group}
+            onHistory={() => loadHistory("group")}
           />
         )}
         <section className="team-panel" aria-label="Team and website updates">
@@ -2964,7 +3186,11 @@ function Workspace({
                     <div className="activity-item" key={job.id}>
                       <button
                         className="text-button"
-                        onClick={() => job.memberId && viewChat(job.memberId)}
+                        onClick={() =>
+                          job.isGroup
+                            ? selectPanel("group")
+                            : job.memberId && viewChat(job.memberId)
+                        }
                       >
                         <strong>{job.name}</strong>
                       </button>
@@ -3043,6 +3269,58 @@ function Workspace({
           )}
         </section>
       </main>
+      {catchUp && (
+        <Modal title="What’s new" onClose={() => setCatchUp(false)}>
+          <p className="quiet-note">
+            Messages, previews and website updates. Jump straight to what
+            matters.
+          </p>
+          <div className="catch-up-list">
+            {notices.length ? (
+              notices.map((notice) => (
+                <button
+                  key={notice.id}
+                  className={
+                    "notice-item" + (notice.unread ? " notice-unread" : "")
+                  }
+                  onClick={() => openNotice(notice)}
+                >
+                  <span className="notice-symbol">
+                    {notice.job
+                      ? "✳"
+                      : notice.channel === "updates"
+                        ? "✓"
+                        : "↗"}
+                  </span>
+                  <span>
+                    <strong>{notice.title}</strong>
+                    <small>{notice.detail}</small>
+                    <time>
+                      {new Date(notice.at).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </time>
+                  </span>
+                  {notice.unread && <i aria-label="Unread" />}
+                </button>
+              ))
+            ) : (
+              <p className="quiet-note">
+                You’re up to date. New messages and previews will appear here.
+              </p>
+            )}
+          </div>
+          {unseen > 0 && (
+            <button
+              className="text-button"
+              onClick={() => markNotices(notices)}
+            >
+              Mark all as seen
+            </button>
+          )}
+        </Modal>
+      )}
       {invite && <Invite project={project} onClose={() => setInvite(false)} />}{" "}
       {sharingWebsite && (
         <ShareWebsite

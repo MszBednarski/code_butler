@@ -3561,3 +3561,188 @@ html.workspace-open,
   .group-chat-panel .panel-top { min-height: 54px; padding: 8px 15px; }
   .keyboard-open .group-chat-panel .panel-top { min-height: 42px; }
 }
+
+/* A chat opens at its native bottom. History is fetched only on request. */
+.conversation-scroll.latest-chat {
+  display: flex;
+  flex-direction: column-reverse;
+  overflow-anchor: none;
+  scroll-behavior: auto;
+}
+.conversation-history {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+.load-history {
+  display: block;
+  width: 100%;
+  padding: 12px;
+  margin-bottom: 14px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  font-size: 11px;
+}
+.mention-butler {
+  font-size: 10px;
+  color: var(--green);
+  text-align: left;
+}
+.mention-butler > span {
+  display: block;
+  font-size: 8px;
+  color: var(--muted);
+}
+.group-preview-card {
+  margin: 14px 0;
+}
+.catch-up-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: #f1f4e9;
+  color: var(--green);
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.unread-badge {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  flex-shrink: 0;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 10px;
+  color: white;
+  background: #a2693f;
+  font-size: 9px;
+  font-weight: 600;
+}
+.mobile-tabs button {
+  position: relative;
+}
+.mobile-tabs .unread-badge {
+  position: absolute;
+  right: 1px;
+  top: -4px;
+  min-width: 12px;
+  height: 12px;
+  padding: 0 3px;
+  font-size: 8px;
+}
+.viewer-notices {
+  position: relative;
+}
+.unread-dot {
+  position: absolute;
+  right: 3px;
+  top: 3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #b66c3e;
+  box-shadow: 0 0 0 2px white;
+}
+.catch-up-list {
+  max-height: min(60dvh, 500px);
+  overflow-y: auto;
+  margin: 16px 0;
+}
+.notice-item {
+  display: flex;
+  align-items: flex-start;
+  width: 100%;
+  gap: 10px;
+  padding: 12px 8px;
+  background: transparent;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  color: var(--green);
+}
+.notice-item > span:nth-child(2) {
+  flex: 1;
+  min-width: 0;
+}
+.notice-item strong,
+.notice-item small,
+.notice-item time {
+  display: block;
+}
+.notice-item strong {
+  font-size: 12px;
+  line-height: 1.6;
+}
+.notice-item small {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.notice-item time {
+  font-size: 9px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+.notice-item > i {
+  width: 6px;
+  height: 6px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: #ac7146;
+}
+.notice-unread {
+  background: #f5f7ef;
+}
+.notice-symbol {
+  color: #748c5d;
+  font-size: 20px;
+}
+.tour-mention {
+  color: #305b42;
+  background: #e5edda;
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.tour-new-badge {
+  font-size: 9px;
+  border-radius: 10px;
+  padding: 2px 5px;
+  background: #a2693f;
+  color: white;
+  margin-left: 4px;
+}
+@media (max-width: 1100px) {
+  .catch-up-button > span {
+    display: none;
+  }
+}
+@media (max-width: 760px) {
+  .catch-up-button {
+    padding: 6px;
+    gap: 3px;
+  }
+  .website-toolbar-actions {
+    gap: 0;
+  }
+}
+.tour-news {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px;
+  background: #f0f3e8;
+  color: var(--green);
+  border-radius: 6px;
+  font-size: 14px;
+}
+.working-glance {
+  font-size: 9px;
+  color: #71865c;
+  font-weight: 400;
+}
+@media (max-width: 1100px) {
+  .working-glance {
+    display: none;
+  }
+}

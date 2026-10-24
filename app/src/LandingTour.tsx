@@ -18,6 +18,7 @@ export default function LandingTour() {
     [preview, setPreview] = useState(false),
     [refresh, setRefresh] = useState(0),
     [copied, setCopied] = useState(false),
+    [demoSeen, setDemoSeen] = useState(false),
     [reactions, setReactions] = useState<ReactionSummary>({
       "message:Maya": [
         { emoji: "🔥", count: 2, reacted: false, names: ["Sam", "You (demo)"] },
@@ -84,6 +85,13 @@ export default function LandingTour() {
           <small>A sample project · no live AI</small>
         </div>
         <span className="tour-demo-tag">PRODUCT DEMO</span>
+        <button
+          className="tour-news"
+          aria-label="What’s new in the demo"
+          onClick={() => setPanel("news")}
+        >
+          ✳{!demoSeen && <span className="tour-new-badge">3</span>}
+        </button>
       </div>
       <div className="tour-nav" role="tablist" aria-label="Demo workspace">
         {[
@@ -95,13 +103,68 @@ export default function LandingTour() {
           <button
             key={value}
             role="tab"
+            aria-label={label}
             aria-selected={panel === value}
-            onClick={() => setPanel(value)}
+            onClick={() => {
+              setPanel(value);
+              if (value === "group") setDemoSeen(true);
+            }}
           >
             {label}
+            {value === "group" && !demoSeen && (
+              <span className="tour-new-badge">2</span>
+            )}
           </button>
         ))}
       </div>
+      {panel === "news" && (
+        <div className="tour-chat-panel">
+          <h3>What’s new</h3>
+          <p className="tour-chat-note">
+            You don’t have to check every chat. Butler brings the important bits
+            together.
+          </p>
+          <button
+            className="notice-item notice-unread"
+            onClick={() => {
+              setPanel("group");
+              setDemoSeen(true);
+            }}
+          >
+            <span className="notice-symbol">✳</span>
+            <span>
+              <strong>Group Butler has a preview</strong>
+              <small>Your shared request is ready to try.</small>
+            </span>
+          </button>
+          <button className="notice-item" onClick={() => setPanel("chat")}>
+            <span className="notice-symbol">↗</span>
+            <span>
+              <strong>Sam is making your changes</strong>
+              <small>Phone controls · working in a separate chat</small>
+            </span>
+          </button>
+          <button
+            className="notice-item"
+            onClick={() => {
+              setPreview(false);
+              setPanel("website");
+            }}
+          >
+            <span className="notice-symbol">✓</span>
+            <span>
+              <strong>The shared website is ready</strong>
+              <small>Open it here and play a round.</small>
+            </span>
+          </button>
+          <div className="tour-chat-composer">
+            <span>
+              Sample updates. Your project shows its own messages, previews and
+              published changes.
+            </span>
+          </div>
+        </div>
+      )}
       {panel === "website" && (
         <div className="tour-website">
           <div className="tour-version-bar">
@@ -329,7 +392,10 @@ export default function LandingTour() {
           </p>
           <div className="tour-message tour-from-butler">
             <small>Maya</small>
-            <p>The new jumps are in my preview. What do you think?</p>
+            <p>
+              <span className="tour-mention">@Butler</span> make the jumps
+              colourful while Sam improves the phone controls.
+            </p>
           </div>
           <div className="tour-message tour-from-butler">
             <small>Sam</small>
@@ -342,15 +408,20 @@ export default function LandingTour() {
             />
           </div>
           <div className="tour-message tour-from-user">
-            <small>You · team lead</small>
+            <small>✳ @Butler · group agent</small>
             <p>
-              Looking good. I’ll inspect the preview and approve it for
-              everyone.
+              I’ve made a preview in our group’s own workspace. Sam’s Butler can
+              keep working on the phone controls. Try the new jumps before they
+              go live.
             </p>
+            <button className="text-button" onClick={requestChange}>
+              Inspect group preview →
+            </button>
           </div>
           <div className="tour-chat-composer">
             <span>
-              Sample group chat. Humans talking to humans; agents keep working.
+              Talk as a team. Tag @Butler to build a shared idea in its own
+              workstream. Sample conversation; no live AI.
             </span>
             <button
               className="button primary compact"

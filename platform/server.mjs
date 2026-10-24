@@ -232,7 +232,7 @@ export function createPlatform(
     req.member =
       req.account && req.project
         ? store.get(
-            `SELECT * FROM members WHERE project_id=? AND user_id=? ${req.query.member ? "AND id=?" : ""} ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END,created_at DESC LIMIT 1`,
+            `SELECT * FROM members WHERE project_id=? AND user_id=? AND role!='agent' ${req.query.member ? "AND id=?" : ""} ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END,created_at DESC LIMIT 1`,
             req.project.id,
             req.account.id,
             ...(req.query.member ? [String(req.query.member)] : []),
@@ -479,7 +479,7 @@ export function createPlatform(
     if (existing) return res.json({ projectId: project.id });
     if (
       store.get(
-        "SELECT COUNT(*) AS total FROM members WHERE project_id=?",
+        "SELECT COUNT(*) AS total FROM members WHERE project_id=? AND role!='agent'",
         project.id,
       ).total >= 20
     )
@@ -507,6 +507,37 @@ export function createPlatform(
     cookie(res, config, "butler_account", store.session(user.id));
     res.status(201).json({ projectId: project.id });
   });
+  function jobViews(project, viewer, member = null, historyIds = null) {
+    return store
+      .all(
+        `SELECT j.id,j.member_id AS memberId,j.request_key AS requestKey,j.text,j.state,j.result,j.error,
+      j.pr_number AS prNumber,j.pr_url AS prUrl,j.preview_url AS previewUrl,j.created_at AS createdAt,j.updated_at AS updatedAt,
+      j.started_at AS startedAt,j.finished_at AS finishedAt,j.merged_at AS mergedAt,j.published_at AS publishedAt,
+      j.change_sha AS changeSha,j.pr_title AS prTitle,j.artifact_url AS artifactUrl,j.artifact_ready_at AS artifactReadyAt,
+      j.approved_at AS approvedAt,j.request_revision AS requestRevision,m.name,
+      (m.role='agent') AS isGroup,
+      (p.owner_id=? OR (m.role!='agent' AND m.user_id=?) OR (m.role='agent' AND j.requested_by=?)) AS canApprove,
+      (SELECT inspected_at FROM preview_inspections i WHERE i.job_id=j.id AND i.user_id=? AND i.sha=j.change_sha) AS inspectedAt,
+      (SELECT dismissed_at FROM preview_visibility v WHERE v.job_id=j.id AND v.user_id=? AND v.hidden_revision=j.request_revision) AS dismissedAt
+      FROM jobs j JOIN members m ON m.id=j.member_id JOIN projects p ON p.id=j.project_id
+      WHERE j.project_id=? ${member ? "AND j.member_id=?" : ""}
+      ${historyIds ? `AND (j.id IN (${historyIds.map(() => "?").join(",") || "NULL"}) OR j.id=(SELECT id FROM jobs WHERE member_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1))` : ""}
+      ORDER BY j.created_at ${member ? "ASC" : "DESC"},j.rowid ${member ? "ASC" : "DESC LIMIT 30"}`,
+        viewer,
+        viewer,
+        viewer,
+        viewer,
+        viewer,
+        project,
+        ...(member ? [member] : []),
+        ...(historyIds ? [...historyIds, member] : []),
+      )
+      .map((job) => ({
+        ...job,
+        isGroup: Boolean(job.isGroup),
+        canApprove: Boolean(job.canApprove),
+      }));
+  }
   app.get("/api/projects/:projectId", signed, membership, (req, res) => {
     const p = req.project;
     const chat = req.query.chat
@@ -520,6 +551,8 @@ export function createPlatform(
       return res
         .status(404)
         .json({ error: "This chat is not in your project." });
+    const chatHistory = store.chatPage(chat.id, req.account.id);
+    const groupHistory = store.groupPage(p.id, req.account.id);
     res.json({
       id: p.id,
       name: p.name,
@@ -542,29 +575,54 @@ export function createPlatform(
       chatMember: memberView(chat),
       readOnly: chat.id !== req.member.id,
       canSteerChat:
-        p.owner_id === req.account.id || chat.user_id === req.account.id,
+        chat.role !== "agent" &&
+        (p.owner_id === req.account.id || chat.user_id === req.account.id),
       members: store.all(
-        "SELECT m.id,m.name,m.prefix,m.role,j.state AS agentState,j.started_at AS startedAt,j.finished_at AS finishedAt FROM members m LEFT JOIN jobs j ON j.id=(SELECT id FROM jobs WHERE member_id=m.id ORDER BY created_at DESC,rowid DESC LIMIT 1) WHERE m.project_id=? ORDER BY m.created_at",
+        "SELECT m.id,m.name,m.prefix,m.role,j.state AS agentState,j.started_at AS startedAt,j.finished_at AS finishedAt FROM members m LEFT JOIN jobs j ON j.id=(SELECT id FROM jobs WHERE member_id=m.id ORDER BY created_at DESC,rowid DESC LIMIT 1) WHERE m.project_id=? AND m.role!='agent' ORDER BY m.created_at",
         p.id,
       ),
       ownMemberships: store.all(
-        "SELECT id,name,prefix,role FROM members WHERE project_id=? AND user_id=?",
+        "SELECT id,name,prefix,role FROM members WHERE project_id=? AND user_id=? AND role!='agent'",
         p.id,
         req.account.id,
       ),
-      messages: store.chatMessages(chat.id, req.account.id),
+      messages: chatHistory.items,
+      historyBefore: chatHistory.before,
+      groupHistoryBefore: groupHistory.before,
       reactions: store.reactionSummary(p.id, req.account.id),
-      groupMessages: store.groupMessages(p.id, req.account.id),
-      jobs: store.all(
-        "SELECT id,member_id AS memberId,request_key AS requestKey,text,state,result,error,pr_number AS prNumber,pr_url AS prUrl,preview_url AS previewUrl,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt,merged_at AS mergedAt,published_at AS publishedAt,change_sha AS changeSha,pr_title AS prTitle,artifact_url AS artifactUrl,artifact_ready_at AS artifactReadyAt,(SELECT inspected_at FROM preview_inspections i WHERE i.job_id=jobs.id AND i.user_id=? AND i.sha=jobs.change_sha) AS inspectedAt,approved_at AS approvedAt,request_revision AS requestRevision,(SELECT dismissed_at FROM preview_visibility v WHERE v.job_id=jobs.id AND v.user_id=? AND v.hidden_revision=jobs.request_revision) AS dismissedAt FROM jobs WHERE member_id=? ORDER BY created_at,rowid",
-        req.account.id,
+      groupMessages: groupHistory.items.filter((m) => m.kind === "human"),
+      jobs: jobViews(
+        p.id,
         req.account.id,
         chat.id,
+        chatHistory.items.map((m) => m.jobId).filter(Boolean),
       ),
-      activity: store.all(
-        "SELECT j.id,j.member_id AS memberId,substr(j.text,1,100) AS text,j.state,j.error,j.pr_url AS prUrl,j.preview_url AS previewUrl,m.name,j.started_at AS startedAt,j.finished_at AS finishedAt,j.created_at AS createdAt FROM jobs j JOIN members m ON m.id=j.member_id WHERE j.project_id=? ORDER BY j.created_at DESC LIMIT 30",
-        p.id,
-      ),
+      groupAgent: (() => {
+        const agent = store.groupAgent(p.id);
+        return agent
+          ? {
+              member: memberView(agent),
+              messages: groupHistory.items.filter((m) => m.kind !== "human"),
+              jobs: jobViews(
+                p.id,
+                req.account.id,
+                agent.id,
+                groupHistory.items.map((m) => m.jobId).filter(Boolean),
+              ),
+            }
+          : null;
+      })(),
+      personalUpdateAt: store.get(
+        `SELECT MAX(at) AS at FROM (
+        SELECT created_at AS at FROM messages WHERE member_id=? AND role='assistant'
+        UNION ALL SELECT e.created_at FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.member_id=?
+        UNION ALL SELECT m.created_at FROM messages m JOIN message_authors a ON a.message_id=m.id WHERE m.member_id=? AND a.user_id!=?)`,
+        req.member.id,
+        req.member.id,
+        req.member.id,
+        req.account.id,
+      ).at,
+      activity: jobViews(p.id, req.account.id),
       releases: store
         .all(
           "SELECT pr_number AS number,title,author,merge_sha AS sha,merged_at AS mergedAt,published_at AS publishedAt,is_live AS isLive FROM releases WHERE project_id=? ORDER BY merged_at DESC,pr_number DESC",
@@ -585,6 +643,54 @@ export function createPlatform(
           : [],
     });
   });
+  app.get(
+    "/api/projects/:projectId/history",
+    signed,
+    membership,
+    (req, res) => {
+      const before = req.query.before;
+      if (typeof before !== "string" || before.length > 1500)
+        return res
+          .status(400)
+          .json({ error: "Choose an earlier page of this conversation." });
+      if (req.query.channel === "group") {
+        const page = store.groupPage(req.project.id, req.account.id, before),
+          agent = store.groupAgent(req.project.id);
+        return res.json({
+          ...page,
+          jobs: agent
+            ? jobViews(
+                req.project.id,
+                req.account.id,
+                agent.id,
+                page.items.map((m) => m.jobId).filter(Boolean),
+              )
+            : [],
+        });
+      }
+      const chat = req.query.chat
+        ? store.get(
+            "SELECT id FROM members WHERE project_id=? AND id=?",
+            req.project.id,
+            String(req.query.chat),
+          )
+        : req.member;
+      if (!chat)
+        return res
+          .status(404)
+          .json({ error: "This chat is not in your project." });
+      const page = store.chatPage(chat.id, req.account.id, before);
+      res.json({
+        ...page,
+        jobs: jobViews(
+          req.project.id,
+          req.account.id,
+          chat.id,
+          page.items.map((m) => m.jobId).filter(Boolean),
+        ),
+      });
+    },
+  );
   app.post("/api/projects/:projectId/wake", signed, membership, (req, res) => {
     if (req.project.hosting_provider === "boat")
       store.enqueue(
@@ -671,20 +777,50 @@ export function createPlatform(
         return res
           .status(400)
           .json({ error: "Send a message between 1 and 4,000 characters." });
-      store.run(
-        "INSERT OR IGNORE INTO group_messages VALUES(?,?,?,?,?,?)",
-        id(),
-        req.project.id,
-        req.member.id,
-        requestKey,
-        text.trim(),
-        now(),
-      );
-      const message = store.get(
-        "SELECT id FROM group_messages WHERE member_id=? AND request_key=?",
-        req.member.id,
-        requestKey,
-      );
+      const command = /(?:^|\s)@butler\b/i.test(text);
+      const instruction = text.replace(/(^|\s)@butler\b/gi, "$1").trim();
+      if (command && !instruction)
+        return res
+          .status(400)
+          .json({ error: "Tell @Butler what you’d like it to work on." });
+      const message = store.transaction(() => {
+        const saved = store.get(
+          "SELECT id FROM group_messages WHERE member_id=? AND request_key=?",
+          req.member.id,
+          requestKey,
+        );
+        if (saved) return saved;
+        const messageId = id();
+        store.run(
+          "INSERT INTO group_messages VALUES(?,?,?,?,?,?)",
+          messageId,
+          req.project.id,
+          req.member.id,
+          requestKey,
+          text.trim(),
+          now(),
+        );
+        if (command) {
+          const agent = store.ensureGroupAgent(req.project.id);
+          const job = store.requestChange(
+            req.project.id,
+            agent,
+            req.account,
+            `Group request from ${req.member.name}:\n${instruction}\n\nRecent group conversation (context only; act on the tagged request above):\n${store
+              .all(
+                "SELECT m.name,g.text FROM group_messages g JOIN members m ON m.id=g.member_id WHERE g.project_id=? ORDER BY g.created_at DESC,g.rowid DESC LIMIT 8",
+                req.project.id,
+              )
+              .reverse()
+              .map((m) => `${m.name}: ${m.text}`)
+              .join("\n")
+              .slice(-9000)}`,
+            `group:${req.member.id}:${requestKey}`,
+          );
+          store.run("INSERT INTO group_requests VALUES(?,?)", messageId, job);
+        }
+        return { id: messageId };
+      });
       res.json({
         message: store
           .groupMessages(req.project.id, req.account.id)
@@ -771,6 +907,10 @@ export function createPlatform(
         return res
           .status(404)
           .json({ error: "This chat isn’t in your project." });
+      if (chat.role === "agent")
+        return res.status(403).json({
+          error: "Tag @Butler in group chat to guide the shared agent.",
+        });
       const text = req.body?.text;
       if (
         typeof text !== "string" ||
@@ -825,18 +965,14 @@ export function createPlatform(
           .json({ error: "This preview isn’t in your project." });
       const { dismissed, revision, sha } = req.body || {};
       if (typeof dismissed !== "boolean" || !Number.isSafeInteger(revision))
-        return res
-          .status(400)
-          .json({
-            error: "Choose whether to dismiss or restore this preview.",
-          });
+        return res.status(400).json({
+          error: "Choose whether to dismiss or restore this preview.",
+        });
       if (revision !== job.request_revision || sha !== job.change_sha)
-        return res
-          .status(409)
-          .json({
-            error:
-              "This preview has been updated. Open its latest version and try again.",
-          });
+        return res.status(409).json({
+          error:
+            "This preview has been updated. Open its latest version and try again.",
+        });
       if (dismissed) {
         const current = store.get(
           "SELECT hidden_revision FROM preview_visibility WHERE job_id=? AND user_id=?",
@@ -863,11 +999,13 @@ export function createPlatform(
   );
   function ownedJob(req, res, next) {
     req.job = store.get(
-      "SELECT * FROM jobs WHERE id=? AND project_id=? AND (member_id=? OR ?=1)",
+      "SELECT * FROM jobs WHERE id=? AND project_id=? AND (member_id=? OR ?=1 OR (requested_by=? AND member_id IN (SELECT member_id FROM group_agents WHERE project_id=?)))",
       req.params.jobId,
       req.project.id,
       req.member.id,
       req.project.owner_id === req.account.id ? 1 : 0,
+      req.account.id,
+      req.project.id,
     );
     if (!req.job)
       return res
@@ -923,11 +1061,9 @@ export function createPlatform(
         job.request_revision,
       )
     )
-      return res
-        .status(409)
-        .json({
-          error: "Restore this preview from chat history before publishing it.",
-        });
+      return res.status(409).json({
+        error: "Restore this preview from chat history before publishing it.",
+      });
     if (
       store.get(
         "SELECT 1 FROM jobs WHERE member_id=? AND request_key NOT LIKE 'review-fix:%' AND created_at>? LIMIT 1",

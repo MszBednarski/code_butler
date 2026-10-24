@@ -2544,3 +2544,324 @@ test("first-time project creation needs no installation or existing repository a
     1,
   );
 });
+
+test("@Butler runs in a separate durable group workspace, retries once, and requires requester or lead approval", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    inv = await f.invite(p.id);
+  const alice = await f.join(inv.url, "Alice"),
+    bob = await f.join(inv.url, "Bob");
+  f.store.run(
+    "UPDATE projects SET state='ready',repo='lead/site' WHERE id=?",
+    p.id,
+  );
+  f.store.run("UPDATE jobs SET state='unchanged' WHERE project_id=?", p.id);
+  const group = `/api/projects/${p.id}/group/messages`;
+  const ordinary = await (
+    await f.call(
+      group,
+      { text: "Please make the website blue", requestKey: id() },
+      alice,
+    )
+  ).json();
+  assert.equal(ordinary.message.jobId, null);
+  assert.equal(
+    f.store.groupAgent(p.id),
+    undefined,
+    "Talking to humans must not provision an agent",
+  );
+  const request = { text: "@Butler add a scoreboard", requestKey: id() };
+  const posted = await (await f.call(group, request, alice)).json();
+  const retried = await (await f.call(group, request, alice)).json();
+  assert.equal(posted.message.id, retried.message.id);
+  assert.ok(posted.message.jobId);
+  const agent = f.store.groupAgent(p.id),
+    job = f.store.get("SELECT * FROM jobs WHERE id=?", posted.message.jobId);
+  assert.equal(job.member_id, agent.id);
+  assert.equal(agent.role, "agent");
+  assert.match(agent.prefix, /^team-[a-f0-9]{8}$/);
+  assert.notEqual(
+    agent.id,
+    f.store.get(
+      "SELECT id FROM members WHERE project_id=? AND name='Alice'",
+      p.id,
+    ).id,
+  );
+  assert.match(job.text, /request from Alice/i);
+  assert.match(job.text, /Recent group conversation/);
+  const aliceId = f.store.get(
+    "SELECT user_id FROM members WHERE project_id=? AND name='Alice'",
+    p.id,
+  ).user_id;
+  assert.equal(job.requested_by, aliceId);
+  assert.equal(
+    f.store.get("SELECT COUNT(*) AS n FROM jobs WHERE member_id=?", agent.id).n,
+    1,
+  );
+  let view = await (
+    await f.call(`/api/projects/${p.id}`, undefined, alice)
+  ).json();
+  assert.equal(
+    view.members.some((m) => m.role === "agent"),
+    false,
+  );
+  assert.equal(
+    view.ownMemberships.some((m) => m.role === "agent"),
+    false,
+  );
+  assert.equal(view.groupAgent.jobs[0].canApprove, true);
+  assert.equal(
+    view.jobs.length,
+    0,
+    "Personal chat and group agent must stay separate",
+  );
+  assert.equal(
+    (await f.call(`/api/projects/${p.id}?member=${agent.id}`)).status,
+    404,
+  );
+  const project = f.store.get("SELECT * FROM projects WHERE id=?", p.id);
+  const claimed = (await (await workerCall(f, project, "/claim", {})).json())
+    .job;
+  assert.equal(claimed.member.id, agent.id);
+  assert.equal(claimed.member.prefix, agent.prefix);
+  await workerCall(f, project, `/jobs/${job.id}/thread`, { threadId: id() });
+  f.store.recordEvent(
+    job.id,
+    "sample-progress",
+    "agent",
+    "The scoreboard is ready to try.",
+  );
+  const sha = "b".repeat(40);
+  f.store.run(
+    "UPDATE jobs SET state='awaiting_approval',change_sha=?,branch=?,pr_title='Add a scoreboard',artifact_url='https://preview.example.test',artifact_ready_at=? WHERE id=?",
+    sha,
+    agent.prefix + "/scoreboard",
+    now(),
+    job.id,
+  );
+  view = await (await f.call(`/api/projects/${p.id}`, undefined, bob)).json();
+  assert.equal(view.groupAgent.jobs[0].canApprove, false);
+  assert.ok(
+    view.groupAgent.messages.some(
+      (m) => m.text === "The scoreboard is ready to try.",
+    ),
+  );
+  assert.ok(
+    view.groupMessages.some(
+      (m) => m.id === posted.message.id && m.jobId === job.id,
+    ),
+  );
+  const base = `/api/projects/${p.id}/jobs/${job.id}`;
+  assert.equal((await f.call(base + "/inspect", { sha }, bob)).status, 404);
+  assert.equal((await f.call(base + "/approve", { sha }, bob)).status, 404);
+  assert.equal((await f.call(base + "/approve", { sha }, alice)).status, 409);
+  assert.equal((await f.call(base + "/inspect", { sha }, alice)).status, 200);
+  // Any teammate can refine the same shared draft without taking its approval.
+  const followup = await (
+    await f.call(
+      group,
+      { text: "@butler use big numbers", requestKey: id() },
+      bob,
+    )
+  ).json();
+  assert.equal(followup.message.jobId, job.id);
+  assert.equal(f.store.groupAgent(p.id).id, agent.id);
+  assert.equal(
+    f.store.get("SELECT requested_by FROM jobs WHERE id=?", job.id)
+      .requested_by,
+    aliceId,
+  );
+  assert.equal((await f.call(base + "/approve", { sha }, alice)).status, 409);
+  f.store.run(
+    "UPDATE jobs SET state='awaiting_approval',artifact_ready_at=? WHERE id=?",
+    now(),
+    job.id,
+  );
+  assert.equal((await f.call(base + "/inspect", { sha })).status, 200);
+  assert.equal((await f.call(base + "/approve", { sha })).status, 202);
+  assert.equal(
+    f.store.get(
+      "SELECT COUNT(*) AS n FROM tasks WHERE project_id=? AND kind='open-pr'",
+      p.id,
+    ).n,
+    1,
+  );
+  assert.equal(
+    (await f.call(group, { text: "@Butler", requestKey: id() }, alice)).status,
+    400,
+  );
+  assert.equal(
+    (await f.call(group, { text: "@Butler build", requestKey: id() }, ""))
+      .status,
+    401,
+  );
+  assert.equal(
+    (
+      await f.call(group, { text: "@Butler build", requestKey: id() }, alice, {
+        origin: "https://elsewhere.example",
+      })
+    ).status,
+    403,
+  );
+  const other = await f.create("Other");
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${other.id}/group/messages`,
+        { text: "@Butler build", requestKey: id() },
+        alice,
+      )
+    ).status,
+    404,
+  );
+  const reopened = createStore(f.dir);
+  assert.equal(reopened.groupAgent(p.id).id, agent.id);
+  assert.ok(reopened.groupAgent(p.id).thread_id);
+  reopened.close();
+});
+
+test("chat APIs return only the end and page older personal and mixed group history without gaps", async (t) => {
+  const f = await fixture(t),
+    p = await f.create(),
+    inv = await f.invite(p.id),
+    alice = await f.join(inv.url, "Alice");
+  const member = f.store.get(
+    "SELECT * FROM members WHERE project_id=? AND name='Alice'",
+    p.id,
+  );
+  const job = f.store.requestChange(
+    p.id,
+    member,
+    f.store.get("SELECT * FROM users WHERE id=?", member.user_id),
+    "Build a game",
+    id(),
+  );
+  for (let i = 0; i < 130; i++)
+    f.store.run(
+      "INSERT INTO messages VALUES(?,?,?,?,?,?,?)",
+      id(),
+      p.id,
+      member.id,
+      job,
+      i % 2 ? "assistant" : "user",
+      "Saved entry " + i,
+      100000 + Math.floor(i / 3),
+    );
+  const all = f.store.chatMessages(member.id, member.user_id);
+  let view = await (
+    await f.call(`/api/projects/${p.id}`, undefined, alice)
+  ).json();
+  assert.ok(view.messages.length <= 40);
+  assert.equal(view.messages.at(-1).id, all.at(-1).id);
+  assert.ok(view.historyBefore);
+  let fetched = [...view.messages],
+    cursor = view.historyBefore;
+  while (cursor) {
+    const r = await f.call(
+      `/api/projects/${p.id}/history?before=${cursor}`,
+      undefined,
+      alice,
+    );
+    assert.equal(r.status, 200);
+    const page = await r.json();
+    assert.ok(page.items.length <= 40);
+    fetched = [...page.items, ...fetched];
+    cursor = page.before;
+  }
+  assert.deepEqual(
+    fetched.map((m) => m.id),
+    all.map((m) => m.id),
+  );
+  const agent = f.store.ensureGroupAgent(p.id);
+  const groupJob = f.store.requestChange(
+    p.id,
+    agent,
+    f.lead,
+    "Make shared changes",
+    id(),
+  );
+  for (let i = 0; i < 100; i++) {
+    f.store.run(
+      "INSERT INTO group_messages VALUES(?,?,?,?,?,?)",
+      id(),
+      p.id,
+      member.id,
+      id(),
+      "Human group entry " + i,
+      200000 + i,
+    );
+    f.store.recordEvent(
+      groupJob,
+      "progress-" + i,
+      "agent",
+      "Group agent entry " + i,
+      200000 + i,
+    );
+  }
+  view = await (await f.call(`/api/projects/${p.id}`, undefined, alice)).json();
+  assert.ok(view.groupMessages.length + view.groupAgent.messages.length <= 40);
+  assert.ok(view.groupHistoryBefore);
+  let groupItems = [...view.groupMessages, ...view.groupAgent.messages],
+    before = view.groupHistoryBefore;
+  while (before) {
+    const page = await (
+      await f.call(
+        `/api/projects/${p.id}/history?channel=group&before=${before}`,
+        undefined,
+        alice,
+      )
+    ).json();
+    assert.ok(page.items.length <= 40);
+    groupItems.push(...page.items);
+    before = page.before;
+  }
+  assert.equal(new Set(groupItems.map((m) => m.id)).size, groupItems.length);
+  assert.equal(groupItems.filter((m) => m.kind === "human").length, 100);
+  assert.equal(groupItems.filter((m) => m.kind === "agent").length, 100);
+  assert.ok(
+    groupItems
+      .filter((m) => m.kind === "human")
+      .every((m) => m.isOwn && m.memberId === member.id),
+  );
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${p.id}/history?before=invalid`,
+        undefined,
+        alice,
+      )
+    ).status,
+    400,
+  );
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${p.id}/history?before=${view.groupHistoryBefore}`,
+        undefined,
+        "",
+      )
+    ).status,
+    401,
+  );
+  const other = await f.create("Other");
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${other.id}/history?before=${view.groupHistoryBefore}`,
+        undefined,
+        alice,
+      )
+    ).status,
+    404,
+  );
+  assert.equal(
+    (
+      await f.call(
+        `/api/projects/${p.id}/history?chat=${id()}&before=${view.groupHistoryBefore}`,
+        undefined,
+        alice,
+      )
+    ).status,
+    404,
+  );
+});

@@ -110,6 +110,12 @@ export function createStore(directory) {
       job_id TEXT NOT NULL REFERENCES jobs(id), user_id TEXT NOT NULL REFERENCES users(id),
       hidden_revision INTEGER, dismissed_at INTEGER NOT NULL, title TEXT NOT NULL,
       PRIMARY KEY(job_id,user_id));
+    CREATE TABLE IF NOT EXISTS group_agents (
+      project_id TEXT PRIMARY KEY REFERENCES projects(id),
+      member_id TEXT NOT NULL UNIQUE REFERENCES members(id));
+    CREATE TABLE IF NOT EXISTS group_requests (
+      message_id TEXT PRIMARY KEY REFERENCES group_messages(id),
+      job_id TEXT NOT NULL REFERENCES jobs(id));
   `);
   if (
     !db
@@ -179,6 +185,7 @@ export function createStore(directory) {
     approved_by: "TEXT",
     request_revision: "INTEGER NOT NULL DEFAULT 0",
     pending_text: "TEXT",
+    requested_by: "TEXT",
   }))
     if (!jobColumns.has(column))
       db.exec(`ALTER TABLE jobs ADD COLUMN ${column} ${type}`);
@@ -200,15 +207,24 @@ export function createStore(directory) {
       job.state === "needs_attention" ? "review" : "error",
       job.error,
     );
+  let transactionDepth = 0;
   const transaction = (fn) => {
-    db.exec("BEGIN IMMEDIATE");
+    const level = transactionDepth;
+    db.exec(level ? `SAVEPOINT nested_${level}` : "BEGIN IMMEDIATE");
+    transactionDepth++;
     try {
       const value = fn();
-      db.exec("COMMIT");
+      db.exec(level ? `RELEASE nested_${level}` : "COMMIT");
       return value;
     } catch (error) {
-      db.exec("ROLLBACK");
+      db.exec(
+        level
+          ? `ROLLBACK TO nested_${level}; RELEASE nested_${level}`
+          : "ROLLBACK",
+      );
       throw error;
+    } finally {
+      transactionDepth--;
     }
   };
   function seal(value) {
@@ -322,6 +338,7 @@ export function createStore(directory) {
       );
       run("DELETE FROM preview_inspections WHERE user_id=?", from);
       run("UPDATE jobs SET approved_by=? WHERE approved_by=?", to, from);
+      run("UPDATE jobs SET requested_by=? WHERE requested_by=?", to, from);
       run(
         "UPDATE OR IGNORE preview_visibility SET user_id=? WHERE user_id=?",
         to,
@@ -428,32 +445,99 @@ export function createStore(directory) {
     ))
       recordEvent(job.id, key, kind, text, at);
   }
-  function chatMessages(member, viewer = null) {
-    const rows = all(
-      `SELECT m.id,m.job_id AS jobId,m.role,m.text,m.created_at AS createdAt,'message' AS kind,CASE m.role WHEN 'user' THEN 0 ELSE 2 END AS position,m.rowid AS sequence,NULL AS eventKey,NULL AS prNumber,u.name AS authorName,a.role AS authorRole FROM messages m LEFT JOIN message_authors a ON a.message_id=m.id LEFT JOIN users u ON u.id=a.user_id WHERE m.member_id=?
-       UNION ALL SELECT j.id||':'||e.event_key,j.id,'assistant',e.text,e.created_at,e.kind,1,e.rowid,e.event_key,j.pr_number,NULL,NULL FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.member_id=?
-       ORDER BY createdAt,position,sequence`,
-      member,
-      member,
-    );
+  function chatSql(member, viewer = null, assistantOnly = false) {
+    let sql = `SELECT m.id,m.job_id AS jobId,m.role,m.text,m.created_at AS createdAt,'message' AS kind,CASE m.role WHEN 'user' THEN 0 ELSE 2 END AS position,m.rowid AS sequence,NULL AS eventKey,NULL AS prNumber,u.name AS authorName,a.role AS authorRole FROM messages m LEFT JOIN message_authors a ON a.message_id=m.id LEFT JOIN users u ON u.id=a.user_id WHERE m.member_id=? ${assistantOnly ? "AND m.role='assistant'" : ""}
+      UNION ALL SELECT j.id||':'||e.event_key,j.id,'assistant',e.text,e.created_at,e.kind,1,e.rowid,e.event_key,j.pr_number,NULL,NULL FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.member_id=?`;
+    const args = [member, member];
     if (viewer) {
-      rows.push(
-        ...all(
-          `SELECT 'saved-preview:'||j.id AS id,j.id AS jobId,'assistant' AS role,v.title AS text,
-         v.dismissed_at AS createdAt,'saved-preview' AS kind,3 AS position,v.rowid AS sequence,
-         NULL AS eventKey,NULL AS prNumber,NULL AS authorName,NULL AS authorRole
-         FROM preview_visibility v JOIN jobs j ON j.id=v.job_id WHERE j.member_id=? AND v.user_id=?`,
-          member,
-          viewer,
-        ),
-      );
-      rows.sort(
-        (a, b) =>
-          a.createdAt - b.createdAt ||
-          a.position - b.position ||
-          a.sequence - b.sequence,
-      );
+      sql += ` UNION ALL SELECT 'saved-preview:'||j.id,j.id,'assistant',v.title,v.dismissed_at,'saved-preview',3,v.rowid,NULL,NULL,NULL,NULL
+        FROM preview_visibility v JOIN jobs j ON j.id=v.job_id WHERE j.member_id=? AND v.user_id=?`;
+      args.push(member, viewer);
     }
+    return { sql, args };
+  }
+  function chatMessages(member, viewer = null) {
+    const { sql, args } = chatSql(member, viewer);
+    return presentMessages(
+      all(
+        `SELECT * FROM (${sql}) ORDER BY createdAt,position,sequence,id`,
+        ...args,
+      ),
+    );
+  }
+  function historyPage(source, before = null, limit = 40) {
+    let cursor = null;
+    if (before) {
+      try {
+        cursor = JSON.parse(Buffer.from(before, "base64url").toString());
+      } catch {
+        /* Invalid cursor is rejected below. */
+      }
+      if (
+        typeof before !== "string" ||
+        before.length > 1500 ||
+        !Array.isArray(cursor) ||
+        cursor.length !== 4 ||
+        !cursor.slice(0, 3).every(Number.isSafeInteger) ||
+        typeof cursor[3] !== "string" ||
+        cursor[3].length > 800
+      )
+        throw Object.assign(new Error("Invalid chat history cursor"), {
+          status: 400,
+        });
+    }
+    const rows = all(
+      `SELECT * FROM (${source.sql}) ${cursor ? "WHERE (createdAt,position,sequence,id)<(?,?,?,?)" : ""} ORDER BY createdAt DESC,position DESC,sequence DESC,id DESC LIMIT ?`,
+      ...source.args,
+      ...(cursor || []),
+      limit + 1,
+    );
+    const hasMore = rows.length > limit;
+    const selected = rows.slice(0, limit).reverse(),
+      oldest = selected[0];
+    return {
+      items: presentMessages(selected),
+      before: hasMore
+        ? Buffer.from(
+            JSON.stringify([
+              oldest.createdAt,
+              oldest.position,
+              oldest.sequence,
+              oldest.id,
+            ]),
+          ).toString("base64url")
+        : null,
+    };
+  }
+  function chatPage(member, viewer, before = null) {
+    return historyPage(chatSql(member, viewer), before);
+  }
+  function groupPage(project, viewer, before = null) {
+    const source = {
+      sql: `SELECT g.id,r.job_id AS jobId,'user' AS role,g.text,g.created_at AS createdAt,'human' AS kind,0 AS position,g.rowid AS sequence,NULL AS eventKey,NULL AS prNumber,m.name AS authorName,(CASE WHEN m.user_id=? THEN 'own:' ELSE 'human:' END)||m.id AS authorRole FROM group_messages g JOIN members m ON m.id=g.member_id LEFT JOIN group_requests r ON r.message_id=g.id WHERE g.project_id=?`,
+      args: [viewer, project],
+    };
+    const agent = groupAgent(project);
+    if (agent) {
+      const bot = chatSql(agent.id, viewer, true);
+      source.sql += ` UNION ALL ${bot.sql}`;
+      source.args.push(...bot.args);
+    }
+    const page = historyPage(source, before);
+    return {
+      ...page,
+      items: page.items.map((message) => ({
+        ...message,
+        name: message.authorName || "@Butler",
+        memberId:
+          message.kind === "human"
+            ? message.authorRole.split(":")[1]
+            : agent?.id,
+        isOwn: message.authorRole?.startsWith("own:") || false,
+      })),
+    };
+  }
+  function presentMessages(rows) {
     const seen = new Set();
     return rows
       .filter((message) => {
@@ -521,12 +605,33 @@ export function createStore(directory) {
   }
   function groupMessages(project, user) {
     return all(
-      `SELECT g.id,g.member_id AS memberId,m.name,g.text,g.created_at AS createdAt,
-       (m.user_id=?) AS isOwn FROM group_messages g JOIN members m ON m.id=g.member_id
+      `SELECT g.id,g.member_id AS memberId,m.name,g.text,g.created_at AS createdAt,r.job_id AS jobId,
+       (m.user_id=?) AS isOwn FROM group_messages g JOIN members m ON m.id=g.member_id LEFT JOIN group_requests r ON r.message_id=g.id
        WHERE g.project_id=? ORDER BY g.created_at,g.rowid`,
       user,
       project,
     ).map((message) => ({ ...message, isOwn: Boolean(message.isOwn) }));
+  }
+  function groupAgent(project) {
+    return get(
+      "SELECT m.* FROM members m JOIN group_agents g ON g.member_id=m.id WHERE g.project_id=?",
+      project,
+    );
+  }
+  function ensureGroupAgent(project) {
+    const saved = groupAgent(project);
+    if (saved) return saved;
+    const member = id();
+    run(
+      "INSERT INTO members(id,project_id,user_id,name,prefix,role,created_at) VALUES(?,?,?,'Group Butler',?,'agent',?)",
+      member,
+      project,
+      get("SELECT owner_id FROM projects WHERE id=?", project).owner_id,
+      `team-${member.slice(0, 8)}`,
+      now(),
+    );
+    run("INSERT INTO group_agents VALUES(?,?)", project, member);
+    return groupAgent(project);
   }
   function humanMessage(project, memberId, jobId, actor, text) {
     const messageId = id();
@@ -545,9 +650,12 @@ export function createStore(directory) {
       get("SELECT user_id FROM members WHERE id=?", memberId).user_id
     )
       run(
-        "INSERT INTO message_authors VALUES(?,?,'lead')",
+        "INSERT INTO message_authors VALUES(?,?,?)",
         messageId,
         actor.id,
+        get("SELECT role FROM members WHERE id=?", memberId).role === "agent"
+          ? "teammate"
+          : "lead",
       );
   }
   function resumeFollowups(jobId) {
@@ -614,7 +722,7 @@ export function createStore(directory) {
           "status",
           "I’ll update this preview with your follow-up.",
         );
-      } else
+      } else {
         run(
           "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at,approval_required) VALUES(?,?,?,?,?,?,?,1)",
           jobId,
@@ -625,6 +733,8 @@ export function createStore(directory) {
           now(),
           now(),
         );
+        run("UPDATE jobs SET requested_by=? WHERE id=?", actor.id, jobId);
+      }
       run(
         "INSERT INTO request_receipts VALUES(?,?,?)",
         member.id,
@@ -698,8 +808,12 @@ export function createStore(directory) {
     recordEvent,
     recordPullEvent,
     chatMessages,
+    chatPage,
+    groupPage,
     reactionSummary,
     groupMessages,
+    groupAgent,
+    ensureGroupAgent,
     humanMessage,
     requestChange,
     resumeFollowups,
