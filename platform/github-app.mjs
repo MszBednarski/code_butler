@@ -56,13 +56,15 @@ export async function saveCreationCredential(
     },
   );
   const value = await response.json();
+  // GitHub returns scoped-token grants in the installation envelope.
+  const permissions = value.installation?.permissions;
   if (
     !response.ok ||
     !value.token ||
     Object.entries(creationPermissions).some(
-      ([key, level]) => value.permissions?.[key] !== level,
+      ([key, level]) => permissions?.[key] !== level,
     ) ||
-    Object.entries(value.permissions || {}).some(
+    Object.entries(permissions || {}).some(
       ([key, level]) => level !== "none" && creationPermissions[key] !== level,
     )
   )

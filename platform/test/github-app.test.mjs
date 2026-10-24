@@ -593,16 +593,26 @@ test("installation callbacks require the browser, signed-in account and installa
   const url = new URL(start.headers.get("location")),
     browser = start.headers.get("set-cookie").split(";")[0];
   assert.equal(url.hostname, "github.com");
-  assert.equal(url.pathname, "/apps/butler-renamed/installations/new/permissions");
+  assert.equal(
+    url.pathname,
+    "/apps/butler-renamed/installations/new/permissions",
+  );
   assert.deepEqual(url.searchParams.getAll("repository_ids[]"), ["7"]);
   assert.equal(f.config.githubAppSlug, "butler-renamed");
-  assert.equal(f.store.setting("provider-settings").githubAppSlug, "butler-renamed");
+  assert.equal(
+    f.store.setting("provider-settings").githubAppSlug,
+    "butler-renamed",
+  );
   assert.equal(url.searchParams.get("suggested_target_id"), "42");
   registration = { id: "wrong-app", slug: "unrelated-app" };
-  const wrong = await fetch(f.config.publicUrl + `/auth/github/install?returnTo=${encodeURIComponent(`/p/${project.id}`)}`, {
-    headers: { cookie },
-    redirect: "manual",
-  });
+  const wrong = await fetch(
+    f.config.publicUrl +
+      `/auth/github/install?returnTo=${encodeURIComponent(`/p/${project.id}`)}`,
+    {
+      headers: { cookie },
+      redirect: "manual",
+    },
+  );
   assert.equal(wrong.status, 503);
   assert.equal(wrong.headers.get("location"), null);
   registration = { id: f.config.githubAppId, slug: "butler-renamed" };
@@ -670,9 +680,11 @@ test("creation authorization stores only a bounded scoped token and rejects expa
     assert.deepEqual(body.permissions, creationPermissions);
     return Response.json({
       token: "scoped-user",
-      permissions: {
-        ...creationPermissions,
-        ...(extra ? { contents: "write" } : {}),
+      installation: {
+        permissions: {
+          ...creationPermissions,
+          ...(extra ? { contents: "write" } : {}),
+        },
       },
       expires_at: new Date(Date.now() + 7200000).toISOString(),
     });
@@ -706,6 +718,20 @@ test("creation authorization stores only a bounded scoped token and rejects expa
       f.user.id,
       { access_token: "unscoped-user" },
       request,
+    ),
+  );
+  // A top-level permissions fixture is not GitHub's scoped-token response.
+  await assert.rejects(
+    saveCreationCredential(
+      f.config,
+      f.store,
+      f.user.id,
+      { access_token: "unscoped-user" },
+      async () =>
+        Response.json({
+          token: "wrong-envelope",
+          permissions: creationPermissions,
+        }),
     ),
   );
   const saved = f.store.connection(f.user.id, "github_creation");
@@ -746,7 +772,7 @@ test("creation consent is browser-bound, preserves the idea return path, and sav
         );
         return Response.json({
           token: "scoped-create-user",
-          permissions: creationPermissions,
+          installation: { permissions: creationPermissions },
           expires_at: new Date(Date.now() + 3600000).toISOString(),
         });
       },
