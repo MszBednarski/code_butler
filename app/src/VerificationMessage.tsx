@@ -3,6 +3,7 @@ export type VerificationUpdate = {
   summary: string;
   details?: string;
   model?: string;
+  sample?: boolean;
 };
 
 export default function VerificationMessage({ text }: { text: string }) {
@@ -12,7 +13,9 @@ export default function VerificationMessage({ text }: { text: string }) {
     if (typeof parsed.summary === "string") update = parsed;
   } catch {}
   const label =
-    update.phase === "passed"
+    update.sample
+      ? "Sample · not run"
+      : update.phase === "passed"
       ? "Passed"
       : update.phase === "blocked"
         ? "Needs a fix"
@@ -25,15 +28,16 @@ export default function VerificationMessage({ text }: { text: string }) {
     <div className="gemini-verification">
       <div className="gemini-verification-heading">
         <span aria-hidden="true">✧</span>
-        <strong>Gemini 4 Argon</strong>
-        <span className={`gemini-verdict gemini-${update.phase || "check"}`}>
+        <strong>{update.sample ? "Sample Gemini verification" : "Gemini 4 Argon"}</strong>
+        <span className={`gemini-verdict gemini-${update.sample ? "sample" : update.phase || "check"}`}>
           {label}
         </span>
       </div>
+      {update.sample && <p className="gemini-sample-notice">Illustrative example. Gemini did not run these checks.</p>}
       <p>{update.summary}</p>
       {update.details && (
         <details className="gemini-details">
-          <summary>See Gemini’s checks</summary>
+          <summary>{update.sample ? "See example checks" : "See Gemini’s checks"}</summary>
           <pre>{update.details}</pre>
         </details>
       )}
