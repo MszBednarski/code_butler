@@ -2076,6 +2076,14 @@ small {
 .gemini-details { margin-top: 10px; font-size: 12px; }
 .gemini-details summary { cursor: pointer; color: #69409b; }
 .gemini-details pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 340px; overflow-y: auto; font: inherit; line-height: 1.6; margin: 10px 0 0; }
+.gemini-settings-modal { width: min(440px, calc(100vw - 32px)); max-width: calc(100vw - 32px); }
+.gemini-settings-modal input { width: 100%; font-size: 16px; }
+@media (max-width: 760px) {
+  .site-header:has(.account-menu) { flex-wrap: wrap; gap: 10px; }
+  .account-menu { max-width: 100%; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+  .account-menu > span:not(.avatar) { display: none; }
+  .workspace-header .gemini-settings-button span { display: none; }
+}
 .read-only-notice p {
   font-size: 12px;
   margin: 0 0 10px;

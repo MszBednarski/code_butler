@@ -57,7 +57,7 @@ export default function GeminiSettings() {
       </button>
       {open && (
         <dialog
-          className="modal"
+          className="modal gemini-settings-modal"
           ref={dialog}
           aria-labelledby="gemini-settings-title"
           onCancel={close}
