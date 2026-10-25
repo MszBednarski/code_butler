@@ -6,6 +6,32 @@ import { createPlatform } from "../server.mjs";
 import { createStore, id, token, now, digest } from "../store.mjs";
 import { createProvisioner } from "../provision.mjs";
 
+test("Gemini is optional per account, encrypted, revocable, and applies to existing project reviews", async (t) => {
+  const f = await fixture(t), p = await f.create();
+  const project = f.store.get("SELECT * FROM projects WHERE id=?", p.id);
+  const initial = await (await f.call("/api/settings/verification")).json();
+  assert.equal(initial.connected, false);
+  assert.equal((await f.call("/api/settings/verification", undefined, "")).status, 401);
+  assert.equal((await workerCall(f, project, "/pulls/7/gemini")).status, 200);
+  assert.equal((await (await workerCall(f, project, "/pulls/7/gemini")).json()).enabled, false);
+  const apiKey = "gemini-fixture-" + id();
+  const saved = await (await f.call("/api/settings/verification", {apiKey})).json();
+  assert.equal(saved.connected, true);
+  assert.ok(!JSON.stringify(saved).includes(apiKey));
+  assert.ok(!f.store.get("SELECT secret FROM connections WHERE user_id=? AND provider='gemini_verification'", f.lead.id).secret.includes(apiKey));
+  f.store.run("UPDATE jobs SET pr_number=7,approved_at=? WHERE project_id=?", now(), p.id);
+  assert.equal((await (await workerCall(f, project, "/pulls/7/gemini")).json()).enabled, true);
+  const other = f.store.guest("Other account");
+  f.store.run("UPDATE users SET email='other@example.test' WHERE id=?", other.id);
+  const otherCookie = `butler_account=${f.store.session(other.id)}`;
+  assert.equal((await (await f.call("/api/settings/verification", undefined, otherCookie)).json()).connected, false);
+  await f.call("/api/settings/verification", {disconnect:true}, otherCookie);
+  assert.ok(f.store.connection(f.lead.id, "gemini_verification"));
+  await f.call("/api/settings/verification", {disconnect:true});
+  assert.equal((await (await workerCall(f, project, "/pulls/7/gemini")).json()).enabled, false);
+  assert.equal((await f.call("/api/worker/pulls/7/gemini", undefined, "")).status, 401);
+});
+
 async function fixture(t, overrides = {}) {
   const dir = await mkdtemp(`${tmpdir()}/butler-platform-`),
     store = createStore(dir);

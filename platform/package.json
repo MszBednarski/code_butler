@@ -2,7 +2,17 @@
   "name": "butler-platform",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.13" },
-  "scripts": { "start": "node server.mjs", "test": "node --test test/*.test.mjs" },
-  "dependencies": { "express": "^5.2.1", "qrcode": "^1.5.4", "tar": "^7.5.1" }
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@google/genai": "2.31.0",
+    "express": "^5.2.1",
+    "qrcode": "^1.5.4",
+    "tar": "^7.5.1"
+  }
 }

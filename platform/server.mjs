@@ -18,6 +18,7 @@ import { installWorkerApi } from "./worker-api.mjs";
 import { installGitProxy } from "./git-proxy.mjs";
 import { createProvisioner } from "./provision.mjs";
 import { installSetup } from "./setup.mjs";
+import { installGeminiSettings } from "./gemini.mjs";
 
 const uuid = (value) =>
   typeof value === "string" && /^[a-f0-9-]{36}$/.test(value);
@@ -219,6 +220,7 @@ export function createPlatform(
   installSetup(app, config, store, provider.request);
   installWorkerApi(app, config, store, provider);
   installAuth(app, config, store, provider);
+  installGeminiSettings(app, store);
   const signed = (req, res, next) =>
     req.account
       ? next()

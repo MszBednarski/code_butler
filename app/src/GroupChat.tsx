@@ -204,7 +204,9 @@ export default function GroupChat({
                 <div className="message-content">
                   <div className="group-message-author">
                     <strong>
-                      {message.kind === "gemini" ? "Gemini · independent verification" : message.name}
+                      {message.kind === "gemini"
+                        ? "Gemini · independent verification"
+                        : message.name}
                       {message.isOwn ? " (you)" : ""}
                     </strong>
                     <time
@@ -242,7 +244,9 @@ export default function GroupChat({
                         </button>
                       </div>
                     </article>
-                  ) : message.kind === "gemini" ? <VerificationMessage text={message.text} /> : (
+                  ) : message.kind === "gemini" ? (
+                    <VerificationMessage text={message.text} />
+                  ) : (
                     <p>{display}</p>
                   )}
                   {display !== message.text &&

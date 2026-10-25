@@ -93,6 +93,14 @@ Butler serializes its own merges and rechecks head/base. Without an owner-config
 
 ## Verification
 
+### Optional Gemini verification
+
+After signing in, open **Gemini checks** in the project or account header and connect a Gemini API key. It is saved encrypted to that account, never as a global application variable, exposed through an API response, or passed into coding workers. The request author's connection takes priority; a project lead's connection can cover their team's reviews. Disconnecting affects that account only. Existing projects resolve the connection at review time, so the next approved change can use Gemini without recreating a workspace.
+
+Without a connected key, the existing Codex review path continues. With one, `gemini-4-argon` uses the official SDK's Interactions API with medium thinking and background execution. Its restricted tools read app files, execute the app checks, and open the proposed merge in Chromium at phone size. Approval requires both successful checks and a real browser assertion. The model's plan, tool evidence and verdict appear as purple Gemini messages with expandable details. Failures use the existing repair loop; model or account errors pause review instead of publishing unchecked changes. Human preview inspection and approval remain required before opening the PR.
+
+The broker binds interactions to an approved request, account, project and exact head/base pair, persists resumable state encrypted, rejects mismatched tool replies and limits each review to eight model turns. It never forwards private reasoning. Browser screenshots can be sent to Gemini for visual inspection; app source and tool results are sent to Google's API using the connected account's billing. Automated tests use fixtures; a connected real key is required to verify live inference.
+
 `platform/test` checks tenant/member access, read-only team chats, durable progress, creator-only preview approval, revision checks, OAuth state, email-link binding, origin protection, invite revocation, private recovery links, request idempotency and persistent storage. Its pipeline test uses real Git smart-HTTP clone/push, real npm/TypeScript/Vite builds, a model fixture, and simulated provider endpoints to exercise request → draft preview → inspection → approval → PR → review → merge → resumed conversation. `project-worker/test` checks progress recovery, head/base merge guards, device-code parsing, worker authentication and subprocess credential separation.
 
 Real GitHub consent, Railway OAuth permissions/provisioning, Codex subscription authorization, production previews and publishing must also be exercised against the deployed installation after its integration apps are registered. Fixture tests do not establish that these external account connections are configured.

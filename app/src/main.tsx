@@ -13,6 +13,7 @@ import type { ChatMessage } from "./communication";
 import { attachWorkspaceViewport } from "./workspace-viewport";
 import LandingTour from "./LandingTour";
 import VerificationMessage from "./VerificationMessage";
+import GeminiSettings from "./GeminiSettings";
 import Reactions from "./Reactions";
 import type { ReactionSummary, ReactionTarget } from "./Reactions";
 import GroupChat from "./GroupChat";
@@ -855,6 +856,7 @@ function Dashboard({
       <header className="site-header">
         <Brand />
         <div className="account-menu">
+          {!session.user?.isGuest && <GeminiSettings />}
           {listOnly && (
             <a className="button ghost compact" href="/start">
               <Icon name="plus" size={15} />
@@ -2330,6 +2332,7 @@ function Workspace({
           ))}
         </nav>
         <div className="workspace-header-actions">
+          {session.user && !session.user.isGuest && <GeminiSettings />}
           <button
             className="catch-up-button"
             onClick={() => setCatchUp(true)}

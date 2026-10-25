@@ -1,4 +1,5 @@
 import { digest, id, now } from "./store.mjs";
+import { installGeminiWorker } from "./gemini.mjs";
 
 const SHA = /^[a-f0-9]{40}$/;
 const number = (value) =>
@@ -23,6 +24,7 @@ export function installWorkerApi(app, config, store, provider) {
         .json({ error: "Invalid project worker credential." });
     next();
   });
+  installGeminiWorker(app, store, provider);
   app.get("/api/worker/config", (req, res) =>
     res.json({
       id: req.project.id,
