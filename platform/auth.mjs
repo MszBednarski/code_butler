@@ -149,6 +149,7 @@ export function installAuth(app, config, store, provider) {
         return res.redirect(
           `${state.return_to}?auth_error=Authorization%20was%20not%20completed`,
         );
+      let stage = "token_exchange";
       try {
         const response = await provider.request(
           name === "github"
@@ -180,7 +181,12 @@ export function installAuth(app, config, store, provider) {
         );
         const credentials = await response.json();
         if (!response.ok || !credentials.access_token)
-          throw new Error("Authorization was not completed. Please try again.");
+          throw Object.assign(new Error("Authorization was not completed."), {
+            status: response.status,
+            code: ["bad_verification_code", "incorrect_client_credentials", "redirect_uri_mismatch", "access_denied"].includes(credentials.error)
+              ? credentials.error
+              : "token_exchange_failed",
+          });
         let userId = state.user_id;
         if (name === "github") {
           if (
@@ -211,6 +217,7 @@ export function installAuth(app, config, store, provider) {
               "An older broad GitHub grant was removed. Sign in again for profile-only access.",
             );
           }
+          stage = "profile";
           const me = await provider.request("https://api.github.com/user", {
             headers: {
               Authorization: `Bearer ${credentials.access_token}`,
@@ -219,10 +226,11 @@ export function installAuth(app, config, store, provider) {
             },
             signal: AbortSignal.timeout(30000),
           });
-          if (!me.ok) throw new Error("Could not read your GitHub profile.");
+          if (!me.ok) throw Object.assign(new Error("Could not read your GitHub profile."), { status: me.status });
           const profile = await me.json();
           if (!profile.id || typeof profile.login !== "string")
             throw new Error("Invalid GitHub profile.");
+          stage = "account";
           const existing = store.get(
             "SELECT * FROM users WHERE github_id=?",
             String(profile.id),
@@ -250,6 +258,7 @@ export function installAuth(app, config, store, provider) {
           }
           // Retain only a short-lived, permission-scoped USER token after explicit creation consent.
           if (state.provider === "github-create") {
+            stage = "project_creation_consent";
             if (!githubLoginClient(config).app)
               throw new Error("GitHub App login is required.");
             await saveCreationCredential(
@@ -290,12 +299,20 @@ export function installAuth(app, config, store, provider) {
             expiresAt: now() + Number(credentials.expires_in || 3600) * 1000,
           });
         }
+        stage = "session";
         cookie(res, config, "butler_account", store.session(userId));
         res.redirect(state.return_to);
       } catch (error) {
-        console.error(`[auth] ${name} callback failed: ${error.name}`);
+        // Deliberately omit request URLs, codes, tokens and provider response bodies.
+        const code = /^[a-z_]{1,80}$/.test(error.code || "")
+          ? error.code
+          : "callback_failed";
+        console.error(`[auth] ${name} callback failed: ${JSON.stringify({ stage, code, status: Number(error.status) || null, ...error.authDiagnostic })}`);
+        const message = stage === "project_creation_consent"
+          ? "GitHub signed you in, but couldn’t authorize creating your project. Your saved work is safe. Please try connecting again."
+          : "Connection failed. Please try again.";
         res.redirect(
-          `${state.return_to}?auth_error=${encodeURIComponent("Connection failed. Please try again.")}`,
+          `${state.return_to}?auth_error=${encodeURIComponent(message)}`,
         );
       }
     });

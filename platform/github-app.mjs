@@ -68,10 +68,26 @@ export async function saveCreationCredential(
       ([key, level]) => level !== "none" && creationPermissions[key] !== level,
     )
   )
-    throw accessError(
+    throw Object.assign(accessError(
       "GitHub could not authorize new project creation. Try connecting again.",
       403,
-    );
+      "creation_scope_failed",
+    ), { authDiagnostic: {
+      upstreamStatus: response.status,
+      hasToken: Boolean(value.token),
+      hasInstallation: Boolean(value.installation),
+      missingPermissions: Object.entries(creationPermissions)
+        .filter(([key, level]) => permissions?.[key] !== level).map(([key]) => key),
+      expandedPermissions: Object.keys(githubPermissions)
+        .filter((key) => permissions?.[key] && permissions[key] !== "none" && permissions[key] !== creationPermissions[key]),
+      messageKind: /installation/i.test(value.message || "") ? "installation"
+        : /target/i.test(value.message || "") ? "target"
+        : /permission/i.test(value.message || "") ? "permission"
+        : /not found/i.test(value.message || "") ? "not_found" : "other",
+      validationFields: Array.isArray(value.errors) ? value.errors.flatMap((error) =>
+        ["access_token", "target", "target_id", "permissions", "permissions.repository_creation", "permissions.metadata"].includes(error.field) ? [error.field] : [],
+      ) : [],
+    } });
   const expiresAt = Math.min(
     Date.now() + 3600000,
     value.expires_at ? Date.parse(value.expires_at) : Infinity,

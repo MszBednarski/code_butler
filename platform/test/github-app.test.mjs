@@ -754,7 +754,7 @@ test("creation consent is browser-bound, preserves the idea return path, and sav
     githubAppClientId: "app-client",
     githubAppClientSecret: "app-secret",
   });
-  let narrowed = 0;
+  let narrowed = 0, fail = false;
   const platform = createPlatform(f.config, {
     store: f.store,
     provisioner: {},
@@ -766,6 +766,7 @@ test("creation consent is browser-bound, preserves the idea return path, and sav
           return Response.json({ id: 42, login: "lead", name: "Lead" });
         assert.ok(url.endsWith("/token/scoped"));
         narrowed++;
+        if (fail) return Response.json({ message: "Invalid permissions private-provider-secret", errors: [{ field: "private-provider-secret" }] }, { status: 422 });
         assert.deepEqual(
           JSON.parse(options.body).permissions,
           creationPermissions,
@@ -812,4 +813,18 @@ test("creation consent is browser-bound, preserves the idea return path, and sav
     { redirect: "manual", headers: { cookie } },
   );
   assert.equal(premature.headers.get("location"), "/start");
+  fail = true;
+  f.store.run("DELETE FROM connections WHERE provider='github_creation'");
+  const logs = [];
+  t.mock.method(console, "error", (message) => logs.push(message));
+  const retry = await fetch(f.config.publicUrl + "/auth/github?purpose=create&returnTo=%2Fstart", { redirect: "manual" });
+  const retryUrl = new URL(retry.headers.get("location"));
+  const failed = await fetch(f.config.publicUrl + `/auth/github/callback?state=${retryUrl.searchParams.get("state")}&code=private-authorization-code`, {
+    redirect: "manual", headers: { cookie: retry.headers.get("set-cookie").split(";")[0] },
+  });
+  assert.match(new URL(failed.headers.get("location"), f.config.publicUrl).searchParams.get("auth_error"), /signed you in.*authorize/);
+  assert.equal(creationCredential(f.config, f.store, f.user.id), null);
+  assert.match(logs[0], /project_creation_consent/);
+  assert.match(logs[0], /"upstreamStatus":422/);
+  for (const secret of ["private-provider-secret", "private-authorization-code", "unscoped-user", "app-secret", retryUrl.searchParams.get("state")]) assert.ok(!logs[0].includes(secret));
 });
