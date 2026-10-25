@@ -12,6 +12,7 @@ import { chatBubbles, explainButler } from "./communication";
 import type { ChatMessage } from "./communication";
 import { attachWorkspaceViewport } from "./workspace-viewport";
 import LandingTour from "./LandingTour";
+import VerificationMessage from "./VerificationMessage";
 import Reactions from "./Reactions";
 import type { ReactionSummary, ReactionTarget } from "./Reactions";
 import GroupChat from "./GroupChat";
@@ -293,6 +294,7 @@ function ButlerText({
   developerUrl?: string;
   diagnostics?: string[];
 }) {
+  if (kind === "gemini") return <VerificationMessage text={text} />;
   const explanation = explainButler(text, kind);
   const details = [...new Set([text, ...diagnostics])].filter(
     (value) => value.trim() !== explanation,
@@ -2807,7 +2809,9 @@ function Workspace({
                         message.kind !== "message" &&
                         message.kind !== "saved-preview" && (
                           <small className="message-caption">
-                            {message.kind === "review"
+                            {message.kind === "gemini"
+                              ? "Independent verification"
+                              : message.kind === "review"
                               ? "Website checks"
                               : message.kind === "error"
                                 ? "Update failed"

@@ -3,6 +3,7 @@ import { useState } from "react";
 import type { DemoWebsiteFeatures } from "./horse-demo";
 import { horseDemoWebsite } from "./horse-demo";
 import Reactions from "./Reactions";
+import VerificationMessage from "./VerificationMessage";
 import type { ReactionSummary, ReactionTarget } from "./Reactions";
 
 type DemoOwner = "Maya" | "Sam" | "group";
@@ -499,6 +500,9 @@ export default function LandingTour() {
             </span>
           </div>
           {proposal(person)}
+          <div className="message message-kind-gemini"><div className="message-content">
+            <VerificationMessage text={JSON.stringify({ phase: "plan", summary: "Before this goes live, I’ll independently check the change and show the results here.", details: `Example verification plan for ${person}’s change:\n1. Check that the website compiles.\n2. Open it at phone size and test the jump controls.\n3. Report any problems for Butler to fix, then check again.\n\nThis is a sample. Your project shows Gemini’s actual checks and findings.` })} />
+          </div></div>
           {savedPreview(person)}
           <div className="tour-chat-composer">
             <span>Sample conversation · no live AI is running.</span>

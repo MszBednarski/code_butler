@@ -5,6 +5,7 @@ import type { ReactionSummary, ReactionTarget } from "./Reactions";
 import { chatBubbles, explainButler } from "./communication";
 import type { ChatMessage } from "./communication";
 import { useLatestChat } from "./latest-chat";
+import VerificationMessage from "./VerificationMessage";
 import type { Job } from "./workspace-types";
 
 export type GroupMessage = {
@@ -196,13 +197,14 @@ export default function GroupChat({
                 key={message.id}
                 className={
                   "message group-message " +
-                  (message.isOwn ? "message-user" : "message-teammate")
+                  (message.isOwn ? "message-user" : "message-teammate") +
+                  (message.kind === "gemini" ? " message-kind-gemini" : "")
                 }
               >
                 <div className="message-content">
                   <div className="group-message-author">
                     <strong>
-                      {message.name}
+                      {message.kind === "gemini" ? "Gemini · independent verification" : message.name}
                       {message.isOwn ? " (you)" : ""}
                     </strong>
                     <time
@@ -240,10 +242,11 @@ export default function GroupChat({
                         </button>
                       </div>
                     </article>
-                  ) : (
+                  ) : message.kind === "gemini" ? <VerificationMessage text={message.text} /> : (
                     <p>{display}</p>
                   )}
                   {display !== message.text &&
+                    message.kind !== "gemini" &&
                     message.kind !== "saved-preview" && (
                       <details className="developer-details">
                         <summary>Details for developers</summary>

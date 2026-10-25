@@ -2060,6 +2060,22 @@ small {
   border-left: 2px solid #b3745e;
   padding-left: 12px;
 }
+.message-kind-gemini .message-content {
+  background: #f4efff;
+  border: 1px solid #d8c6f5;
+  border-left: 3px solid #8054bd;
+  border-radius: 12px;
+  padding: 13px;
+  color: #342442;
+}
+.gemini-verification-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; color: #69409b; font-size: 12px; margin-bottom: 8px; }
+.gemini-verification-heading > span:first-child { font-size: 21px; line-height: 1; }
+.gemini-verdict { font-size: 10px; background: #e7dcf9; border-radius: 12px; padding: 3px 7px; }
+.gemini-passed { color: #23583b; background: #dceee2; }
+.gemini-blocked,.gemini-error { color: #714319; background: #f6e6ca; }
+.gemini-details { margin-top: 10px; font-size: 12px; }
+.gemini-details summary { cursor: pointer; color: #69409b; }
+.gemini-details pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 340px; overflow-y: auto; font: inherit; line-height: 1.6; margin: 10px 0 0; }
 .read-only-notice p {
   font-size: 12px;
   margin: 0 0 10px;

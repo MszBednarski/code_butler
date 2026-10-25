@@ -2,6 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chatBubbles, explainButler } from "../src/communication.ts";
 
+test("Gemini verification remains separate from coding and generic review bubbles", () => {
+  const messages = ["review", "gemini", "gemini"].map((kind, i) => ({ id: String(i), jobId: "job", role: "assistant", kind, text: "Checking the change." }));
+  assert.equal(chatBubbles(messages).length, 3);
+});
+
 test("a failure mentioning PR creation never claims the change is ready to publish", () => {
   const text = "Creating the pull request failed. Your work is saved.";
   const explanation = explainButler(text, "error");

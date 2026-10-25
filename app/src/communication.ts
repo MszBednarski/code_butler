@@ -19,6 +19,8 @@ export function chatBubbles<T extends ChatMessage>(messages: T[]) {
       message.role === "assistant" &&
       last?.role === "assistant" &&
       message.kind !== "saved-preview" &&
+      message.kind !== "gemini" &&
+      last.kind !== "gemini" &&
       last.kind !== "saved-preview" &&
       last.jobId === message.jobId &&
       (!(last.kind === "agent" || message.kind === "agent") ||

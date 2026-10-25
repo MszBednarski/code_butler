@@ -124,7 +124,7 @@ export function installWorkerApi(app, config, store, provider) {
       (e) =>
         typeof e.key === "string" &&
         /^[a-zA-Z0-9:._-]{1,160}$/.test(e.key) &&
-        ["agent", "status", "review", "error"].includes(e.kind) &&
+        ["agent", "status", "review", "error", "gemini"].includes(e.kind) &&
         typeof e.text === "string" &&
         e.text.length > 0 &&
         e.text.length <= 20000 &&
