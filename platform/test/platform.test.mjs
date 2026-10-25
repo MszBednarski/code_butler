@@ -2545,6 +2545,34 @@ test("first-time project creation needs no installation or existing repository a
   );
 });
 
+test("a selected installation can start a project without saving a user creation token", async (t) => {
+  const f = await fixture(t);
+  f.store.run("DELETE FROM connections WHERE provider='github_creation'");
+  const session = await (await f.call("/api/session")).json();
+  assert.equal(session.connections.githubCreation, true);
+  assert.ok(!JSON.stringify(session).includes("token"));
+  const p = await f.create();
+  assert.equal(
+    f.store.get("SELECT repo FROM projects WHERE id=?", p.id).repo,
+    null,
+  );
+  f.store.run("DELETE FROM connections WHERE provider='github_installation'");
+  assert.equal(
+    (await (await f.call("/api/session")).json()).connections.githubCreation,
+    false,
+  );
+  assert.equal(
+    (
+      await f.call("/api/projects", {
+        name: "Another project",
+        description: "A new idea",
+        requestKey: id(),
+      })
+    ).status,
+    409,
+  );
+});
+
 test("@Butler runs in a separate durable group workspace, retries once, and requires requester or lead approval", async (t) => {
   const f = await fixture(t),
     p = await f.create(),

@@ -276,12 +276,19 @@ export function createPlatform(
     const saved = user && store.connection(user.id, "boat");
     return Boolean(
       saved?.access_token &&
-      saved.environmentId &&
-      Date.parse(saved.expiresAt) > now(),
+        saved.environmentId &&
+        Date.parse(saved.expiresAt) > now(),
     );
   };
   const hostingFor = (user) =>
     boatConnected(user) ? "boat" : config.defaultHostingProvider || "boat";
+  const canCreateRepository = (user) =>
+    Boolean(
+      user &&
+        githubAppReady(config) &&
+        (creationCredential(config, store, user.id) ||
+          store.connection(user.id, "github_installation")),
+    );
   app.get("/api/session", (req, res) => {
     const github =
       req.account && store.connection(req.account.id, "github_installation");
@@ -289,9 +296,7 @@ export function createPlatform(
       user: publicUser(req.account),
       connections: {
         github: Boolean(github && githubAppReady(config)),
-        githubCreation: Boolean(
-          req.account && creationCredential(config, store, req.account.id),
-        ),
+        githubCreation: canCreateRepository(req.account),
         railway: Boolean(
           req.account && store.connection(req.account.id, "railway"),
         ),
@@ -347,7 +352,7 @@ export function createPlatform(
     if (
       !req.account.github_id ||
       !githubAppReady(config) ||
-      !creationCredential(config, store, req.account.id) ||
+      !canCreateRepository(req.account) ||
       !store.connection(req.account.id, hosting)
     )
       return res.status(409).json({

@@ -62,6 +62,29 @@ export function installAuth(app, config, store, provider) {
     req.account = accountForRequest(req, store);
     next();
   });
+  const resumeCreation = (userId, returnTo) => {
+    const projectId = /^\/p\/([a-f0-9-]{36})$/.exec(returnTo)?.[1];
+    if (
+      !projectId ||
+      !store.get(
+        "SELECT id FROM projects WHERE id=? AND owner_id=? AND state='github_authorization'",
+        projectId,
+        userId,
+      )
+    )
+      return;
+    store.transaction(() => {
+      store.run(
+        "UPDATE tasks SET state='queued',attempts=0,error=NULL,available_at=? WHERE project_id=? AND kind='provision' AND state='failed'",
+        now(),
+        projectId,
+      );
+      store.run(
+        "UPDATE projects SET state='queued',error=NULL WHERE id=?",
+        projectId,
+      );
+    });
+  };
   const begin = (name, clientId, authorize, scopes) => (req, res) => {
     const origin = callbackOrigin(req, config);
     if (new URL(origin).host !== req.get("host"))
@@ -183,7 +206,12 @@ export function installAuth(app, config, store, provider) {
         if (!response.ok || !credentials.access_token)
           throw Object.assign(new Error("Authorization was not completed."), {
             status: response.status,
-            code: ["bad_verification_code", "incorrect_client_credentials", "redirect_uri_mismatch", "access_denied"].includes(credentials.error)
+            code: [
+              "bad_verification_code",
+              "incorrect_client_credentials",
+              "redirect_uri_mismatch",
+              "access_denied",
+            ].includes(credentials.error)
               ? credentials.error
               : "token_exchange_failed",
           });
@@ -226,7 +254,11 @@ export function installAuth(app, config, store, provider) {
             },
             signal: AbortSignal.timeout(30000),
           });
-          if (!me.ok) throw Object.assign(new Error("Could not read your GitHub profile."), { status: me.status });
+          if (!me.ok)
+            throw Object.assign(
+              new Error("Could not read your GitHub profile."),
+              { status: me.status },
+            );
           const profile = await me.json();
           if (!profile.id || typeof profile.login !== "string")
             throw new Error("Invalid GitHub profile.");
@@ -261,36 +293,27 @@ export function installAuth(app, config, store, provider) {
             stage = "project_creation_consent";
             if (!githubLoginClient(config).app)
               throw new Error("GitHub App login is required.");
-            await saveCreationCredential(
-              config,
-              store,
-              userId,
-              credentials,
-              provider.request,
-            );
-            const projectId = /^\/p\/([a-f0-9-]{36})$/.exec(
-              state.return_to,
-            )?.[1];
-            if (
-              projectId &&
-              store.get(
-                "SELECT id FROM projects WHERE id=? AND owner_id=? AND state='github_authorization'",
-                projectId,
+            try {
+              await saveCreationCredential(
+                config,
+                store,
                 userId,
-              )
-            ) {
-              store.transaction(() => {
-                store.run(
-                  "UPDATE tasks SET state='queued',attempts=0,error=NULL,available_at=? WHERE project_id=? AND kind='provision' AND state='failed'",
-                  now(),
-                  projectId,
-                );
-                store.run(
-                  "UPDATE projects SET state='queued',error=NULL WHERE id=?",
-                  projectId,
-                );
-              });
+                credentials,
+                provider.request,
+              );
+            } catch (error) {
+              if (error.code !== "creation_scope_failed") throw error;
+              // Identity has succeeded. Installation consent can provide the
+              // dedicated creation permission without retaining this user token.
+              console.error(
+                `[auth] github creation consent continuing with installation: ${JSON.stringify(error.authDiagnostic)}`,
+              );
+              cookie(res, config, "butler_account", store.session(userId));
+              return res.redirect(
+                `/auth/github/install?returnTo=${encodeURIComponent(state.return_to)}`,
+              );
             }
+            resumeCreation(userId, state.return_to);
           }
         } else {
           if (!userId) throw new Error("Sign in with GitHub first.");
@@ -307,10 +330,13 @@ export function installAuth(app, config, store, provider) {
         const code = /^[a-z_]{1,80}$/.test(error.code || "")
           ? error.code
           : "callback_failed";
-        console.error(`[auth] ${name} callback failed: ${JSON.stringify({ stage, code, status: Number(error.status) || null, ...error.authDiagnostic })}`);
-        const message = stage === "project_creation_consent"
-          ? "GitHub signed you in, but couldn’t authorize creating your project. Your saved work is safe. Please try connecting again."
-          : "Connection failed. Please try again.";
+        console.error(
+          `[auth] ${name} callback failed: ${JSON.stringify({ stage, code, status: Number(error.status) || null, ...error.authDiagnostic })}`,
+        );
+        const message =
+          stage === "project_creation_consent"
+            ? "GitHub signed you in, but couldn’t authorize creating your project. Your saved work is safe. Please try connecting again."
+            : "Connection failed. Please try again.";
         res.redirect(
           `${state.return_to}?auth_error=${encodeURIComponent(message)}`,
         );
@@ -338,13 +364,16 @@ export function installAuth(app, config, store, provider) {
       );
     const repositoryId =
       project && JSON.parse(project.resources).githubRepositoryId;
-    if (!project?.repo || !Number.isSafeInteger(repositoryId))
-      return res.redirect("/start");
+    const bootstrap = !project?.repo || !Number.isSafeInteger(repositoryId);
     try {
       const current = await provider.app(
         `/users/${encodeURIComponent(req.account.github_login)}/installation`,
       );
       await provider.connect(req.account.id, current.id);
+      if (bootstrap) {
+        resumeCreation(req.account.id, returnTo);
+        return res.redirect(returnTo);
+      }
       // Editing an existing installation preserves access for earlier Butler projects.
       return res.redirect(
         `https://github.com/settings/installations/${current.id}`,
@@ -387,7 +416,8 @@ export function installAuth(app, config, store, provider) {
     );
     url.searchParams.set("state", state);
     url.searchParams.set("suggested_target_id", req.account.github_id);
-    url.searchParams.append("repository_ids[]", String(repositoryId));
+    if (!bootstrap)
+      url.searchParams.append("repository_ids[]", String(repositoryId));
     res.redirect(url.href);
   });
   app.get("/auth/github/install/callback", async (req, res) => {
@@ -415,6 +445,7 @@ export function installAuth(app, config, store, provider) {
       return res.status(400).send("Invalid GitHub installation.");
     try {
       await provider.connect(req.account.id, installationId);
+      resumeCreation(req.account.id, state.return_to);
       res.redirect(state.return_to);
     } catch (error) {
       res.redirect(

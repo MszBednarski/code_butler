@@ -361,7 +361,7 @@ function Landing({ session, error }: { session: Session; error: string }) {
   const startUrl = session.user
     ? "/start"
     : session.capabilities.github
-      ? "/auth/github?returnTo=%2Fstart"
+      ? "/auth/github?purpose=create&returnTo=%2Fstart"
       : "#get-started";
   return (
     <div className="landing">
@@ -914,9 +914,10 @@ function Dashboard({
               </span>
               <h2>Butler handles the project files.</h2>
               <p>
-                We’ll create a new private GitHub repository for your project.
-                If GitHub asks you to add it to Butler, approve only that
-                project. Setup continues automatically when you return.
+                Sign in and let Butler create a new private project for you.
+                If GitHub asks where Butler can work, choose “Only select
+                repositories” to keep access limited. You don’t need an existing
+                repository. Setup continues when you return.
               </p>
               <a
                 className={
@@ -936,7 +937,7 @@ function Dashboard({
               </a>
               <p className="quiet-note">
                 {githubAvailable
-                  ? "No existing repository needed. Describe your idea next; Butler creates a new private repository, then asks you to approve access to it."
+                  ? "No project files to prepare or tokens to copy. Connect your account, then describe your idea."
                   : "GitHub setup is being finished. Please try again shortly."}
               </p>
             </section>
@@ -3721,7 +3722,10 @@ function InstallationSetup() {
               Sign in with GitHub, connect your Boat account, and create a
               project. Codex sign-in happens inside the project.
             </p>
-            <a className="button primary" href="/auth/github?returnTo=%2Fstart">
+            <a
+              className="button primary"
+              href="/auth/github?purpose=create&returnTo=%2Fstart"
+            >
               Start your first project
               <Icon name="arrow" size={17} />
             </a>
@@ -3842,7 +3846,7 @@ function App() {
           </p>
           <a
             className="button primary full"
-            href={`/auth/github?returnTo=${encodeURIComponent(route)}`}
+            href={`/auth/github?${route === "/start" ? "purpose=create&" : ""}returnTo=${encodeURIComponent(route)}`}
           >
             <Icon name="github" />
             Continue with GitHub
