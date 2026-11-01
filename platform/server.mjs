@@ -268,6 +268,12 @@ export function createPlatform(
         error:
           "Teammate chats are read-only. Return to your chat to send a request.",
       });
+    if (req.method === "POST" && req.project.hosting_provider === "boat")
+      store.run(
+        "UPDATE projects SET last_active_at=? WHERE id=?",
+        now(),
+        req.project.id,
+      );
     next();
   }
   const owner = (req, res, next) =>
@@ -571,6 +577,7 @@ export function createPlatform(
       isOwner: p.owner_id === req.account.id,
       codingReady: Boolean(p.codex_ready),
       hostingProvider: p.hosting_provider,
+      hostingState: JSON.parse(p.resources).hostingCheck?.state || "ready",
       githubAccess:
         p.state === "github_access" && p.repo && p.owner_id === req.account.id
           ? {
@@ -699,7 +706,12 @@ export function createPlatform(
     },
   );
   app.post("/api/projects/:projectId/wake", signed, membership, (req, res) => {
-    if (req.project.hosting_provider === "boat")
+    const check = JSON.parse(req.project.resources).hostingCheck;
+    if (
+      req.project.hosting_provider === "boat" &&
+      req.project.state === "ready" &&
+      (check?.state !== "ready" || check.at < now() - 5 * 60000)
+    )
       store.enqueue(
         req.project.id,
         "boat-wake",

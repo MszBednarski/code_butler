@@ -528,6 +528,7 @@ export function createAgent({
       clearInterval(heartbeat);
       await progress.flush();
     }
+    return true;
   }
   return {
     initialize,

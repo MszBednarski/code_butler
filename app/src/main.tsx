@@ -68,6 +68,7 @@ type Project = {
   repoUrl?: string;
   isOwner: boolean;
   codingReady: boolean;
+  hostingState?: "ready" | "stopping" | "sleeping" | "unavailable";
   hostingProvider?: "railway" | "boat";
   githubAccess?: { repo: string; url: string } | null;
   member: Member;
@@ -1825,11 +1826,17 @@ function Workspace({
     wake();
     const timer = setInterval(wake, 60000);
     window.addEventListener("focus", wake);
+    document.addEventListener("visibilitychange", wake);
     return () => {
       clearInterval(timer);
       window.removeEventListener("focus", wake);
+      document.removeEventListener("visibilitychange", wake);
     };
   }, [project?.hostingProvider, projectId]);
+  useEffect(() => {
+    if (project?.hostingState === "ready")
+      setFrameReload((value) => value + 1);
+  }, [project?.hostingState]);
   useEffect(() => {
     if (project?.state !== "github_access" || !project.isOwner) return;
     let checkedAt = 0,
@@ -2513,6 +2520,13 @@ function Workspace({
               </button>
             </div>
           </div>
+          {project.hostingProvider === "boat" && (
+            <p className="hosting-note" role="status">
+              {["sleeping", "stopping"].includes(project.hostingState || "")
+                ? "Waking your project. Your website will return shortly…"
+                : "Your website and worker sleep after 15 minutes away. Open this project in Butler to wake them."}
+            </p>
+          )}
           {error && (
             <div className="viewer-error">
               <Alert>{error}</Alert>

@@ -148,6 +148,14 @@ export function createStore(directory) {
     );
   const all = (sql, ...args) => db.prepare(sql).all(...args);
   const run = (sql, ...args) => db.prepare(sql).run(...args);
+  if (!all("PRAGMA table_info(projects)").some(c => c.name === "last_active_at")) {
+    db.exec(
+      "ALTER TABLE projects ADD COLUMN last_active_at INTEGER NOT NULL DEFAULT 0",
+    );
+    db.exec(`UPDATE projects SET last_active_at=MAX(created_at,
+      COALESCE((SELECT MAX(created_at) FROM messages WHERE project_id=projects.id AND role='user'),0),
+      COALESCE((SELECT MAX(created_at) FROM group_messages WHERE project_id=projects.id),0))`);
+  }
   if (
     !all("PRAGMA table_info(projects)").some(
       (column) => column.name === "name_source",

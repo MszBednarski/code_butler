@@ -1,5 +1,6 @@
 import { digest, id, now } from "./store.mjs";
 import { installGeminiWorker } from "./gemini.mjs";
+import { projectActive } from "./project-activity.mjs";
 
 const SHA = /^[a-f0-9]{40}$/;
 const number = (value) =>
@@ -353,6 +354,15 @@ export function installWorkerApi(app, config, store, provider) {
     let result;
     switch (b.operation) {
       case "pulls":
+        // Do not start a new background review after the team has left. A
+        // review already in progress can finish using the other operations.
+        if (
+          project.hosting_provider === "boat" &&
+          !projectActive(store, project.id)
+        ) {
+          result = [];
+          break;
+        }
         result = await github(
           "/pulls?state=open&sort=created&direction=asc&per_page=100",
         );

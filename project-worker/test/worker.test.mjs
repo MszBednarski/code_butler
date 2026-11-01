@@ -315,3 +315,97 @@ test("a failed proposed merge build is recorded and does not starve later PRs", 
   assert.equal((await load(`${dir}/reviews/1.json`)).decision, "block");
   assert.equal((await load(`${dir}/reviews/2.json`)).decision, "validated");
 });
+
+test("empty polls wait thirty seconds; completed work polls promptly; failures back off", async () => {
+  const pauses = [],
+    order = [];
+  let cycle = 0,
+    worker;
+  worker = await createWorker({
+    platform: "http://127.0.0.1:3000",
+    projectId: randomUUID(),
+    secret: randomBytes(32).toString("base64url"),
+    auth: { stop() {} },
+    agent: {
+      initialize: async () => {},
+      codeOne: async () => {
+        order.push("claim");
+        return cycle === 1;
+      },
+      stop() {},
+    },
+    reviewer: {
+      finish: async () => {
+        order.push("finish");
+        if (cycle === 2) throw Error("temporary failure");
+      },
+      one: async () => order.push("review"),
+      stop() {},
+    },
+    pause: async (ms) => {
+      pauses.push(ms);
+      if (++cycle === 3) worker.stop();
+    },
+  });
+  await worker.start();
+  assert.deepEqual(pauses, [30000, 5000, 30000]);
+  assert.deepEqual(order, [
+    "finish",
+    "claim",
+    "review",
+    "finish",
+    "claim",
+    "review",
+    "finish",
+  ]);
+});
+
+test("authenticated worker status reports busy during review and idle between polls", async (t) => {
+  const secret = randomBytes(32).toString("base64url");
+  let release, started, worker, url;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const entered = new Promise((resolve) => {
+    started = resolve;
+  });
+  const status = () =>
+    fetch(url + "/status", {
+      headers: { authorization: `Bearer ${secret}` },
+    }).then((r) => r.json());
+  worker = await createWorker({
+    platform: "http://127.0.0.1:3000",
+    projectId: randomUUID(),
+    secret,
+    auth: { stop() {} },
+    agent: {
+      initialize: async () => {},
+      codeOne: async () => false,
+      stop() {},
+    },
+    reviewer: {
+      finish: async () => {
+        started();
+        await held;
+      },
+      one: async () => {},
+      stop() {},
+    },
+    pause: async () => {
+      assert.equal((await status()).busy, false);
+      worker.stop();
+    },
+  });
+  await new Promise((resolve) => worker.server.listen(0, "127.0.0.1", resolve));
+  url = `http://127.0.0.1:${worker.server.address().port}`;
+  t.after(() => new Promise((resolve) => worker.server.close(resolve)));
+  const running = worker.start();
+  await entered;
+  try {
+    assert.equal((await fetch(url + "/status")).status, 401);
+    assert.equal((await status()).busy, true);
+  } finally {
+    release();
+  }
+  await running;
+});

@@ -15,6 +15,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { now } from "./store.mjs";
 import { createBoatProvisioner } from "./boat-provision.mjs";
 import { workerSource } from "./worker-source.mjs";
+import { projectActive } from "./project-activity.mjs";
 
 const exec = promisify(execFile);
 const ENVIRONMENTS = "environments{edges{node{id name}}}";
@@ -931,10 +932,20 @@ export function createProvisioner(
     active = true;
     try {
       const task = store.transaction(() => {
-        const found = store.get(
-          "SELECT * FROM tasks WHERE state='queued' AND available_at<=? ORDER BY available_at LIMIT 1",
-          now(),
-        );
+        const found = store
+          .all(
+            "SELECT * FROM tasks WHERE state='queued' AND available_at<=? ORDER BY available_at",
+            now(),
+          )
+          .find(
+            (task) =>
+              !["boat-wake", "worker-update", "cleanup"].includes(task.kind) ||
+              store.get(
+                "SELECT hosting_provider FROM projects WHERE id=?",
+                task.project_id,
+              )?.hosting_provider !== "boat" ||
+              projectActive(store, task.project_id),
+          );
         if (found)
           store.run(
             "UPDATE tasks SET state='running',updated_at=? WHERE id=?",
@@ -954,8 +965,10 @@ export function createProvisioner(
           await deploy(project, JSON.parse(task.payload));
         else if (task.kind === "cleanup")
           await cleanup(project, JSON.parse(task.payload));
-        else if (task.kind === "boat-wake") await boat.ensure(project);
-        else if (task.kind === "sync-history") await syncHistory(project);
+        else if (task.kind === "boat-wake") {
+          await boat.wake(project);
+          save(project, { hostingCheck: { at: now(), state: "ready" } });
+        } else if (task.kind === "sync-history") await syncHistory(project);
         else if (task.kind === "worker-update") await updateWorker(project);
         else if (task.kind === "artifact")
           await artifact(project, JSON.parse(task.payload));
@@ -1106,17 +1119,29 @@ export function createProvisioner(
     if (stopped || checkingHosting) return;
     checkingHosting = true;
     try {
-      // This runs independently of builds: a long preview build must not let
-      // another live site's lease expire, even when nobody has Butler open.
+      // Only human presence or unfinished work renews a VM. Polling and pending
+      // approvals must not keep old projects (or manually stopped VMs) alive.
       await Promise.allSettled(
         store
           .all(
-            "SELECT * FROM projects WHERE state='ready' AND hosting_provider='boat' AND app_url IS NOT NULL",
+            "SELECT * FROM projects WHERE state IN ('ready','infrastructure','deploying') AND hosting_provider='boat'",
           )
           .map(async (project) => {
             let state = "ready";
             try {
-              await boat.ensure(project);
+              const needed = projectActive(store, project.id);
+              const check = resources(project).hostingCheck;
+              if (!needed && check?.state === "sleeping") return;
+              if (
+                needed &&
+                check?.state === "ready" &&
+                check.at > now() - 5 * 60000
+              )
+                return;
+              if (needed && check?.state && check.state !== "ready")
+                await boat.wake(project);
+              else if (needed) await boat.ensure(project);
+              else state = await boat.sleepIfIdle(project);
             } catch (error) {
               state = "unavailable";
               console.error(`[hosting] ${project.id}: ${error.name}`);
@@ -1125,7 +1150,11 @@ export function createProvisioner(
               "SELECT resources,state FROM projects WHERE id=?",
               project.id,
             );
-            if (stopped || current?.state !== "ready") return;
+            if (
+              stopped ||
+              !["ready", "infrastructure", "deploying"].includes(current?.state)
+            )
+              return;
             store.run(
               "UPDATE projects SET resources=? WHERE id=?",
               JSON.stringify({
@@ -1178,7 +1207,7 @@ export function createProvisioner(
         maintainHosting().catch((error) =>
           console.error(`[hosting] ${error.name}`),
         );
-      const hostingTimer = setInterval(checkHosting, 5 * 60000);
+      const hostingTimer = setInterval(checkHosting, 60000);
       checkHosting();
       tick().catch((error) => console.error(`[tasks] ${error.name}`));
       return () => {

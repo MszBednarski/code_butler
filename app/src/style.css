@@ -3773,3 +3773,10 @@ html.workspace-open,
 }
 .tour-context > div { min-width: 0; }
 .tour-context small { display: block; font-size: 9px; line-height: 1.5; margin-top: 3px; color: #7d755f; }
+.hosting-note {
+  margin: 0;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--muted);
+  background: #f8f8f2;
+}

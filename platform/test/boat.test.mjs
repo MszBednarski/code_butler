@@ -8,6 +8,7 @@ import { createBoatProvisioner } from "../boat-provision.mjs";
 import { createPlatform } from "../server.mjs";
 import { configuration } from "../config.mjs";
 import { gunzipSync } from "node:zlib";
+import { projectActive, idleTimeout } from "../project-activity.mjs";
 
 async function fixture(t) {
   const directory = await mkdtemp("/tmp/butler-boat-test-"),
@@ -382,7 +383,7 @@ test("Boat provisioning retries reuse one VM and previews never fork or copy age
       if (endpoint === "/sandboxes") {
         assert.equal(body.noEnv, true);
         assert.equal(body.snapshots, true);
-        assert.equal(body.ttlSeconds, 7200);
+        assert.equal(body.ttlSeconds, 1200);
         assert.equal(body.environment, "butler-test-environment");
         const key = extra.headers["Idempotency-Key"];
         created.set(key, created.get(key) || { id: "bx_23456789" });
@@ -591,7 +592,7 @@ test("Boat provisioning retries reuse one VM and previews never fork or copy age
   );
 });
 
-test("live Boat websites renew and resume without an open Butler tab or waiting for builds", async (t) => {
+test("active Boat projects renew independently of the build queue and resume when needed", async (t) => {
   const f = await fixture(t),
     projectId = id(),
     calls = [];
@@ -641,13 +642,13 @@ test("live Boat websites renew and resume without an open Butler tab or waiting 
       calls.push({ url, method, body });
       assert.ok(url.startsWith("/sandboxes/bx_leaseactive"));
       if (method === "PATCH") {
-        assert.equal(body.ttlSeconds, 7200);
-        expires = Date.now() + 7200000;
+        assert.equal(body.ttlSeconds, 1200);
+        expires = Date.now() + 1200000;
         return { sandbox: { state: vmState } };
       }
       if (url.endsWith("/resume")) {
         assert.equal(body.noEnv, true);
-        assert.equal(body.ttlSeconds, 7200);
+        assert.equal(body.ttlSeconds, 1200);
         vmState = "ready";
         return { sandbox: { state: vmState } };
       }
@@ -683,6 +684,10 @@ test("live Boat websites renew and resume without an open Butler tab or waiting 
   releaseBuild();
   await busy;
   vmState = "archived";
+  f.store.run(
+    "UPDATE projects SET resources=json_set(resources, '$.hostingCheck.at', 0) WHERE id=?",
+    active.id,
+  );
   await manager.maintainHosting();
   assert.equal(calls.filter((c) => c.url.endsWith("/resume")).length, 1);
   assert.equal(vmState, "ready");
@@ -690,4 +695,315 @@ test("live Boat websites renew and resume without an open Butler tab or waiting 
     !calls.some((c) => c.url.includes("/commands") || c.url.includes("/files")),
     "Waking must not rebuild or replace the app or agent",
   );
+});
+
+async function idleFixture(t) {
+  const f = await fixture(t),
+    projectId = id(),
+    old = now() - idleTimeout - 60000;
+  f.store.run(
+    "INSERT INTO projects(id,owner_id,name,description,slug,invite_hash,invite_secret,worker_secret,worker_hash,webhook_secret,repo,resources,hosting_provider,state,app_url,created_at,last_active_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    projectId,
+    f.user.id,
+    "Idle project",
+    "A website",
+    id(),
+    digest(token()),
+    f.store.seal(token()),
+    f.store.seal(token()),
+    digest(token()),
+    f.store.seal(token()),
+    "team/site",
+    JSON.stringify({ boat: { id: "bx_idle1234", ttlSeconds: null } }),
+    "boat",
+    "ready",
+    "https://live.example.test",
+    old,
+    old,
+  );
+  const project = f.store.get("SELECT * FROM projects WHERE id=?", projectId),
+    calls = [];
+  const machine = { state: "idle", snapshots: true, archiveAfter: null };
+  const provider = {
+    request: async () => new Response("ok"),
+    boat: async (_owner, url, method = "GET", body) => {
+      calls.push({ url, method, body });
+      if (method === "PATCH")
+        machine.archiveAfter = new Date(
+          now() + body.ttlSeconds * 1000,
+        ).toISOString();
+      if (url.endsWith("/resume")) {
+        machine.state = "ready";
+        machine.archiveAfter = new Date(
+          now() + body.ttlSeconds * 1000,
+        ).toISOString();
+      }
+      return { sandbox: { ...machine } };
+    },
+  };
+  const manager = createProvisioner(f.config, f.store, provider, {
+    pause: async () => {},
+  });
+  return { ...f, project, calls, machine, provider, manager };
+}
+
+test("idle paid projects stop renewing, arm one auto-stop, stay asleep, and wake on human activity", async (t) => {
+  const f = await idleFixture(t);
+  const original = f.store.get(
+    "SELECT worker_secret,invite_secret,repo FROM projects WHERE id=?",
+    f.project.id,
+  );
+  assert.equal(projectActive(f.store, f.project.id), false);
+  await f.manager.maintainHosting();
+  assert.deepEqual(
+    f.calls.filter((c) => c.method === "PATCH").map((c) => c.body),
+    [{ ttlSeconds: 60 }],
+  );
+  await f.manager.maintainHosting();
+  assert.equal(
+    f.calls.filter((c) => c.method === "PATCH").length,
+    1,
+    "do not reset the shutdown deadline on each check",
+  );
+  f.machine.state = "archived";
+  await f.manager.maintainHosting();
+  assert.equal(
+    JSON.parse(
+      f.store.get("SELECT resources FROM projects WHERE id=?", f.project.id)
+        .resources,
+    ).hostingCheck.state,
+    "sleeping",
+  );
+  const count = f.calls.length;
+  await f.manager.maintainHosting();
+  assert.equal(
+    f.calls.length,
+    count,
+    "sleeping projects make no provider calls",
+  );
+  f.store.run(
+    "UPDATE projects SET last_active_at=? WHERE id=?",
+    now(),
+    f.project.id,
+  );
+  await f.manager.maintainHosting();
+  assert.equal(f.calls.filter((c) => c.url.endsWith("/resume")).length, 1);
+  assert.equal(f.machine.state, "ready");
+  assert.equal(projectActive(f.store, f.project.id), true);
+  assert.deepEqual(
+    f.store.get(
+      "SELECT worker_secret,invite_secret,repo FROM projects WHERE id=?",
+      f.project.id,
+    ),
+    original,
+  );
+  assert.ok(
+    !f.calls.some((c) => /commands|files/.test(c.url)),
+    "sleep/wake must not rebuild or replace workspace data",
+  );
+});
+
+test("an already archived idle project stays stopped and maintenance tasks do not wake it", async (t) => {
+  const f = await idleFixture(t);
+  f.machine.state = "archived";
+  for (const kind of ["worker-update", "cleanup", "boat-wake"])
+    f.store.enqueue(f.project.id, kind, kind, {});
+  await f.manager.tick();
+  assert.equal(f.calls.length, 0);
+  await f.manager.maintainHosting();
+  assert.deepEqual(
+    f.calls.map((c) => c.method),
+    ["GET"],
+  );
+  assert.equal(
+    f.store.get("SELECT COUNT(*) AS count FROM tasks WHERE state='queued'")
+      .count,
+    3,
+  );
+});
+
+test("unfinished work protects a project, but waiting approvals and completed maintenance do not", async (t) => {
+  const f = await idleFixture(t),
+    member = id(),
+    job = id();
+  f.store.run(
+    "INSERT INTO members(id,project_id,user_id,name,prefix,role,created_at) VALUES(?,?,?,?,?,?,?)",
+    member,
+    f.project.id,
+    f.user.id,
+    "Lead",
+    "lead",
+    "owner",
+    now(),
+  );
+  f.store.run(
+    "INSERT INTO jobs(id,project_id,member_id,request_key,text,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+    job,
+    f.project.id,
+    member,
+    id(),
+    "Build the page",
+    "awaiting_approval",
+    now(),
+    now(),
+  );
+  assert.equal(projectActive(f.store, f.project.id), false);
+  f.store.run("UPDATE projects SET codex_ready=1 WHERE id=?", f.project.id);
+  for (const state of ["queued", "working", "reviewing"]) {
+    f.store.run("UPDATE jobs SET state=? WHERE id=?", state, job);
+    assert.equal(projectActive(f.store, f.project.id), true, state);
+  }
+  f.store.run("UPDATE jobs SET state='awaiting_approval' WHERE id=?", job);
+  for (const kind of ["artifact", "open-pr", "deploy"]) {
+    f.store.enqueue(f.project.id, kind, kind, {});
+    assert.equal(projectActive(f.store, f.project.id), true, kind);
+    f.store.run("UPDATE tasks SET state='done' WHERE kind=?", kind);
+  }
+  f.store.enqueue(f.project.id, "sync-history", "history", {});
+  f.store.run("UPDATE tasks SET state='running' WHERE kind='sync-history'");
+  assert.equal(projectActive(f.store, f.project.id), false);
+  f.store.run(
+    "UPDATE projects SET last_active_at=? WHERE id=?",
+    now() - idleTimeout + 1000,
+    f.project.id,
+  );
+  assert.equal(projectActive(f.store, f.project.id), true);
+  assert.equal(projectActive(f.store, f.project.id, now() + 2000), false);
+});
+
+test("activity arriving during a sleep request cancels sleep and restores the lease", async (t) => {
+  for (const during of ["GET", "PATCH"]) {
+    const f = await idleFixture(t),
+      original = f.provider.boat;
+    let arrived = false;
+    f.provider.boat = async (...args) => {
+      const result = await original(...args);
+      if (!arrived && (args[2] || "GET") === during) {
+        arrived = true;
+        f.store.run(
+          "UPDATE projects SET last_active_at=? WHERE id=?",
+          now(),
+          f.project.id,
+        );
+      }
+      return result;
+    };
+    await f.manager.maintainHosting();
+    assert.equal(
+      JSON.parse(
+        f.store.get("SELECT resources FROM projects WHERE id=?", f.project.id)
+          .resources,
+      ).hostingCheck.state,
+      "ready",
+    );
+    assert.equal(
+      f.calls.filter((c) => c.method === "PATCH").at(-1).body.ttlSeconds,
+      1200,
+    );
+  }
+});
+
+test("automatic sleep refuses a workspace with snapshots disabled", async (t) => {
+  const f = await idleFixture(t);
+  f.machine.snapshots = false;
+  await f.manager.maintainHosting();
+  assert.equal(f.calls.filter((c) => c.method !== "GET").length, 0);
+  assert.equal(
+    JSON.parse(
+      f.store.get("SELECT resources FROM projects WHERE id=?", f.project.id)
+        .resources,
+    ).hostingCheck.state,
+    "unavailable",
+  );
+});
+
+test("a worker busy reviewing an external PR keeps its lease even without a chat job", async (t) => {
+  const f = await idleFixture(t);
+  f.store.run(
+    "UPDATE projects SET worker_url='https://worker.example.test' WHERE id=?",
+    f.project.id,
+  );
+  let busy = true;
+  f.provider.worker = async (_p, endpoint) => {
+    assert.equal(endpoint, "/status");
+    return { busy };
+  };
+  await f.manager.maintainHosting();
+  assert.deepEqual(
+    f.calls.filter((c) => c.method === "PATCH").map((c) => c.body),
+    [{ ttlSeconds: 1200 }],
+  );
+  busy = false;
+  await f.manager.maintainHosting();
+  assert.equal(
+    f.calls.filter((c) => c.method === "PATCH").at(-1).body.ttlSeconds,
+    60,
+  );
+});
+
+test("abandoned requests and expired work leases cannot keep an unused project alive forever", async (t) => {
+  const f = await idleFixture(t),
+    member = id(),
+    job = id(),
+    old = now() - idleTimeout - 60000;
+  f.store.run(
+    "INSERT INTO members(id,project_id,user_id,name,prefix,role,created_at) VALUES(?,?,?,?,?,?,?)",
+    member,
+    f.project.id,
+    f.user.id,
+    "Lead",
+    "lead",
+    "owner",
+    old,
+  );
+  f.store.run(
+    "INSERT INTO jobs(id,project_id,member_id,request_key,text,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+    job,
+    f.project.id,
+    member,
+    id(),
+    "Initial request",
+    "queued",
+    old,
+    now(),
+  );
+  assert.equal(
+    projectActive(f.store, f.project.id),
+    false,
+    "an abandoned Codex sign-in should sleep",
+  );
+  f.store.run("UPDATE projects SET codex_ready=1 WHERE id=?", f.project.id);
+  assert.equal(projectActive(f.store, f.project.id), true);
+  f.store.run(
+    "UPDATE jobs SET state='working',updated_at=?,lease_until=? WHERE id=?",
+    old,
+    old,
+    job,
+  );
+  assert.equal(
+    projectActive(f.store, f.project.id),
+    false,
+    "an expired orphan job must not renew the VM forever",
+  );
+  f.store.run("UPDATE jobs SET lease_until=? WHERE id=?", now() + 90000, job);
+  assert.equal(
+    projectActive(f.store, f.project.id),
+    true,
+    "a real working heartbeat protects long jobs",
+  );
+});
+
+test("a returning teammate is only shown ready after the restored worker and website answer", async t => {
+  const f=await idleFixture(t),probes=[];
+  f.store.run("UPDATE projects SET last_active_at=?,worker_url='https://worker.example.test',resources=json_set(resources,'$.hostingCheck',json(?)) WHERE id=?",now(),JSON.stringify({at:now(),state:"sleeping"}),f.project.id);
+  f.machine.state="archived";
+  let retry=true;
+  f.provider.request=async url=>{
+    probes.push(url);
+    if(url==='https://live.example.test'&&retry){retry=false;return new Response('Starting',{status:503});}
+    return new Response('ok');
+  };
+  await f.manager.maintainHosting();
+  assert.deepEqual(probes,["https://worker.example.test/healthz","https://live.example.test","https://live.example.test"]);
+  assert.equal(JSON.parse(f.store.get("SELECT resources FROM projects WHERE id=?",f.project.id).resources).hostingCheck.state,"ready");
 });

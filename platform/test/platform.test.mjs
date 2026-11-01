@@ -3014,3 +3014,40 @@ test("Continue retries recover the unfinished instruction, including old overwri
     0,
   );
 });
+
+test("only authorized project interactions refresh Boat activity; polling does not wake sleeping projects", async t => {
+  const f=await fixture(t),p=await f.create();
+  const stale=now()-3600000;
+  f.store.run("UPDATE projects SET hosting_provider='boat',state='ready',last_active_at=?,resources=json_set(resources,'$.hostingCheck',json(?)) WHERE id=?",stale,JSON.stringify({at:stale,state:"sleeping"}),p.id);
+  const activity=()=>f.store.get("SELECT last_active_at FROM projects WHERE id=?",p.id).last_active_at;
+  const worker=f.store.get("SELECT * FROM projects WHERE id=?",p.id);
+  await f.call(`/api/projects/${p.id}`);
+  await workerCall(f,worker,"/pending-pulls");
+  assert.equal(activity(),stale);
+  assert.equal((await f.call(`/api/projects/${p.id}/wake`,{},"")).status,401);
+  const stranger=f.store.guest("Stranger"),cookie=`butler_account=${f.store.session(stranger.id)}`;
+  assert.equal((await f.call(`/api/projects/${p.id}/wake`,{},cookie)).status,404);
+  assert.equal((await f.call(`/api/projects/${p.id}/wake`,{},undefined,{origin:"https://elsewhere.test"})).status,403);
+  assert.equal(activity(),stale);
+  assert.equal((await f.call(`/api/projects/${p.id}/wake`,{})).status,200);
+  assert.ok(activity()>stale);
+  assert.equal(f.store.get("SELECT COUNT(*) AS count FROM tasks WHERE project_id=? AND kind='boat-wake'",p.id).count,1);
+  f.store.run("UPDATE projects SET resources=json_set(resources,'$.hostingCheck',json(?)) WHERE id=?",JSON.stringify({at:now(),state:"ready"}),p.id);
+  await f.call(`/api/projects/${p.id}/wake`,{});
+  assert.equal(f.store.get("SELECT COUNT(*) AS count FROM tasks WHERE project_id=? AND kind='boat-wake'",p.id).count,1,"presence should not enqueue redundant provider calls");
+});
+
+test("idle Boat workers do not start fresh GitHub reviews, but resume checks when a teammate returns", async t => {
+  const f=await fixture(t),p=await f.create(),stale=now()-3600000;
+  f.store.run("UPDATE projects SET hosting_provider='boat',state='ready',last_active_at=?,created_at=? WHERE id=?",stale,stale,p.id);
+  f.store.run("UPDATE jobs SET state='awaiting_approval' WHERE project_id=?",p.id);
+  f.store.run("UPDATE tasks SET state='done' WHERE project_id=?",p.id);
+  const project=f.store.get("SELECT * FROM projects WHERE id=?",p.id);
+  let githubCalls=0;
+  f.provider.github=async()=>{githubCalls++;return [{number:1}];};
+  assert.deepEqual(await (await workerCall(f,project,"/github",{operation:"pulls"})).json(),[]);
+  assert.equal(githubCalls,0);
+  await f.call(`/api/projects/${p.id}/wake`,{});
+  assert.deepEqual(await (await workerCall(f,project,"/github",{operation:"pulls"})).json(),[{number:1}]);
+  assert.equal(githubCalls,1);
+});

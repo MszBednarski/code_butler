@@ -13,9 +13,11 @@ import { c as archive } from "tar";
 import { setTimeout as delay } from "node:timers/promises";
 import { now } from "./store.mjs";
 import { workerSource } from "./worker-source.mjs";
+import { projectActive } from "./project-activity.mjs";
 const quote = (value) => "'" + String(value).replaceAll("'", "'\\''") + "'";
 const root = "/home/user/butler",
   SHA = /^[a-f0-9]{40}$/;
+const leaseSeconds = 20 * 60;
 const webDockerfile = `FROM node:22-bookworm-slim AS build
 WORKDIR /build
 ARG BUTLER_COMMIT_SHA=dev
@@ -46,29 +48,53 @@ export function createBoatProvisioner(
     );
   const api = (p, endpoint, method, body, extra) =>
     provider.boat(p.owner_id, endpoint, method, body, extra);
-  async function ensure(p) {
+  const lifecycle = new Map();
+  async function exclusive(p, action) {
+    const previous = lifecycle.get(p.id) || Promise.resolve();
+    const current = previous.catch(() => {}).then(action);
+    lifecycle.set(p.id, current);
+    try {
+      return await current;
+    } finally {
+      if (lifecycle.get(p.id) === current) lifecycle.delete(p.id);
+    }
+  }
+  const ensure = (p) => exclusive(p, () => ensureRunning(p));
+  async function wake(p) {
+    await ensure(p);
+    if (p.worker_url) await healthy(p.worker_url + "/healthz");
+    if (p.app_url) await healthy(p.app_url);
+  }
+  async function ensureRunning(p) {
     const saved = resources(p).boat;
     if (!saved?.id) return null;
     let value = await api(p, `/sandboxes/${saved.id}`);
-    if (value.sandbox.state === "archived") {
-      await api(p, `/sandboxes/${saved.id}/resume`, "POST", {
-        noEnv: true,
-        ttlSeconds: saved.ttlSeconds,
-      });
-    } else if (
-      saved.ttlSeconds &&
-      Date.parse(value.sandbox.archiveAfter) < Date.now() + 1800000
-    )
-      await api(p, `/sandboxes/${saved.id}`, "PATCH", {
-        ttlSeconds: saved.ttlSeconds,
-      });
     for (let i = 0; i < 120; i++) {
       if (isStopped())
         throw new Error(
           "Butler is restarting; the workspace will be checked again.",
         );
-      if (["ready", "idle", "running"].includes(value.sandbox.state))
+      if (value.sandbox.state === "archived") {
+        await api(p, `/sandboxes/${saved.id}/resume`, "POST", {
+          noEnv: true,
+          ttlSeconds: leaseSeconds,
+        });
+      } else if (["ready", "idle", "running"].includes(value.sandbox.state)) {
+        if (value.sandbox.snapshots === false)
+          throw new Error(
+            "Enable Boat snapshots before automatically managing this workspace.",
+          );
+        if (
+          !value.sandbox.archiveAfter ||
+          Date.parse(value.sandbox.archiveAfter) < Date.now() + 10 * 60000 ||
+          Date.parse(value.sandbox.archiveAfter) >
+            Date.now() + leaseSeconds * 1000
+        )
+          await api(p, `/sandboxes/${saved.id}`, "PATCH", {
+            ttlSeconds: leaseSeconds,
+          });
         return saved;
+      }
       if (["error", "cancelled"].includes(value.sandbox.state))
         throw new Error(
           "Boat could not start this workspace. Retry setup or check its Boat dashboard.",
@@ -80,6 +106,48 @@ export function createBoatProvisioner(
       "Boat is still preparing the workspace. Butler will retry.",
     );
   }
+  const sleepIfIdle = (p) =>
+    exclusive(p, async () => {
+      const saved = resources(p).boat;
+      if (!saved?.id) return "sleeping";
+      const { sandbox } = await api(p, `/sandboxes/${saved.id}`);
+      // A teammate or a queued job may arrive during the provider request.
+      if (projectActive(store, p.id)) {
+        await ensureRunning(p);
+        return "ready";
+      }
+      if (sandbox.state === "archived") return "sleeping";
+      // Reviews of PRs opened outside Butler can run without a queued chat job.
+      // Never stop a worker that is currently checking or processing work.
+      if (
+        p.worker_url &&
+        provider.worker &&
+        (await provider.worker(p, "/status")).busy
+      ) {
+        await ensureRunning(p);
+        return "ready";
+      }
+      if (projectActive(store, p.id)) {
+        await ensureRunning(p);
+        return "ready";
+      }
+      if (sandbox.snapshots === false)
+        throw new Error(
+          "Enable Boat snapshots before automatically stopping this workspace.",
+        );
+      if (
+        ["ready", "idle", "running"].includes(sandbox.state) &&
+        (!sandbox.archiveAfter ||
+          Date.parse(sandbox.archiveAfter) > Date.now() + 60000)
+      )
+        // Uses the existing sandbox.update scope; never forces a stop or deletes a disk.
+        await api(p, `/sandboxes/${saved.id}`, "PATCH", { ttlSeconds: 60 });
+      if (projectActive(store, p.id)) {
+        await ensureRunning(p);
+        return "ready";
+      }
+      return "stopping";
+    });
   async function put(p, name, bytes) {
     const vm = resources(p).boat.id,
       remote = `${root}/${name}`;
@@ -193,9 +261,7 @@ export function createBoatProvisioner(
       const connection = store.connection(p.owner_id, "boat");
       if (!connection?.environmentName)
         throw new Error("Connect Boat before starting the workspace.");
-      const limits = await api(p, "/limits");
-      const ttlSeconds =
-        limits.accessTier === "trial" || connection.trial ? 7200 : null;
+      const ttlSeconds = leaseSeconds;
       const created = await api(
         p,
         "/sandboxes",
@@ -440,5 +506,5 @@ export function createBoatProvisioner(
       prNumber,
     );
   }
-  return { provision, deploy, cleanup, ensure, updateWorker };
+  return { provision, deploy, cleanup, ensure, wake, sleepIfIdle, updateWorker };
 }
