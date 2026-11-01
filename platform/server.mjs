@@ -1,3 +1,9 @@
+import {
+  githubAppReady,
+  creationCredential,
+  githubLoginClient,
+  retireLegacyGithub,
+} from "./github-app.mjs";
 import express from "express";
 import { createServer } from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
@@ -12,6 +18,7 @@ import { installWorkerApi } from "./worker-api.mjs";
 import { installGitProxy } from "./git-proxy.mjs";
 import { createProvisioner } from "./provision.mjs";
 import { installSetup } from "./setup.mjs";
+import { installGeminiSettings } from "./gemini.mjs";
 
 const uuid = (value) =>
   typeof value === "string" && /^[a-f0-9-]{36}$/.test(value);
@@ -20,6 +27,7 @@ const name = (value) =>
   value.trim().length >= 1 &&
   value.trim().length <= 50 &&
   !/[\x00-\x1f]/.test(value);
+const reactionEmojis = new Set(["👍", "❤️", "🔥", "😂", "🎉", "👀", "🤩"]);
 const memberView = (m) => ({
   id: m.id,
   name: m.name,
@@ -52,39 +60,71 @@ export function createPlatform(
       !req.path.startsWith("/api/worker/") &&
       !req.path.startsWith("/api/git/") &&
       !req.path.startsWith("/api/hooks/") &&
-      req.headers.origin !== config.publicUrl
+      ![config.publicUrl, ...(config.publicAliases || [])].includes(
+        req.headers.origin,
+      )
     )
       return res.status(403).json({ error: "Invalid request origin." });
     next();
   });
   app.get("/healthz", (_req, res) => res.type("text").send("ok"));
   app.post(
-    "/api/hooks/github/:projectId",
+    ["/api/hooks/github/:projectId", "/api/hooks/github-app"],
     express.raw({ type: "application/json", limit: "1mb" }),
     (req, res) => {
-      const project = store.get(
-        "SELECT * FROM projects WHERE id=?",
-        req.params.projectId,
-      );
-      if (!project || !Buffer.isBuffer(req.body)) return res.sendStatus(403);
-      const actual = Buffer.from(req.headers["x-hub-signature-256"] || ""),
-        expected = Buffer.from(
-          "sha256=" +
-            createHmac("sha256", store.open(project.webhook_secret))
-              .update(req.body)
-              .digest("hex"),
-        );
-      if (
-        actual.length !== expected.length ||
-        !timingSafeEqual(actual, expected)
-      )
-        return res.sendStatus(403);
+      const appHook = req.path === "/api/hooks/github-app";
+      if (!Buffer.isBuffer(req.body)) return res.sendStatus(403);
       let event;
       try {
         event = JSON.parse(req.body.toString());
       } catch {
         return res.sendStatus(400);
       }
+      const project = appHook
+        ? store.get(
+            "SELECT * FROM projects WHERE repo=? COLLATE NOCASE",
+            String(event.repository?.full_name || ""),
+          )
+        : store.get("SELECT * FROM projects WHERE id=?", req.params.projectId);
+      const secret = appHook
+        ? config.githubAppWebhookSecret
+        : project && store.open(project.webhook_secret);
+      if (!secret) return res.sendStatus(403);
+      const actual = Buffer.from(req.headers["x-hub-signature-256"] || ""),
+        expected = Buffer.from(
+          "sha256=" +
+            createHmac("sha256", secret).update(req.body).digest("hex"),
+        );
+      if (
+        actual.length !== expected.length ||
+        !timingSafeEqual(actual, expected)
+      )
+        return res.sendStatus(403);
+      if (
+        appHook &&
+        req.headers["x-github-event"] === "installation" &&
+        ["deleted", "suspend"].includes(event.action)
+      ) {
+        for (const row of store.all(
+          "SELECT user_id FROM connections WHERE provider='github_installation'",
+        ))
+          if (
+            store.connection(row.user_id, "github_installation")?.id ===
+            event.installation?.id
+          )
+            store.run(
+              "DELETE FROM connections WHERE user_id=? AND provider='github_installation'",
+              row.user_id,
+            );
+        return res.sendStatus(202);
+      }
+      if (!project) return res.sendStatus(202);
+      if (
+        appHook &&
+        JSON.parse(project.resources).githubInstallationId !==
+          event.installation?.id
+      )
+        return res.sendStatus(403);
       if (
         event.repository?.full_name?.toLowerCase() !==
         project.repo?.toLowerCase()
@@ -112,6 +152,11 @@ export function createPlatform(
             project.id,
             event.number,
             event.pull_request.merge_commit_sha,
+            {
+              title: event.pull_request.title,
+              author: event.pull_request.user?.login,
+              mergedAt: Date.parse(event.pull_request.merged_at),
+            },
           );
         if (
           ["opened", "reopened", "synchronize"].includes(event.action) &&
@@ -142,7 +187,10 @@ export function createPlatform(
       res.sendStatus(202);
     },
   );
-  installGitProxy(app, store, gitOptions);
+  installGitProxy(app, store, {
+    repositoryToken: provider.repositoryToken,
+    ...gitOptions,
+  });
   app.use(express.json({ limit: "128kb" }));
   app.use("/api", (req, res, next) => {
     if (req.path.startsWith("/worker/")) return next();
@@ -169,9 +217,10 @@ export function createPlatform(
         if (value.until < now()) limits.delete(k);
     next();
   });
-  installSetup(app, config, store);
+  installSetup(app, config, store, provider.request);
   installWorkerApi(app, config, store, provider);
   installAuth(app, config, store, provider);
+  installGeminiSettings(app, store);
   const signed = (req, res, next) =>
     req.account
       ? next()
@@ -185,7 +234,7 @@ export function createPlatform(
     req.member =
       req.account && req.project
         ? store.get(
-            `SELECT * FROM members WHERE project_id=? AND user_id=? ${req.query.member ? "AND id=?" : ""} ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END,created_at DESC LIMIT 1`,
+            `SELECT * FROM members WHERE project_id=? AND user_id=? AND role!='agent' ${req.query.member ? "AND id=?" : ""} ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END,created_at DESC LIMIT 1`,
             req.project.id,
             req.account.id,
             ...(req.query.member ? [String(req.query.member)] : []),
@@ -196,39 +245,109 @@ export function createPlatform(
         error:
           "This project is not in your account. Open its invitation to join.",
       });
+    if (
+      !["GET", "HEAD"].includes(req.method) &&
+      req.query.chat &&
+      req.query.chat !== req.member.id &&
+      ![
+        "/api/projects/:projectId/reactions",
+        "/api/projects/:projectId/group/messages",
+        "/api/projects/:projectId/jobs/:jobId/visibility",
+      ].includes(req.route?.path) &&
+      !(
+        req.project.owner_id === req.account.id &&
+        [
+          "/api/projects/:projectId/messages",
+          "/api/projects/:projectId/jobs/:jobId/inspect",
+          "/api/projects/:projectId/jobs/:jobId/approve",
+          "/api/projects/:projectId/jobs/:jobId/retry",
+        ].includes(req.route?.path)
+      )
+    )
+      return res.status(403).json({
+        error:
+          "Teammate chats are read-only. Return to your chat to send a request.",
+      });
+    if (req.method === "POST" && req.project.hosting_provider === "boat")
+      store.run(
+        "UPDATE projects SET last_active_at=? WHERE id=?",
+        now(),
+        req.project.id,
+      );
     next();
   }
   const owner = (req, res, next) =>
     req.project.owner_id === req.account.id
       ? next()
       : res.status(403).json({ error: "Only the project lead can do that." });
+  const boatConnected = (user) => {
+    const saved = user && store.connection(user.id, "boat");
+    return Boolean(
+      saved?.access_token &&
+        saved.environmentId &&
+        Date.parse(saved.expiresAt) > now(),
+    );
+  };
+  const hostingFor = (user) =>
+    boatConnected(user) ? "boat" : config.defaultHostingProvider || "boat";
+  const canCreateRepository = (user) =>
+    Boolean(
+      user &&
+        githubAppReady(config) &&
+        (creationCredential(config, store, user.id) ||
+          store.connection(user.id, "github_installation")),
+    );
   app.get("/api/session", (req, res) => {
-    const github = req.account && store.connection(req.account.id, "github");
+    const github =
+      req.account && store.connection(req.account.id, "github_installation");
     res.json({
       user: publicUser(req.account),
       connections: {
-        github: Boolean(
-          github && String(github.scope).split(/[ ,]/).includes("repo"),
-        ),
+        github: Boolean(github && githubAppReady(config)),
+        githubCreation: canCreateRepository(req.account),
         railway: Boolean(
           req.account && store.connection(req.account.id, "railway"),
         ),
+        boat: boatConnected(req.account),
       },
       capabilities: {
-        github: Boolean(config.githubClientId && config.githubClientSecret),
+        github: Boolean(
+          githubLoginClient(config).id && githubLoginClient(config).secret,
+        ),
+        githubRepositories: githubAppReady(config),
         railway: Boolean(config.railwayClientId && config.railwayClientSecret),
+        boat: true,
         email: Boolean(config.emailKey && config.emailFrom),
       },
       commit: config.commit,
+      hostingProvider: hostingFor(req.account),
     });
   });
   app.get("/api/projects", signed, (req, res) =>
     res.json({
-      projects: store.all(
-        "SELECT DISTINCT p.id,p.name,p.description,p.state,p.app_url AS appUrl,p.created_at AS createdAt FROM projects p JOIN members m ON m.project_id=p.id WHERE m.user_id=? ORDER BY p.created_at DESC",
-        req.account.id,
-      ),
+      projects: store
+        .all(
+          "SELECT DISTINCT p.id,p.name,p.description,p.state,p.app_url AS appUrl,p.created_at AS createdAt,(p.owner_id=?) AS isOwner FROM projects p JOIN members m ON m.project_id=p.id WHERE m.user_id=? ORDER BY p.created_at DESC",
+          req.account.id,
+          req.account.id,
+        )
+        .map((project) => ({ ...project, isOwner: Boolean(project.isOwner) })),
     }),
+  );
+  const verifiedLead = (req, res, next) =>
+    req.account.github_id
+      ? next()
+      : res
+          .status(403)
+          .json({ error: "Sign in with GitHub before connecting hosting." });
+  app.get("/api/auth/boat", signed, verifiedLead, async (req, res) =>
+    res.json(await provider.boatAuth.status(req.account.id)),
+  );
+  app.post("/api/auth/boat", signed, verifiedLead, async (req, res) =>
+    res.json(await provider.boatAuth.start(req.account.id)),
+  );
+  app.post("/api/auth/boat/billing", signed, verifiedLead, async (req, res) =>
+    res.json(await provider.boatAuth.billing(req.account.id)),
   );
   app.get("/api/railway/workspaces", signed, async (req, res) =>
     res.json(
@@ -237,14 +356,16 @@ export function createPlatform(
     ),
   );
   app.post("/api/projects", signed, (req, res) => {
+    const hosting = hostingFor(req.account);
     if (
       !req.account.github_id ||
-      !store.connection(req.account.id, "github") ||
-      !store.connection(req.account.id, "railway")
+      !githubAppReady(config) ||
+      !canCreateRepository(req.account) ||
+      !store.connection(req.account.id, hosting)
     )
-      return res
-        .status(409)
-        .json({ error: "Connect GitHub and Railway first." });
+      return res.status(409).json({
+        error: `Connect GitHub and ${hosting === "boat" ? "Boat" : "Railway"} first.`,
+      });
     const b = req.body || {};
     if (
       !name(b.name) ||
@@ -275,7 +396,7 @@ export function createPlatform(
     }-${projectId.slice(0, 8)}`;
     store.transaction(() => {
       store.run(
-        `INSERT INTO projects(id,owner_id,name,description,slug,invite_hash,invite_secret,worker_secret,worker_hash,webhook_secret,workspace_id,create_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO projects(id,owner_id,name,description,slug,invite_hash,invite_secret,worker_secret,worker_hash,webhook_secret,workspace_id,create_key,created_at,hosting_provider) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         projectId,
         req.account.id,
         b.name.trim(),
@@ -289,6 +410,7 @@ export function createPlatform(
         uuid(b.workspaceId) ? b.workspaceId : null,
         b.requestKey,
         now(),
+        hosting,
       );
       store.run(
         "INSERT INTO members(id,project_id,user_id,name,prefix,role,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -300,10 +422,15 @@ export function createPlatform(
         "owner",
         now(),
       );
+      if (b.generateName === true)
+        store.run(
+          "UPDATE projects SET name_source='pending' WHERE id=?",
+          projectId,
+        );
       store.enqueue(projectId, "provision", `provision:${projectId}`);
       const jobId = id();
       store.run(
-        "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at,approval_required) VALUES(?,?,?,?,?,?,?,1)",
         jobId,
         projectId,
         memberId,
@@ -365,7 +492,7 @@ export function createPlatform(
     if (existing) return res.json({ projectId: project.id });
     if (
       store.get(
-        "SELECT COUNT(*) AS total FROM members WHERE project_id=?",
+        "SELECT COUNT(*) AS total FROM members WHERE project_id=? AND role!='agent'",
         project.id,
       ).total >= 20
     )
@@ -393,8 +520,52 @@ export function createPlatform(
     cookie(res, config, "butler_account", store.session(user.id));
     res.status(201).json({ projectId: project.id });
   });
+  function jobViews(project, viewer, member = null, historyIds = null) {
+    return store
+      .all(
+        `SELECT j.id,j.member_id AS memberId,j.request_key AS requestKey,j.text,j.state,j.result,j.error,
+      j.pr_number AS prNumber,j.pr_url AS prUrl,j.preview_url AS previewUrl,j.created_at AS createdAt,j.updated_at AS updatedAt,
+      j.started_at AS startedAt,j.finished_at AS finishedAt,j.merged_at AS mergedAt,j.published_at AS publishedAt,
+      j.change_sha AS changeSha,j.pr_title AS prTitle,j.artifact_url AS artifactUrl,j.artifact_ready_at AS artifactReadyAt,
+      j.approved_at AS approvedAt,j.request_revision AS requestRevision,m.name,
+      (m.role='agent') AS isGroup,
+      (p.owner_id=? OR (m.role!='agent' AND m.user_id=?) OR (m.role='agent' AND j.requested_by=?)) AS canApprove,
+      (SELECT inspected_at FROM preview_inspections i WHERE i.job_id=j.id AND i.user_id=? AND i.sha=j.change_sha) AS inspectedAt,
+      (SELECT dismissed_at FROM preview_visibility v WHERE v.job_id=j.id AND v.user_id=? AND v.hidden_revision=j.request_revision) AS dismissedAt
+      FROM jobs j JOIN members m ON m.id=j.member_id JOIN projects p ON p.id=j.project_id
+      WHERE j.project_id=? ${member ? "AND j.member_id=?" : ""}
+      ${historyIds ? `AND (j.id IN (${historyIds.map(() => "?").join(",") || "NULL"}) OR j.id=(SELECT id FROM jobs WHERE member_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1))` : ""}
+      ORDER BY j.created_at ${member ? "ASC" : "DESC"},j.rowid ${member ? "ASC" : "DESC LIMIT 30"}`,
+        viewer,
+        viewer,
+        viewer,
+        viewer,
+        viewer,
+        project,
+        ...(member ? [member] : []),
+        ...(historyIds ? [...historyIds, member] : []),
+      )
+      .map((job) => ({
+        ...job,
+        isGroup: Boolean(job.isGroup),
+        canApprove: Boolean(job.canApprove),
+      }));
+  }
   app.get("/api/projects/:projectId", signed, membership, (req, res) => {
     const p = req.project;
+    const chat = req.query.chat
+      ? store.get(
+          "SELECT * FROM members WHERE project_id=? AND id=?",
+          p.id,
+          String(req.query.chat),
+        )
+      : req.member;
+    if (!chat)
+      return res
+        .status(404)
+        .json({ error: "This chat is not in your project." });
+    const chatHistory = store.chatPage(chat.id, req.account.id);
+    const groupHistory = store.groupPage(p.id, req.account.id);
     res.json({
       id: p.id,
       name: p.name,
@@ -405,28 +576,77 @@ export function createPlatform(
       repoUrl: p.repo ? `https://github.com/${p.repo}` : null,
       isOwner: p.owner_id === req.account.id,
       codingReady: Boolean(p.codex_ready),
+      hostingProvider: p.hosting_provider,
+      hostingState: JSON.parse(p.resources).hostingCheck?.state || "ready",
+      githubAccess:
+        p.state === "github_access" && p.repo && p.owner_id === req.account.id
+          ? {
+              repo: p.repo,
+              url: `/auth/github/install?returnTo=${encodeURIComponent(`/p/${p.id}`)}`,
+            }
+          : null,
       member: memberView(req.member),
+      chatMember: memberView(chat),
+      readOnly: chat.id !== req.member.id,
+      canSteerChat:
+        chat.role !== "agent" &&
+        (p.owner_id === req.account.id || chat.user_id === req.account.id),
       members: store.all(
-        "SELECT id,name,prefix,role FROM members WHERE project_id=? ORDER BY created_at",
+        "SELECT m.id,m.name,m.prefix,m.role,j.state AS agentState,j.started_at AS startedAt,j.finished_at AS finishedAt FROM members m LEFT JOIN jobs j ON j.id=(SELECT id FROM jobs WHERE member_id=m.id ORDER BY created_at DESC,rowid DESC LIMIT 1) WHERE m.project_id=? AND m.role!='agent' ORDER BY m.created_at",
         p.id,
       ),
       ownMemberships: store.all(
-        "SELECT id,name,prefix,role FROM members WHERE project_id=? AND user_id=?",
+        "SELECT id,name,prefix,role FROM members WHERE project_id=? AND user_id=? AND role!='agent'",
         p.id,
         req.account.id,
       ),
-      messages: store.all(
-        "SELECT id,job_id AS jobId,role,text,created_at AS createdAt FROM messages WHERE member_id=? ORDER BY created_at,rowid",
-        req.member.id,
-      ),
-      jobs: store.all(
-        "SELECT id,request_key AS requestKey,text,state,result,error,pr_url AS prUrl,preview_url AS previewUrl,created_at AS createdAt FROM jobs WHERE member_id=? ORDER BY created_at",
-        req.member.id,
-      ),
-      activity: store.all(
-        "SELECT j.id,substr(j.text,1,100) AS text,j.state,j.pr_url AS prUrl,j.preview_url AS previewUrl,m.name FROM jobs j JOIN members m ON m.id=j.member_id WHERE j.project_id=? ORDER BY j.created_at DESC LIMIT 15",
+      messages: chatHistory.items,
+      historyBefore: chatHistory.before,
+      groupHistoryBefore: groupHistory.before,
+      reactions: store.reactionSummary(p.id, req.account.id),
+      groupMessages: groupHistory.items.filter((m) => m.kind === "human"),
+      jobs: jobViews(
         p.id,
+        req.account.id,
+        chat.id,
+        chatHistory.items.map((m) => m.jobId).filter(Boolean),
       ),
+      groupAgent: (() => {
+        const agent = store.groupAgent(p.id);
+        return agent
+          ? {
+              member: memberView(agent),
+              messages: groupHistory.items.filter((m) => m.kind !== "human"),
+              jobs: jobViews(
+                p.id,
+                req.account.id,
+                agent.id,
+                groupHistory.items.map((m) => m.jobId).filter(Boolean),
+              ),
+            }
+          : null;
+      })(),
+      personalUpdateAt: store.get(
+        `SELECT MAX(at) AS at FROM (
+        SELECT created_at AS at FROM messages WHERE member_id=? AND role='assistant'
+        UNION ALL SELECT e.created_at FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.member_id=?
+        UNION ALL SELECT m.created_at FROM messages m JOIN message_authors a ON a.message_id=m.id WHERE m.member_id=? AND a.user_id!=?)`,
+        req.member.id,
+        req.member.id,
+        req.member.id,
+        req.account.id,
+      ).at,
+      activity: jobViews(p.id, req.account.id),
+      releases: store
+        .all(
+          "SELECT pr_number AS number,title,author,merge_sha AS sha,merged_at AS mergedAt,published_at AS publishedAt,is_live AS isLive FROM releases WHERE project_id=? ORDER BY merged_at DESC,pr_number DESC",
+          p.id,
+        )
+        .map((r) => ({
+          ...r,
+          isLive: Boolean(r.isLive),
+          url: `https://github.com/${p.repo}/pull/${r.number}`,
+        })),
       tasks:
         p.owner_id === req.account.id
           ? store.all(
@@ -437,6 +657,95 @@ export function createPlatform(
           : [],
     });
   });
+  app.get(
+    "/api/projects/:projectId/history",
+    signed,
+    membership,
+    (req, res) => {
+      const before = req.query.before;
+      if (typeof before !== "string" || before.length > 1500)
+        return res
+          .status(400)
+          .json({ error: "Choose an earlier page of this conversation." });
+      if (req.query.channel === "group") {
+        const page = store.groupPage(req.project.id, req.account.id, before),
+          agent = store.groupAgent(req.project.id);
+        return res.json({
+          ...page,
+          jobs: agent
+            ? jobViews(
+                req.project.id,
+                req.account.id,
+                agent.id,
+                page.items.map((m) => m.jobId).filter(Boolean),
+              )
+            : [],
+        });
+      }
+      const chat = req.query.chat
+        ? store.get(
+            "SELECT id FROM members WHERE project_id=? AND id=?",
+            req.project.id,
+            String(req.query.chat),
+          )
+        : req.member;
+      if (!chat)
+        return res
+          .status(404)
+          .json({ error: "This chat is not in your project." });
+      const page = store.chatPage(chat.id, req.account.id, before);
+      res.json({
+        ...page,
+        jobs: jobViews(
+          req.project.id,
+          req.account.id,
+          chat.id,
+          page.items.map((m) => m.jobId).filter(Boolean),
+        ),
+      });
+    },
+  );
+  app.post("/api/projects/:projectId/wake", signed, membership, (req, res) => {
+    const check = JSON.parse(req.project.resources).hostingCheck;
+    if (
+      req.project.hosting_provider === "boat" &&
+      req.project.state === "ready" &&
+      (check?.state !== "ready" || check.at < now() - 5 * 60000)
+    )
+      store.enqueue(
+        req.project.id,
+        "boat-wake",
+        `boat-wake:${req.project.id}:${Math.floor(now() / 60000)}`,
+      );
+    res.json({ ok: true });
+  });
+  app.get(
+    "/api/projects/:projectId/share",
+    signed,
+    membership,
+    async (req, res) => {
+      const link = req.project.app_url;
+      if (!link)
+        return res.status(409).json({
+          error:
+            "Your website isn’t live yet. You can share it once it’s ready.",
+        });
+      const url = new URL(link);
+      if (url.protocol !== "https:" || url.username || url.password)
+        return res.status(409).json({
+          error: "The website link isn’t ready yet. Please try again shortly.",
+        });
+      res.json({
+        url: link,
+        qr: await QRCode.toDataURL(link, {
+          width: 320,
+          margin: 2,
+          color: { dark: "#153e35", light: "#ffffff" },
+          errorCorrectionLevel: "M",
+        }),
+      });
+    },
+  );
   app.get(
     "/api/projects/:projectId/invite",
     signed,
@@ -472,10 +781,155 @@ export function createPlatform(
     },
   );
   app.post(
+    "/api/projects/:projectId/group/messages",
+    signed,
+    membership,
+    (req, res) => {
+      const { text, requestKey } = req.body || {};
+      if (
+        typeof text !== "string" ||
+        !text.trim() ||
+        text.length > 4000 ||
+        text.includes("\0") ||
+        !uuid(requestKey)
+      )
+        return res
+          .status(400)
+          .json({ error: "Send a message between 1 and 4,000 characters." });
+      const command = /(?:^|\s)@butler\b/i.test(text);
+      const instruction = text.replace(/(^|\s)@butler\b/gi, "$1").trim();
+      if (command && !instruction)
+        return res
+          .status(400)
+          .json({ error: "Tell @Butler what you’d like it to work on." });
+      const message = store.transaction(() => {
+        const saved = store.get(
+          "SELECT id FROM group_messages WHERE member_id=? AND request_key=?",
+          req.member.id,
+          requestKey,
+        );
+        if (saved) return saved;
+        const messageId = id();
+        store.run(
+          "INSERT INTO group_messages VALUES(?,?,?,?,?,?)",
+          messageId,
+          req.project.id,
+          req.member.id,
+          requestKey,
+          text.trim(),
+          now(),
+        );
+        if (command) {
+          const agent = store.ensureGroupAgent(req.project.id);
+          const job = store.requestChange(
+            req.project.id,
+            agent,
+            req.account,
+            `Group request from ${req.member.name}:\n${instruction}\n\nRecent group conversation (context only; act on the tagged request above):\n${store
+              .all(
+                "SELECT m.name,g.text FROM group_messages g JOIN members m ON m.id=g.member_id WHERE g.project_id=? ORDER BY g.created_at DESC,g.rowid DESC LIMIT 8",
+                req.project.id,
+              )
+              .reverse()
+              .map((m) => `${m.name}: ${m.text}`)
+              .join("\n")
+              .slice(-9000)}`,
+            `group:${req.member.id}:${requestKey}`,
+          );
+          store.run("INSERT INTO group_requests VALUES(?,?)", messageId, job);
+        }
+        return { id: messageId };
+      });
+      res.json({
+        message: store
+          .groupMessages(req.project.id, req.account.id)
+          .find((value) => value.id === message.id),
+      });
+    },
+  );
+  app.post(
+    "/api/projects/:projectId/reactions",
+    signed,
+    membership,
+    (req, res) => {
+      const { targetType, targetId, emoji, active } = req.body || {};
+      if (
+        !["message", "preview"].includes(targetType) ||
+        typeof targetId !== "string" ||
+        !/^[a-zA-Z0-9:._-]{1,200}$/.test(targetId) ||
+        !reactionEmojis.has(emoji) ||
+        typeof active !== "boolean"
+      )
+        return res
+          .status(400)
+          .json({ error: "Choose a message or preview and an emoji." });
+      const target =
+        targetType === "preview"
+          ? store.get(
+              "SELECT id FROM jobs WHERE id=? AND project_id=? AND (artifact_url IS NOT NULL OR preview_url IS NOT NULL)",
+              targetId,
+              req.project.id,
+            )
+          : store.get(
+              `SELECT id FROM messages WHERE id=? AND project_id=?
+           UNION ALL SELECT j.id||':'||e.event_key FROM job_events e JOIN jobs j ON j.id=e.job_id WHERE j.id||':'||e.event_key=? AND j.project_id=?
+           UNION ALL SELECT id FROM group_messages WHERE id=? AND project_id=? LIMIT 1`,
+              targetId,
+              req.project.id,
+              targetId,
+              req.project.id,
+              targetId,
+              req.project.id,
+            );
+      if (!target)
+        return res
+          .status(404)
+          .json({ error: "This message or preview isn’t in your project." });
+      if (active)
+        store.run(
+          "INSERT OR IGNORE INTO reactions VALUES(?,?,?,?,?,?,?)",
+          req.project.id,
+          targetType,
+          targetId,
+          emoji,
+          req.account.id,
+          req.member.id,
+          now(),
+        );
+      else
+        store.run(
+          "DELETE FROM reactions WHERE project_id=? AND target_type=? AND target_id=? AND emoji=? AND user_id=?",
+          req.project.id,
+          targetType,
+          targetId,
+          emoji,
+          req.account.id,
+        );
+      res.json({
+        reactions: store.reactionSummary(req.project.id, req.account.id),
+      });
+    },
+  );
+  app.post(
     "/api/projects/:projectId/messages",
     signed,
     membership,
     (req, res) => {
+      const chat = req.query.chat
+        ? store.get(
+            "SELECT * FROM members WHERE id=? AND project_id=?",
+            String(req.query.chat),
+            req.project.id,
+          )
+        : req.member;
+      if (!chat)
+        return res
+          .status(404)
+          .json({ error: "This chat isn’t in your project." });
+      if (chat.role === "agent")
+        return res.status(403).json({
+          error: "Tag @Butler in group chat to guide the shared agent.",
+        });
       const text = req.body?.text;
       if (
         typeof text !== "string" ||
@@ -487,37 +941,229 @@ export function createPlatform(
         return res
           .status(400)
           .json({ error: "Send a request between 1 and 20,000 characters." });
-      const jobId = store.transaction(() => {
-        const existing = store.get(
-          "SELECT id FROM jobs WHERE member_id=? AND request_key=?",
-          req.member.id,
-          req.body.requestKey,
-        );
-        if (existing) return existing.id;
-        const value = id();
-        store.run(
-          "INSERT INTO jobs(id,project_id,member_id,request_key,text,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-          value,
-          req.project.id,
-          req.member.id,
-          req.body.requestKey,
+      if (
+        /^(?:please\s+)?(?:make (?:the change|this the website|the website have that)|apply (?:this|the change)|publish (?:it|this)|ship it)[.!?]*$/i.test(
           text.trim(),
-          now(),
-          now(),
-        );
-        store.run(
-          "INSERT INTO messages VALUES(?,?,?,?,?,?,?)",
-          id(),
+        )
+      ) {
+        const job = store.get(
+          "SELECT * FROM jobs WHERE project_id=? AND member_id=? AND state='awaiting_approval' ORDER BY inspected_at DESC,created_at DESC LIMIT 1",
           req.project.id,
-          req.member.id,
-          value,
-          "user",
-          text.trim(),
-          now(),
+          chat.id,
         );
-        return value;
-      });
+        if (!job)
+          return res.status(409).json({
+            error:
+              "Inspect a ready preview first, then choose Make this the website.",
+          });
+        return approveJob(req, res, job, job.change_sha);
+      }
+      const jobId = store.requestChange(
+        req.project.id,
+        chat,
+        req.account,
+        text.trim(),
+        req.body.requestKey,
+      );
       res.status(202).json({ jobId });
+    },
+  );
+  app.post(
+    "/api/projects/:projectId/jobs/:jobId/visibility",
+    signed,
+    membership,
+    (req, res) => {
+      const job = store.get(
+        "SELECT * FROM jobs WHERE id=? AND project_id=?",
+        req.params.jobId,
+        req.project.id,
+      );
+      if (!job || !(job.artifact_url || job.preview_url))
+        return res
+          .status(404)
+          .json({ error: "This preview isn’t in your project." });
+      const { dismissed, revision, sha } = req.body || {};
+      if (typeof dismissed !== "boolean" || !Number.isSafeInteger(revision))
+        return res.status(400).json({
+          error: "Choose whether to dismiss or restore this preview.",
+        });
+      if (revision !== job.request_revision || sha !== job.change_sha)
+        return res.status(409).json({
+          error:
+            "This preview has been updated. Open its latest version and try again.",
+        });
+      if (dismissed) {
+        const current = store.get(
+          "SELECT hidden_revision FROM preview_visibility WHERE job_id=? AND user_id=?",
+          job.id,
+          req.account.id,
+        );
+        if (current?.hidden_revision !== revision)
+          store.run(
+            "INSERT INTO preview_visibility VALUES(?,?,?,?,?) ON CONFLICT(job_id,user_id) DO UPDATE SET hidden_revision=excluded.hidden_revision,dismissed_at=excluded.dismissed_at,title=excluded.title",
+            job.id,
+            req.account.id,
+            revision,
+            now(),
+            job.pr_title || "Your proposed change",
+          );
+      } else
+        store.run(
+          "UPDATE preview_visibility SET hidden_revision=NULL WHERE job_id=? AND user_id=?",
+          job.id,
+          req.account.id,
+        );
+      res.json({ ok: true });
+    },
+  );
+  function ownedJob(req, res, next) {
+    req.job = store.get(
+      "SELECT * FROM jobs WHERE id=? AND project_id=? AND (member_id=? OR ?=1 OR (requested_by=? AND member_id IN (SELECT member_id FROM group_agents WHERE project_id=?)))",
+      req.params.jobId,
+      req.project.id,
+      req.member.id,
+      req.project.owner_id === req.account.id ? 1 : 0,
+      req.account.id,
+      req.project.id,
+    );
+    if (!req.job)
+      return res
+        .status(404)
+        .json({ error: "This request is not in your chat." });
+    next();
+  }
+  app.post(
+    "/api/projects/:projectId/jobs/:jobId/inspect",
+    signed,
+    membership,
+    ownedJob,
+    (req, res) => {
+      if (
+        req.job.state !== "awaiting_approval" ||
+        !req.job.artifact_url ||
+        req.body.sha !== req.job.change_sha
+      )
+        return res
+          .status(409)
+          .json({ error: "Open the latest ready preview before applying it." });
+      store.run("UPDATE jobs SET inspected_at=? WHERE id=?", now(), req.job.id);
+      store.run(
+        "INSERT INTO preview_inspections VALUES(?,?,?,?) ON CONFLICT(job_id,user_id) DO UPDATE SET sha=excluded.sha,inspected_at=excluded.inspected_at",
+        req.job.id,
+        req.account.id,
+        req.job.change_sha,
+        now(),
+      );
+      res.json({ ok: true });
+    },
+  );
+  app.post(
+    "/api/projects/:projectId/jobs/:jobId/approve",
+    signed,
+    membership,
+    ownedJob,
+    (req, res) => {
+      return approveJob(req, res, req.job, req.body.sha);
+    },
+  );
+  function approveJob(req, res, job, sha) {
+    if (sha !== job.change_sha)
+      return res.status(409).json({
+        error: "The preview changed. Inspect the latest version first.",
+      });
+    if (job.approved_at) return res.json({ ok: true, jobId: job.id });
+    if (
+      store.get(
+        "SELECT 1 FROM preview_visibility WHERE job_id=? AND user_id=? AND hidden_revision=?",
+        job.id,
+        req.account.id,
+        job.request_revision,
+      )
+    )
+      return res.status(409).json({
+        error: "Restore this preview from chat history before publishing it.",
+      });
+    if (
+      store.get(
+        "SELECT 1 FROM jobs WHERE member_id=? AND request_key NOT LIKE 'review-fix:%' AND created_at>? LIMIT 1",
+        job.member_id,
+        job.created_at,
+      )
+    )
+      return res.status(409).json({
+        error:
+          "This preview has been updated. Inspect the latest version in this chat.",
+      });
+    if (
+      job.state !== "awaiting_approval" ||
+      !store.get(
+        "SELECT 1 FROM preview_inspections WHERE job_id=? AND user_id=? AND sha=?",
+        job.id,
+        req.account.id,
+        sha,
+      ) ||
+      !job.artifact_url ||
+      !job.artifact_ready_at ||
+      !job.pr_title ||
+      !job.branch
+    )
+      return res.status(409).json({
+        error: "Inspect your preview first, then choose Make this the website.",
+      });
+    store.transaction(() => {
+      store.run(
+        "UPDATE jobs SET state='creating_pr',approved_at=?,approved_by=?,updated_at=? WHERE id=?",
+        now(),
+        req.account.id,
+        now(),
+        job.id,
+      );
+      store.humanMessage(
+        req.project.id,
+        job.member_id,
+        job.id,
+        req.account,
+        "Make this the website.",
+      );
+      store.recordEvent(
+        job.id,
+        "approved",
+        "status",
+        `${req.account.name} approved this preview. Creating the pull request for review.`,
+      );
+      store.enqueue(
+        req.project.id,
+        "open-pr",
+        `open-pr:${job.id}:${job.change_sha}`,
+        { jobId: job.id, sha: job.change_sha },
+      );
+    });
+    return res.status(202).json({ ok: true, jobId: job.id });
+  }
+  app.post(
+    "/api/projects/:projectId/jobs/:jobId/retry",
+    signed,
+    membership,
+    ownedJob,
+    (req, res) => {
+      const job = req.job;
+      if (job.state !== "preview_failed" || !job.change_sha)
+        return res
+          .status(409)
+          .json({ error: "There is no preview step to retry." });
+      const kind = job.approved_at ? "open-pr" : "artifact";
+      store.run(
+        "UPDATE tasks SET state='queued',attempts=0,available_at=0,error=NULL WHERE project_id=? AND dedupe_key=? AND state='failed'",
+        req.project.id,
+        `${kind}:${job.id}:${job.change_sha}`,
+      );
+      store.run(
+        "UPDATE jobs SET state=?,error=NULL,updated_at=? WHERE id=?",
+        job.approved_at ? "creating_pr" : "building_preview",
+        now(),
+        job.id,
+      );
+      res.status(202).json({ ok: true });
     },
   );
   app.get(
@@ -547,6 +1193,39 @@ export function createPlatform(
             "Your workspace is still being prepared. You can invite teammates now.",
         });
       res.json(await provider.worker(req.project, "/auth/start", "POST"));
+    },
+  );
+  app.post(
+    "/api/projects/:projectId/github-access",
+    signed,
+    membership,
+    owner,
+    async (req, res) => {
+      if (req.project.state !== "github_access")
+        return res.json({ ready: true });
+      if (!req.project.repo)
+        return res
+          .status(409)
+          .json({ error: "The project repository has not been created yet." });
+      try {
+        await provider.createRepository(req.project);
+      } catch (error) {
+        if (error.code === "github_repository_access_required")
+          return res.json({ ready: false });
+        throw error;
+      }
+      store.transaction(() => {
+        store.run(
+          "UPDATE tasks SET state='queued',attempts=0,error=NULL,available_at=? WHERE project_id=? AND kind='provision' AND state='failed'",
+          now(),
+          req.project.id,
+        );
+        store.run(
+          "UPDATE projects SET state='queued',error=NULL WHERE id=? AND state='github_access'",
+          req.project.id,
+        );
+      });
+      res.json({ ready: true });
     },
   );
   app.post(
@@ -608,6 +1287,24 @@ if (process.argv[1] && import.meta.filename === path.resolve(process.argv[1])) {
   process.umask(0o077);
   const config = configuration(),
     platform = createPlatform(config);
+  const retire = async () => {
+    const legacy = await retireLegacyGithub(config, platform.store);
+    await platform.provider.boatAuth?.retire();
+    console.log(
+      `[github] Legacy grants revoked: ${legacy.revoked}; quarantined pending revocation: ${legacy.pending}`,
+    );
+  };
+  retire().catch(() =>
+    console.error("[github] Legacy grant cleanup will retry."),
+  );
+  const retireTimer = setInterval(
+    () =>
+      retire().catch(() =>
+        console.error("[github] Legacy grant cleanup will retry."),
+      ),
+    60000,
+  );
+  retireTimer.unref();
   const stop = platform.provisioner.start();
   platform.server.listen(config.port, "0.0.0.0", () =>
     console.log(`Butler portal listening on ${config.port}`),
@@ -615,6 +1312,7 @@ if (process.argv[1] && import.meta.filename === path.resolve(process.argv[1])) {
   for (const signal of ["SIGTERM", "SIGINT"])
     process.once(signal, () => {
       stop();
+      clearInterval(retireTimer);
       platform.server.close(() => {
         platform.store.close();
         process.exit(0);

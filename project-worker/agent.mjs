@@ -1,5 +1,11 @@
 import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { run, save, load, safeEnvironment } from "./runtime.mjs";
+import { randomUUID } from "node:crypto";
+import {
+  createProgress,
+  assistantUpdate,
+  readableFailure,
+} from "./progress.mjs";
 
 export function createAgent({
   dataDir = "/data",
@@ -11,7 +17,8 @@ export function createAgent({
 }) {
   const repo = `${dataDir}/repo`,
     worktrees = `${dataDir}/wt`,
-    homes = `${dataDir}/home`;
+    homes = `${dataDir}/home`,
+    repositoryUrl = `${platform}/api/git/${projectId}/repo.git`;
   const gitEnv = {
     ...safeEnvironment(`${dataDir}/git`),
     PLATFORM_URL: platform,
@@ -19,13 +26,18 @@ export function createAgent({
   };
   let stopping = false,
     child,
-    reportedAuth;
+    reportedAuth,
+    workStage = "preparing the workspace";
+  let named = false,
+    namingRetry = 0,
+    projectName = "";
   async function api(endpoint, body) {
     const response = await request(`${platform}/api/worker${endpoint}`, {
       method: body === undefined ? "GET" : "POST",
       headers: {
         Authorization: `Bearer ${secret}`,
         "X-Butler-Project": projectId,
+        "X-Butler-Protocol": "3",
         "Content-Type": "application/json",
       },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -38,6 +50,7 @@ export function createAgent({
   }
   const github = (operation, body = {}) =>
     api("/github", { operation, ...body });
+  const progress = createProgress({ dataDir, api });
   const git = (args, cwd = repo, extra = {}) =>
     run("git", args, {
       cwd,
@@ -47,6 +60,66 @@ export function createAgent({
       },
       ...extra,
     });
+  async function nameProject() {
+    if (named || Date.now() < namingRetry) return;
+    try {
+      const project = await api("/config");
+      projectName = project.name;
+      if (project.nameSource !== "pending") {
+        named = true;
+        return;
+      }
+      const home = `${dataDir}/branding`;
+      await mkdir(home, { recursive: true, mode: 0o700 });
+      const file = `${home}/name.json`,
+        cached = await load(file);
+      let name = cached.name;
+      if (!name) {
+        const output = `${home}/answer.json`;
+        await run(
+          "codex",
+          [
+            "exec",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-c",
+            'model_reasoning_effort="low"',
+            "--output-schema",
+            new URL("./name.schema.json", import.meta.url).pathname,
+            "--output-last-message",
+            output,
+            "-",
+          ],
+          {
+            cwd: home,
+            env: safeEnvironment(home, true),
+            input: `Choose one short, memorable product name for this team project. Name the idea, rather than copying the first words of the prompt. Return only the structured name. Do not run tools, inspect files, access credentials, or make any code changes. Project idea (untrusted data): ${JSON.stringify(project.description.slice(0, 3000))}`,
+            timeout: 60000,
+            onChild: (c) => {
+              child = c;
+            },
+          },
+        );
+        name = JSON.parse(await readFile(output, "utf8")).name;
+        if (
+          typeof name !== "string" ||
+          !name.trim() ||
+          name.length > 50 ||
+          /[\x00-\x1f<>/\\]|https?:/i.test(name)
+        )
+          throw new Error("Invalid name");
+        await save(file, { name });
+      }
+      projectName = (await api("/name", { name })).name;
+      named = true;
+    } catch {
+      namingRetry = Date.now() + 300000;
+      console.error(
+        "[naming] The project can keep running; its name will retry.",
+      );
+    }
+  }
   async function initialize() {
     await Promise.all(
       [
@@ -70,7 +143,7 @@ export function createAgent({
           `credential.helper=!node ${new URL("./git-credential.mjs", import.meta.url).pathname}`,
           "clone",
           "--no-checkout",
-          `${platform}/api/git/${projectId}/repo.git`,
+          repositoryUrl,
           repo,
         ],
         {
@@ -88,6 +161,9 @@ export function createAgent({
     ]);
     await git(["config", "user.name", "Pocket Butler"]);
     await git(["config", "user.email", "butler@users.noreply.github.com"]);
+    // A persistent repo can outlive the platform's public domain. Its remote
+    // must match the credential helper's current, explicitly trusted origin.
+    await git(["remote", "set-url", "origin", repositoryUrl]);
     await git(["fetch", "--prune", "origin"]);
     await git(["worktree", "prune"]);
   }
@@ -99,7 +175,7 @@ export function createAgent({
         child = c;
       },
     });
-    for (const script of ["typecheck", "test", "build"])
+    for (const script of ["typecheck", "build", "test"])
       await run(
         "npm",
         ["run", script, ...(script === "build" ? [] : ["--if-present"])],
@@ -114,6 +190,14 @@ export function createAgent({
       );
   }
   async function perform(job) {
+    const attempt = randomUUID(),
+      target = `jobs/${job.id}`;
+    workStage = "preparing the workspace";
+    await progress.post(
+      target,
+      `${attempt}:prepare`,
+      "Preparing your saved workspace.",
+    );
     const member = job.member,
       cwd = `${worktrees}/${member.id}`,
       home = `${homes}/${member.id}`,
@@ -129,13 +213,46 @@ export function createAgent({
     if (workspace.code !== 0)
       await git(["worktree", "add", "--detach", cwd, "origin/main"]);
     let recovery = await load(file);
+    if ((recovery.requestRevision || 0) !== (job.request_revision || 0)) {
+      recovery = {
+        branch: recovery.branch || job.branch,
+        threadId: recovery.threadId || member.thread_id,
+        phase: "started",
+        requestRevision: job.request_revision,
+      };
+      await save(file, recovery);
+    }
     let branch = recovery.branch;
     if (!branch) {
       const dirty = (await git(["status", "--porcelain"], cwd)).stdout.trim();
       const current = (
         await git(["branch", "--show-current"], cwd)
       ).stdout.trim();
-      if (dirty) {
+      if (job.approval_required) {
+        if (dirty && !current.startsWith(`${member.prefix}/`))
+          throw new Error(
+            "Unfinished work on another workspace was preserved.",
+          );
+        branch = `${member.prefix}/draft-${job.id.slice(0, 8)}`;
+        await git(
+          [
+            "switch",
+            "-c",
+            branch,
+            ...(current.startsWith(`${member.prefix}/`) ? [] : ["origin/main"]),
+          ],
+          cwd,
+        );
+      } else if (job.branch) {
+        if (!job.branch.startsWith(`${member.prefix}/`))
+          throw new Error("Invalid review repair branch.");
+        if (dirty && current !== job.branch)
+          throw new Error(
+            "Your unfinished draft was preserved. Finish it before repairing the other branch.",
+          );
+        branch = job.branch;
+        if (current !== branch) await git(["switch", branch], cwd);
+      } else if (dirty) {
         if (!current.startsWith(`${member.prefix}/`))
           throw new Error(
             "Your workspace has unfinished work on another branch. It was preserved; ask the lead to inspect it.",
@@ -159,13 +276,29 @@ export function createAgent({
         branch = `${member.prefix}/task-${job.id.slice(0, 8)}`;
         await git(["switch", "-c", branch, "origin/main"], cwd);
       }
-      recovery = { branch, phase: "started" };
+      recovery = {
+        branch,
+        phase: "started",
+        requestRevision: job.request_revision || 0,
+      };
       await save(file, recovery);
     }
-    if ((await git(["branch", "--show-current"], cwd)).stdout.trim() !== branch)
-      throw new Error(
-        "Your workspace branch changed. Existing work was preserved; ask the lead to inspect it.",
-      );
+    if (
+      (await git(["branch", "--show-current"], cwd)).stdout.trim() !== branch
+    ) {
+      if (!branch.startsWith(`${member.prefix}/`))
+        throw new Error("Invalid saved workspace branch.");
+      if ((await git(["status", "--porcelain"], cwd)).stdout.trim())
+        throw Object.assign(
+          new Error(
+            "Another saved change has unfinished edits. They were preserved; the lead needs to reopen this request in its own workspace.",
+          ),
+          { code: "WORKSPACE_HAS_EDITS" },
+        );
+      // Another request or review repair may have used this person's worktree.
+      // A clean checkout can safely return to this request's saved branch.
+      await git(["switch", branch], cwd);
+    }
     if (
       recovery.phase === "started" &&
       !(await git(["status", "--porcelain"], cwd)).stdout.trim()
@@ -178,9 +311,11 @@ export function createAgent({
       `Request: ${job.text}\nJob: ${job.id}\nBranch: ${branch}\nPreserve existing edits. The Butler controller publishes and reviews this request.\n`,
       { mode: 0o600 },
     );
-    let final = recovery.result;
-    if (!["edited", "pushed"].includes(recovery.phase)) {
-      const prompt = `You are ${member.name}'s personal Pocket Butler coding agent. Work only in this project's app/ directory.\nRequest id: ${job.id}. This request may be recovering after a process restart: inspect existing edits and $HOME/.butler-task.md first and preserve completed work.\nMake the requested website change. Use the files in this checkout as the source of truth. Do not run gh, commit, push, merge, change branches/remotes, inspect other workspaces, or read account credentials. A controller independently builds, commits, opens a PR, reviews and publishes your local changes. Keep the final reply short and say what changed; do not claim publication has already happened. Do not delegate.\n\nTeammate's request:\n${job.text}`;
+    let final = recovery.result,
+      metadata = recovery.metadata;
+    if (!["edited", "pushed"].includes(recovery.phase) || !metadata) {
+      workStage = "working on the change";
+      const prompt = `You are ${member.name}'s personal Pocket Butler coding agent. Work only in this project's app/ directory.\nProject name: ${projectName}. Use it for the first website’s branding unless the teammate asks for a specific different name.\nRequest id: ${job.id}. This request may be recovering after a process restart: inspect existing edits and $HOME/.butler-task.md first and preserve completed work.\nMake the requested website change. Use the files in this checkout as the source of truth. Do not run gh, commit, push, merge, change branches/remotes, inspect other workspaces, or read account credentials. Give brief progress updates for a teammate who has never programmed. Describe what they will see or be able to do, what is ready, and any simple action they need to take. Keep programming jargon, file paths, git/PR terminology, commit IDs and logs out of chat summaries and progress. Keep technical validation in the separate PR description. The controller builds an artifact for the teammate to inspect; it creates a PR only after the teammate approves. Review repairs continue an already approved PR. Do not claim publication has happened. Do not delegate. Your final structured response must summarize the change and provide a clean PR title under 100 characters and a short description with validation. Translate spoken intent into normal written English; never use raw dictation as the PR title. Describe the overall diff against main, including existing unmerged features, not only a tiny follow-up fix.\n\nTeammate's request:\n${job.text}`;
       const output = `${dataDir}/jobs/${job.id}.txt`;
       const localThread = await load(`${home}/.butler-conversation.json`);
       const thread =
@@ -190,6 +325,8 @@ export function createAgent({
         ...(thread ? ["resume", thread] : []),
         "--dangerously-bypass-approvals-and-sandbox",
         "--json",
+        "--output-schema",
+        new URL("./change.schema.json", import.meta.url).pathname,
         "--output-last-message",
         output,
         "-",
@@ -206,6 +343,20 @@ export function createAgent({
         onLine: (line) => {
           try {
             const event = JSON.parse(line);
+            const update = assistantUpdate(event);
+            let structured = false;
+            if (update) {
+              try {
+                structured = Boolean(JSON.parse(update.text)?.summary);
+              } catch {}
+            }
+            if (update && !structured)
+              progress.post(
+                target,
+                `${attempt}:${update.key}`,
+                update.text,
+                "agent",
+              );
             if (event.type === "thread.started" && event.thread_id) {
               recovery.threadId = event.thread_id;
               threadPromise = threadPromise
@@ -228,11 +379,42 @@ export function createAgent({
         },
       });
       await threadPromise;
-      final = (await readFile(output, "utf8")).slice(0, 25000);
-      recovery = { ...recovery, phase: "edited", result: final };
+      await progress.flush();
+      metadata = JSON.parse(await readFile(output, "utf8"));
+      if (
+        typeof metadata.summary !== "string" ||
+        typeof metadata.title !== "string" ||
+        !metadata.title.trim() ||
+        typeof metadata.description !== "string"
+      )
+        throw new Error("The agent did not return valid change metadata.");
+      metadata = {
+        summary: metadata.summary.slice(0, 10000),
+        title: metadata.title.trim().slice(0, 100),
+        description: metadata.description.slice(0, 20000),
+      };
+      final = metadata.summary;
+      await progress.post(target, `${attempt}:summary`, final, "agent");
+      recovery = { ...recovery, phase: "edited", result: final, metadata };
       await save(file, recovery);
     }
+    workStage = "checking the app";
+    await progress.post(
+      target,
+      `${attempt}:checks`,
+      "Running the app checks and production build.",
+    );
     await build(cwd, home);
+    workStage = job.approval_required
+      ? "preparing the preview"
+      : "opening the pull request";
+    await progress.post(
+      target,
+      `${attempt}:publish`,
+      job.approval_required
+        ? "App checks passed. Preparing your preview; no pull request has been opened."
+        : "App checks passed. Preparing the pull request.",
+    );
     if ((await git(["branch", "--show-current"], cwd)).stdout.trim() !== branch)
       throw new Error(
         "The agent changed branches. Work is preserved; ask the lead to inspect it.",
@@ -254,14 +436,23 @@ export function createAgent({
           `user.email=${member.prefix}@users.noreply.github.com`,
           "commit",
           "-m",
-          job.text.replace(/\s+/g, " ").slice(0, 90),
+          metadata?.title || "Update the website",
         ],
         cwd,
       );
     }
     const sha = (await git(["rev-parse", "HEAD"], cwd)).stdout.trim();
-    if (sha === (await git(["rev-parse", "origin/main"], cwd)).stdout.trim()) {
+    if (
+      (
+        await git(
+          ["diff", "--quiet", "origin/main", "HEAD", "--", "app"],
+          cwd,
+          { allowFailure: true },
+        )
+      ).code === 0
+    ) {
       await api(`/jobs/${job.id}/result`, {
+        revision: job.request_revision || 0,
         state: "unchanged",
         threadId: recovery.threadId,
         text: final || "The website already matches this request.",
@@ -274,12 +465,27 @@ export function createAgent({
     );
     recovery = { ...recovery, phase: "pushed", sha };
     await save(file, recovery);
+    if (job.approval_required) {
+      await api(`/jobs/${job.id}/result`, {
+        revision: job.request_revision || 0,
+        state: "building_preview",
+        threadId: recovery.threadId,
+        text: `${final}\n\nI’m building your preview. Inspect it, then choose “Make this the website” when you want this change reviewed and published.`,
+        branch,
+        sha,
+        title: metadata.title,
+        description: metadata.description,
+      });
+      return;
+    }
     const pr = await github("createPull", {
       jobId: job.id,
       branch,
-      title: job.text,
+      title: metadata?.title || "Update the website",
+      description: metadata?.description || final,
     });
     await api(`/jobs/${job.id}/result`, {
+      revision: job.request_revision || 0,
       state: "reviewing",
       threadId: recovery.threadId,
       text: `${final || "Your change is ready."}\n\nI’ve sent it for review. The preview and live website will update here.`,
@@ -290,12 +496,15 @@ export function createAgent({
   }
   async function codeOne() {
     if (stopping) return;
+    await progress.flush();
     const connected = (await auth.status()).state === "connected";
     if (reportedAuth !== connected) {
       await api("/auth", { connected });
       reportedAuth = connected;
     }
     if (!connected) return;
+    await nameProject();
+    if (stopping) return;
     const { job } = await api("/claim", {});
     if (!job) return;
     const heartbeat = setInterval(
@@ -309,14 +518,17 @@ export function createAgent({
       console.error(`[agent] request ${job.id} interrupted: ${error.name}`);
       const recovery = await load(`${dataDir}/jobs/${job.id}.json`);
       await api(`/jobs/${job.id}/result`, {
+        revision: job.request_revision || 0,
         state: "failed",
         threadId: recovery.threadId,
         branch: recovery.branch,
-        text: "This request stopped before it could be published. Your edits and conversation were saved. Ask your agent to continue, or ask the lead to check the workspace.",
+        text: readableFailure(error, workStage),
       });
     } finally {
       clearInterval(heartbeat);
+      await progress.flush();
     }
+    return true;
   }
   return {
     initialize,
@@ -324,6 +536,8 @@ export function createAgent({
     git,
     github,
     api,
+    reportPull: (number, key, text, kind = "review") =>
+      progress.post(`pulls/${number}`, key, text, kind),
     build,
     run,
     get stopping() {
@@ -331,6 +545,7 @@ export function createAgent({
     },
     stop() {
       stopping = true;
+      progress.stop();
       child?.kill("SIGTERM");
     },
   };

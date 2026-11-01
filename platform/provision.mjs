@@ -13,6 +13,9 @@ import path from "node:path";
 import { x as extract } from "tar";
 import { setTimeout as delay } from "node:timers/promises";
 import { now } from "./store.mjs";
+import { createBoatProvisioner } from "./boat-provision.mjs";
+import { workerSource } from "./worker-source.mjs";
+import { projectActive } from "./project-activity.mjs";
 
 const exec = promisify(execFile);
 const ENVIRONMENTS = "environments{edges{node{id name}}}";
@@ -40,7 +43,14 @@ export function createProvisioner(
   { execute = exec, pause = delay } = {},
 ) {
   let stopped = false,
-    active = false;
+    active = false,
+    checkingHosting = false;
+  const boat = createBoatProvisioner(config, store, provider, {
+    source,
+    markPublished,
+    pause,
+    isStopped: () => stopped,
+  });
   function resources(project) {
     return JSON.parse(
       store.get("SELECT resources FROM projects WHERE id=?", project.id)
@@ -63,43 +73,24 @@ export function createProvisioner(
       project.id,
     );
   async function repo(project) {
-    const owner = store.get(
-      "SELECT github_login FROM users WHERE id=?",
-      project.owner_id,
-    ).github_login;
-    const name = `butler-${project.slug}`;
-    let found;
-    try {
-      found = await provider.github(
-        project.owner_id,
-        `/repos/${owner}/${name}`,
-      );
-    } catch (error) {
-      if (error.status !== 404) throw error;
-    }
-    if (!found)
-      found = await provider.github(project.owner_id, "/user/repos", "POST", {
-        name,
-        private: true,
-        auto_init: true,
-        description: `Pocket Butler project ${project.id}`,
-      });
-    if (found.description !== `Pocket Butler project ${project.id}`)
-      throw new Error("A different repository already has this project name.");
-    store.run(
-      "UPDATE projects SET repo=? WHERE id=?",
-      found.full_name,
-      project.id,
-    );
-    project.repo = found.full_name;
+    const found = await provider.createRepository(project);
     if (resources(project).seeded) return;
-    if (found.default_branch !== "main")
-      await provider.github(
-        project.owner_id,
-        `/repos/${found.full_name}/branches/${encodeURIComponent(found.default_branch)}/rename`,
-        "POST",
-        { new_name: "main" },
-      );
+    if (found.default_branch !== "main") {
+      try {
+        const original = await provider.github(
+          project.owner_id,
+          `/repos/${found.full_name}/git/ref/heads/${encodeURIComponent(found.default_branch)}`,
+        );
+        await provider.github(
+          project.owner_id,
+          `/repos/${found.full_name}/git/refs`,
+          "POST",
+          { ref: "refs/heads/main", sha: original.object.sha },
+        );
+      } catch (error) {
+        if (error.status !== 422) throw error;
+      }
+    }
     const base = await provider.github(
       project.owner_id,
       `/repos/${found.full_name}/git/ref/heads/main`,
@@ -153,32 +144,10 @@ export function createProvisioner(
       { sha: commit.sha },
     );
     save(project, { seeded: true, initialSha: commit.sha });
-    try {
-      await provider.github(
-        project.owner_id,
-        `/repos/${found.full_name}/branches/main/protection`,
-        "PUT",
-        {
-          required_status_checks: {
-            strict: true,
-            contexts: ["butler/validated-merge"],
-          },
-          enforce_admins: true,
-          required_pull_request_reviews: {
-            required_approving_review_count: 0,
-            dismiss_stale_reviews: true,
-          },
-          restrictions: null,
-          allow_force_pushes: false,
-          allow_deletions: false,
-        },
-      );
-      save(project, { protectedMain: true });
-    } catch (error) {
-      if (![403, 404, 422].includes(error.status)) throw error;
-      save(project, { protectedMain: false });
-    }
+    // Validation is enforced by the controller; repository administration is not granted.
+    save(project, { protectedMain: false });
   }
+
   async function projectResource(project, kind) {
     let value = resources(project)[kind];
     if (value) return value;
@@ -375,6 +344,11 @@ export function createProvisioner(
     );
   }
   async function provision(project) {
+    if (project.hosting_provider === "boat") {
+      state(project, "repository");
+      await repo(project);
+      return boat.provision(project);
+    }
     if (!store.connection(project.owner_id, "railway"))
       throw new Error("Connect Railway to prepare this project.");
     if (!project.workspace_id) {
@@ -448,35 +422,14 @@ export function createProvisioner(
       save(project, { workerDeployment });
     }
     await wait(project, workerDeployment);
+    save(project, {
+      workerVersion: (await workerSource(config.workerDir)).hash,
+    });
     if (!resources(project).appDeployed) {
       await deploy(project, { sha: resources(project).initialSha });
       save(project, { appDeployed: true });
     }
-    if (!resources(project).webhook) {
-      const hooks = await provider.github(
-        project.owner_id,
-        `/repos/${project.repo}/hooks`,
-      );
-      const callback = `${config.publicUrl}/api/hooks/github/${project.id}`;
-      if (!hooks.some((hook) => hook.config?.url === callback))
-        await provider.github(
-          project.owner_id,
-          `/repos/${project.repo}/hooks`,
-          "POST",
-          {
-            name: "web",
-            active: true,
-            events: ["push", "pull_request"],
-            config: {
-              url: callback,
-              content_type: "json",
-              secret: store.open(project.webhook_secret),
-              insecure_ssl: "0",
-            },
-          },
-        );
-      save(project, { webhook: true });
-    }
+    // Events arrive through the GitHub App webhook, without repository hook/admin permissions.
     state(project, "ready");
   }
   async function source(project, sha) {
@@ -598,10 +551,10 @@ export function createProvisioner(
     }
     return { ...app, environment: saved.environment_id, domain: saved.url };
   }
-  async function markPublished(project, sha) {
+  async function markPublished(project, sha, historical = false) {
     if (!SHA.test(sha || "")) return;
     for (const job of store.all(
-      "SELECT id,merge_sha FROM jobs WHERE project_id=? AND state IN ('deploying','publish_failed')",
+      "SELECT id,pr_number,merge_sha FROM jobs WHERE project_id=? AND state IN ('deploying','publish_failed')",
       project.id,
     )) {
       if (!job.merge_sha) continue;
@@ -611,14 +564,88 @@ export function createProvisioner(
       );
       if (["ahead", "identical"].includes(comparison.status))
         store.run(
-          "UPDATE jobs SET state='live',error=NULL,updated_at=? WHERE id=?",
+          "UPDATE jobs SET state='live',error=NULL,updated_at=?,published_at=COALESCE(published_at,?),finished_at=COALESCE(finished_at,?) WHERE id=?",
+          now(),
+          historical ? null : now(),
           now(),
           job.id,
         );
+      if (["ahead", "identical"].includes(comparison.status))
+        store.recordPullEvent(
+          project.id,
+          job.pr_number,
+          `published:${job.merge_sha}`,
+          "status",
+          "Your change is live on the website.",
+        );
+    }
+    for (const release of store.all(
+      "SELECT * FROM releases WHERE project_id=? AND is_live=0",
+      project.id,
+    )) {
+      const comparison =
+        release.merge_sha === sha
+          ? { status: "identical" }
+          : await provider.github(
+              project.owner_id,
+              `/repos/${project.repo}/compare/${release.merge_sha}...${sha}`,
+            );
+      if (["ahead", "identical"].includes(comparison.status))
+        store.run(
+          "UPDATE releases SET is_live=1,published_at=COALESCE(published_at,?) WHERE project_id=? AND pr_number=?",
+          historical ? null : now(),
+          project.id,
+          release.pr_number,
+        );
     }
   }
+  async function syncHistory(project) {
+    for (let page = 1; ; page++) {
+      const pulls = await provider.github(
+        project.owner_id,
+        `/repos/${project.repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=${page}`,
+      );
+      for (const pr of pulls)
+        if (
+          pr.merged_at &&
+          pr.base?.ref === "main" &&
+          SHA.test(pr.merge_commit_sha || "")
+        )
+          store.recordRelease(project.id, pr.number, pr.merge_commit_sha, {
+            title: pr.title,
+            author: pr.user?.login,
+            mergedAt: Date.parse(pr.merged_at),
+          });
+      if (pulls.length < 100) break;
+    }
+    const deployed = resources(project).deployedSha;
+    if (deployed) await markPublished(project, deployed, true);
+  }
+  async function updateWorker(project) {
+    if (
+      store.get(
+        "SELECT id FROM jobs WHERE project_id=? AND state='working' AND lease_until>?",
+        project.id,
+        now(),
+      )
+    )
+      throw Object.assign(new Error("The coding agent is still working."), {
+        code: "worker_busy",
+      });
+    if (project.hosting_provider === "boat") return boat.updateWorker(project);
+    const agents = resources(project).agents;
+    if (!agents) return;
+    const deployment = await upload(project, agents, config.workerDir);
+    await wait(project, deployment);
+    save(project, {
+      workerDeployment: deployment,
+      workerVersion: (await workerSource(config.workerDir)).hash,
+    });
+  }
   async function deploy(project, payload) {
-    const { sha, prNumber } = payload;
+    if (project.hosting_provider === "boat")
+      return boat.deploy(project, payload);
+    const { sha, prNumber, jobId } = payload;
     if (!SHA.test(sha)) throw new Error("Invalid deployment revision.");
     const app = resources(project).app;
     if (!app) throw new Error("Project hosting is still being prepared.");
@@ -626,13 +653,13 @@ export function createProvisioner(
       await markPublished(project, sha);
       return;
     }
-    if (prNumber) {
+    if (prNumber && !jobId) {
       const pr = await provider.github(
         project.owner_id,
         `/repos/${project.repo}/pulls/${prNumber}`,
       );
       if (pr.state !== "open" || pr.head.sha !== sha) return;
-    } else if (resources(project).appDeployed) {
+    } else if (!jobId && resources(project).appDeployed) {
       const main = await provider.github(
         project.owner_id,
         `/repos/${project.repo}/git/ref/heads/main`,
@@ -693,6 +720,7 @@ export function createProvisioner(
         project.id,
         prNumber,
       );
+      if (jobId) return;
       store.run(
         "UPDATE jobs SET preview_url=?,error=CASE WHEN state='preview_failed' THEN NULL ELSE error END,state=CASE WHEN state='preview_failed' THEN 'reviewing' ELSE state END,updated_at=? WHERE project_id=? AND pr_number=?",
         target.domain,
@@ -701,6 +729,13 @@ export function createProvisioner(
         prNumber,
       );
       const marker = `<!-- butler-preview:${sha} -->`;
+      store.recordPullEvent(
+        project.id,
+        prNumber,
+        `preview:${sha}`,
+        "status",
+        `Preview ready: ${target.domain}`,
+      );
       const comments = await provider.github(
         project.owner_id,
         `/repos/${project.repo}/issues/${prNumber}/comments?per_page=100`,
@@ -719,7 +754,162 @@ export function createProvisioner(
       await markPublished(project, sha);
     }
   }
+  async function artifact(project, { jobId, sha, revision = 0 }) {
+    const job = store.get(
+      "SELECT *,rowid AS rowNumber FROM jobs WHERE id=? AND project_id=?",
+      jobId,
+      project.id,
+    );
+    if (
+      !job ||
+      job.request_revision !== revision ||
+      job.change_sha !== sha ||
+      !["building_preview", "preview_failed"].includes(job.state)
+    )
+      return;
+    const branch = await provider.github(
+      project.owner_id,
+      `/repos/${project.repo}/git/ref/heads/${job.branch}`,
+    );
+    if (branch.object.sha !== sha)
+      throw new Error(
+        "The draft changed. Ask your agent to prepare a fresh preview.",
+      );
+    const number = job.artifact_number || -job.rowNumber;
+    store.run("UPDATE jobs SET artifact_number=? WHERE id=?", number, job.id);
+    await deploy(project, { sha, prNumber: number, jobId: job.id });
+    const preview = store.get(
+      "SELECT * FROM previews WHERE project_id=? AND pr_number=?",
+      project.id,
+      number,
+    );
+    if (preview?.state !== "ready" || preview.commit_sha !== sha)
+      throw new Error("The artifact preview did not finish.");
+    const current = store.get(
+      "SELECT request_revision,state FROM jobs WHERE id=?",
+      job.id,
+    );
+    if (
+      current.request_revision !== revision ||
+      !["building_preview", "preview_failed"].includes(current.state)
+    )
+      return;
+    if (store.resumeFollowups(job.id)) return;
+    store.run(
+      "UPDATE jobs SET state='awaiting_approval',artifact_url=?,artifact_ready_at=?,error=NULL,updated_at=? WHERE id=? AND change_sha=?",
+      preview.url,
+      now(),
+      now(),
+      job.id,
+      sha,
+    );
+    store.recordEvent(
+      job.id,
+      `artifact:${sha}`,
+      "status",
+      "Your preview is ready. Inspect it, then choose Make this the website to open a pull request.",
+    );
+  }
+  async function openPull(project, { jobId, sha }) {
+    const job = store.get(
+      "SELECT j.*,m.name,COALESCE(u.name,m.name) AS approverName FROM jobs j JOIN members m ON m.id=j.member_id LEFT JOIN users u ON u.id=j.approved_by WHERE j.id=? AND j.project_id=?",
+      jobId,
+      project.id,
+    );
+    if (
+      !job ||
+      !job.approved_at ||
+      job.change_sha !== sha ||
+      !["creating_pr", "preview_failed"].includes(job.state)
+    )
+      return;
+    const root = `/repos/${project.repo}`,
+      head = project.repo.split("/")[0] + ":" + job.branch;
+    const pulls = await provider.github(
+      project.owner_id,
+      `${root}/pulls?state=all&head=${encodeURIComponent(head)}`,
+    );
+    let pr = pulls.find((p) =>
+      p.body?.includes(`<!-- butler-job:${job.id} -->`),
+    );
+    if (!pr) {
+      const ref = await provider.github(
+        project.owner_id,
+        `${root}/git/ref/heads/${job.branch}`,
+      );
+      if (ref.object.sha !== sha)
+        throw new Error(
+          "This preview changed after approval. Prepare and inspect a new preview.",
+        );
+      pr = await provider.github(project.owner_id, root + "/pulls", "POST", {
+        base: "main",
+        head: job.branch,
+        title: job.pr_title,
+        body: `${job.pr_body}\n\nApproved by **${job.approverName}** after inspecting the preview.\n\n<!-- butler-job:${job.id} -->`,
+      });
+    }
+    if (pr.state === "closed" && !pr.merged)
+      throw new Error(
+        "This pull request was closed. Ask your agent for a new preview.",
+      );
+    store.transaction(() => {
+      const preview = store.get(
+        "SELECT * FROM previews WHERE project_id=? AND pr_number=?",
+        project.id,
+        job.artifact_number,
+      );
+      if (
+        preview &&
+        !store.get(
+          "SELECT pr_number FROM previews WHERE project_id=? AND pr_number=?",
+          project.id,
+          pr.number,
+        )
+      ) {
+        store.run(
+          "INSERT INTO previews(project_id,pr_number,environment_id,url,commit_sha,state) VALUES(?,?,?,?,?,'ready')",
+          project.id,
+          pr.number,
+          preview.environment_id,
+          preview.url,
+          preview.commit_sha,
+        );
+        store.run(
+          "UPDATE previews SET state='closed' WHERE project_id=? AND pr_number=?",
+          project.id,
+          job.artifact_number,
+        );
+      }
+      store.run(
+        "UPDATE jobs SET state='reviewing',pr_number=?,pr_url=?,preview_url=?,error=NULL,finished_at=NULL,updated_at=? WHERE id=?",
+        pr.number,
+        `https://github.com/${project.repo}/pull/${pr.number}`,
+        job.artifact_url,
+        now(),
+        job.id,
+      );
+      store.run(
+        "UPDATE members SET pr_number=? WHERE id=? AND branch=?",
+        pr.number,
+        job.member_id,
+        job.branch,
+      );
+      store.recordEvent(
+        job.id,
+        `pull:${pr.number}`,
+        "status",
+        `PR #${pr.number} is open: ${job.pr_title}. Your change is being reviewed before it reaches the website.`,
+      );
+    });
+    if (pr.merged && pr.merge_commit_sha)
+      store.recordMerge(project.id, pr.number, pr.merge_commit_sha, {
+        title: pr.title,
+        mergedAt: Date.parse(pr.merged_at),
+      });
+  }
   async function cleanup(project, { prNumber }) {
+    if (project.hosting_provider === "boat")
+      return boat.cleanup(project, { prNumber });
     const preview = store.get(
       "SELECT * FROM previews WHERE project_id=? AND pr_number=?",
       project.id,
@@ -742,10 +932,20 @@ export function createProvisioner(
     active = true;
     try {
       const task = store.transaction(() => {
-        const found = store.get(
-          "SELECT * FROM tasks WHERE state='queued' AND available_at<=? ORDER BY available_at LIMIT 1",
-          now(),
-        );
+        const found = store
+          .all(
+            "SELECT * FROM tasks WHERE state='queued' AND available_at<=? ORDER BY available_at",
+            now(),
+          )
+          .find(
+            (task) =>
+              !["boat-wake", "worker-update", "cleanup"].includes(task.kind) ||
+              store.get(
+                "SELECT hosting_provider FROM projects WHERE id=?",
+                task.project_id,
+              )?.hosting_provider !== "boat" ||
+              projectActive(store, task.project_id),
+          );
         if (found)
           store.run(
             "UPDATE tasks SET state='running',updated_at=? WHERE id=?",
@@ -765,6 +965,15 @@ export function createProvisioner(
           await deploy(project, JSON.parse(task.payload));
         else if (task.kind === "cleanup")
           await cleanup(project, JSON.parse(task.payload));
+        else if (task.kind === "boat-wake") {
+          await boat.wake(project);
+          save(project, { hostingCheck: { at: now(), state: "ready" } });
+        } else if (task.kind === "sync-history") await syncHistory(project);
+        else if (task.kind === "worker-update") await updateWorker(project);
+        else if (task.kind === "artifact")
+          await artifact(project, JSON.parse(task.payload));
+        else if (task.kind === "open-pr")
+          await openPull(project, JSON.parse(task.payload));
         else throw new Error("Unknown background task");
         store.run(
           "UPDATE tasks SET state='done',error=NULL,updated_at=? WHERE id=?",
@@ -773,6 +982,54 @@ export function createProvisioner(
         );
       } catch (error) {
         const message = error.message.slice(0, 350);
+        if (
+          task.kind === "artifact" &&
+          /The Boat build stopped before it passed/.test(message)
+        ) {
+          const payload = JSON.parse(task.payload);
+          if (store.resumeFollowups(payload.jobId)) {
+            store.run(
+              "UPDATE tasks SET state='done',error=NULL,updated_at=? WHERE id=?",
+              now(),
+              task.id,
+            );
+            return;
+          }
+        }
+        if (error.code === "worker_busy") {
+          store.run(
+            "UPDATE tasks SET state='queued',available_at=?,updated_at=? WHERE id=?",
+            now() + 15000,
+            now(),
+            task.id,
+          );
+          return;
+        }
+        if (
+          task.kind === "provision" &&
+          [
+            "github_repository_access_required",
+            "github_creation_authorization_required",
+          ].includes(error.code)
+        ) {
+          store.transaction(() => {
+            store.run(
+              "UPDATE tasks SET state='failed',error=?,updated_at=? WHERE id=?",
+              message,
+              now(),
+              task.id,
+            );
+            store.run(
+              "UPDATE projects SET state=?,error=? WHERE id=?",
+              error.code === "github_creation_authorization_required"
+                ? "github_authorization"
+                : "github_access",
+              message,
+              project.id,
+            );
+          });
+          return;
+        }
         if (
           error.failedDeployment &&
           resources(project).workerDeployment === error.failedDeployment
@@ -795,6 +1052,22 @@ export function createProvisioner(
             message,
             project.id,
           );
+        if (["artifact", "open-pr"].includes(task.kind) && attempts >= 5) {
+          const payload = JSON.parse(task.payload);
+          store.run(
+            "UPDATE jobs SET state='preview_failed',error=?,updated_at=? WHERE id=? AND project_id=?",
+            message,
+            now(),
+            payload.jobId,
+            project.id,
+          );
+          store.recordEvent(
+            payload.jobId,
+            `artifact-error:${task.id}`,
+            "error",
+            `This change could not finish ${task.kind === "artifact" ? "building its preview" : "opening its pull request"}: ${message}. Your work is saved.`,
+          );
+        }
         if (task.kind === "deploy" && attempts >= 5) {
           const payload = JSON.parse(task.payload);
           if (payload.prNumber) {
@@ -802,6 +1075,13 @@ export function createProvisioner(
               "UPDATE previews SET state='failed' WHERE project_id=? AND pr_number=?",
               project.id,
               payload.prNumber,
+            );
+            store.recordPullEvent(
+              project.id,
+              payload.prNumber,
+              `preview-error:${task.id}:${task.attempts}`,
+              "error",
+              `The preview failed to deploy: ${message}\nYour code is saved. Ask the team lead to retry the preview deployment.`,
             );
             store.run(
               "UPDATE jobs SET state='preview_failed',error=?,updated_at=? WHERE project_id=? AND pr_number=? AND state IN ('reviewing','preview_failed')",
@@ -817,6 +1097,17 @@ export function createProvisioner(
               now(),
               project.id,
             );
+          for (const job of store.all(
+            "SELECT id,pr_number FROM jobs WHERE project_id=? AND state='publish_failed'",
+            project.id,
+          ))
+            store.recordPullEvent(
+              project.id,
+              job.pr_number,
+              `publish-error:${task.id}:${task.attempts}`,
+              "error",
+              `The website update failed to deploy: ${message}\nThe PR is merged and your code is saved. Ask the team lead to retry publishing.`,
+            );
         }
         console.error(`[tasks] ${task.kind} ${project.id}: ${error.name}`);
       }
@@ -824,20 +1115,105 @@ export function createProvisioner(
       active = false;
     }
   }
+  async function maintainHosting() {
+    if (stopped || checkingHosting) return;
+    checkingHosting = true;
+    try {
+      // Only human presence or unfinished work renews a VM. Polling and pending
+      // approvals must not keep old projects (or manually stopped VMs) alive.
+      await Promise.allSettled(
+        store
+          .all(
+            "SELECT * FROM projects WHERE state IN ('ready','infrastructure','deploying') AND hosting_provider='boat'",
+          )
+          .map(async (project) => {
+            let state = "ready";
+            try {
+              const needed = projectActive(store, project.id);
+              const check = resources(project).hostingCheck;
+              if (!needed && check?.state === "sleeping") return;
+              if (
+                needed &&
+                check?.state === "ready" &&
+                check.at > now() - 5 * 60000
+              )
+                return;
+              if (needed && check?.state && check.state !== "ready")
+                await boat.wake(project);
+              else if (needed) await boat.ensure(project);
+              else state = await boat.sleepIfIdle(project);
+            } catch (error) {
+              state = "unavailable";
+              console.error(`[hosting] ${project.id}: ${error.name}`);
+            }
+            const current = store.get(
+              "SELECT resources,state FROM projects WHERE id=?",
+              project.id,
+            );
+            if (
+              stopped ||
+              !["ready", "infrastructure", "deploying"].includes(current?.state)
+            )
+              return;
+            store.run(
+              "UPDATE projects SET resources=? WHERE id=?",
+              JSON.stringify({
+                ...JSON.parse(current.resources),
+                hostingCheck: { at: now(), state },
+              }),
+              project.id,
+            );
+          }),
+      );
+    } finally {
+      checkingHosting = false;
+    }
+  }
   return {
     tick,
+    maintainHosting,
     provision,
     deploy,
+    artifact,
+    openPull,
+    markPublished,
+    syncHistory,
     start() {
       store.run("UPDATE tasks SET state='queued' WHERE state='running'");
+      for (const project of store.all(
+        "SELECT id FROM projects WHERE state='ready' AND repo IS NOT NULL",
+      ))
+        store.enqueue(project.id, "sync-history", `history:${project.id}:v1`);
+      workerSource(config.workerDir)
+        .then(({ hash }) => {
+          for (const project of store.all(
+            "SELECT id,resources FROM projects WHERE state='ready' AND worker_url IS NOT NULL",
+          ))
+            if (JSON.parse(project.resources).workerVersion !== hash)
+              store.enqueue(
+                project.id,
+                "worker-update",
+                `worker-update:${project.id}:${hash}`,
+              );
+        })
+        .catch(() =>
+          console.error("[worker-update] The worker bundle could not be read."),
+        );
       const timer = setInterval(
         () => tick().catch((error) => console.error(`[tasks] ${error.name}`)),
         2000,
       );
+      const checkHosting = () =>
+        maintainHosting().catch((error) =>
+          console.error(`[hosting] ${error.name}`),
+        );
+      const hostingTimer = setInterval(checkHosting, 60000);
+      checkHosting();
       tick().catch((error) => console.error(`[tasks] ${error.name}`));
       return () => {
         stopped = true;
         clearInterval(timer);
+        clearInterval(hostingTimer);
       };
     },
   };

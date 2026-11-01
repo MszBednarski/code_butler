@@ -1,3 +1,8 @@
+import {
+  githubAppReady,
+  githubLoginClient,
+  saveCreationCredential,
+} from "./github-app.mjs";
 import { token, digest, now, id } from "./store.mjs";
 
 export function cookies(req) {
@@ -27,9 +32,18 @@ export function publicUser(user) {
     : null;
 }
 export function safeReturn(value) {
-  return typeof value === "string" && /^\/(?:p\/[a-f0-9-]{36})?$/.test(value)
+  return typeof value === "string" &&
+    /^\/(?:p\/[a-f0-9-]{36}|connect\/boat|start|projects)?$/.test(value)
     ? value
     : "/";
+}
+function callbackOrigin(req, config) {
+  const host = req.get("host");
+  return (
+    (config.publicAliases || []).find(
+      (origin) => new URL(origin).host === host,
+    ) || config.publicUrl
+  );
 }
 
 export function accountForRequest(req, store) {
@@ -48,8 +62,35 @@ export function installAuth(app, config, store, provider) {
     req.account = accountForRequest(req, store);
     next();
   });
+  const resumeCreation = (userId, returnTo) => {
+    const projectId = /^\/p\/([a-f0-9-]{36})$/.exec(returnTo)?.[1];
+    if (
+      !projectId ||
+      !store.get(
+        "SELECT id FROM projects WHERE id=? AND owner_id=? AND state='github_authorization'",
+        projectId,
+        userId,
+      )
+    )
+      return;
+    store.transaction(() => {
+      store.run(
+        "UPDATE tasks SET state='queued',attempts=0,error=NULL,available_at=? WHERE project_id=? AND kind='provision' AND state='failed'",
+        now(),
+        projectId,
+      );
+      store.run(
+        "UPDATE projects SET state='queued',error=NULL WHERE id=?",
+        projectId,
+      );
+    });
+  };
   const begin = (name, clientId, authorize, scopes) => (req, res) => {
-    clientId = config[name === "github" ? "githubClientId" : "railwayClientId"];
+    const origin = callbackOrigin(req, config);
+    if (new URL(origin).host !== req.get("host"))
+      return res.redirect(origin + req.originalUrl);
+    clientId =
+      name === "github" ? githubLoginClient(config).id : config.railwayClientId;
     if (!clientId)
       return res.status(503).json({
         error: `${name === "github" ? "GitHub" : "Railway"} connection has not been configured by the Butler operator yet.`,
@@ -66,7 +107,9 @@ export function installAuth(app, config, store, provider) {
       digest(state),
       digest(browser),
       req.account?.id || null,
-      name,
+      name === "github" && req.query.purpose === "create"
+        ? "github-create"
+        : name,
       safeReturn(req.query.returnTo),
       now(),
     );
@@ -74,12 +117,11 @@ export function installAuth(app, config, store, provider) {
     const url = new URL(authorize);
     url.search = new URLSearchParams({
       client_id: clientId,
-      redirect_uri: `${config.publicUrl}/auth/${name}/callback`,
+      redirect_uri: `${callbackOrigin(req, config)}/auth/${name}/callback`,
       state,
-      scope:
-        name === "github" && req.query.purpose === "account"
-          ? "read:user"
-          : scopes,
+      ...(name === "github" && githubLoginClient(config).app
+        ? {}
+        : { scope: scopes }),
       ...(name === "railway"
         ? { response_type: "code", prompt: "consent" }
         : {}),
@@ -92,7 +134,7 @@ export function installAuth(app, config, store, provider) {
       "github",
       config.githubClientId,
       "https://github.com/login/oauth/authorize",
-      "read:user repo",
+      "read:user",
     ),
   );
   app.get(
@@ -109,9 +151,10 @@ export function installAuth(app, config, store, provider) {
       const state =
         typeof req.query.state === "string"
           ? store.get(
-              "SELECT * FROM oauth_states WHERE hash=? AND provider=? AND created_at>?",
+              "SELECT * FROM oauth_states WHERE hash=? AND provider IN (?,?) AND created_at>?",
               digest(req.query.state),
               name,
+              name === "github" ? "github-create" : name,
               now() - 600000,
             )
           : null;
@@ -129,6 +172,7 @@ export function installAuth(app, config, store, provider) {
         return res.redirect(
           `${state.return_to}?auth_error=Authorization%20was%20not%20completed`,
         );
+      let stage = "token_exchange";
       try {
         const response = await provider.request(
           name === "github"
@@ -147,11 +191,11 @@ export function installAuth(app, config, store, provider) {
             },
             body: new URLSearchParams({
               code: req.query.code,
-              redirect_uri: `${config.publicUrl}/auth/${name}/callback`,
+              redirect_uri: `${callbackOrigin(req, config)}/auth/${name}/callback`,
               ...(name === "github"
                 ? {
-                    client_id: config.githubClientId,
-                    client_secret: config.githubClientSecret,
+                    client_id: githubLoginClient(config).id,
+                    client_secret: githubLoginClient(config).secret,
                   }
                 : { grant_type: "authorization_code" }),
             }),
@@ -160,9 +204,48 @@ export function installAuth(app, config, store, provider) {
         );
         const credentials = await response.json();
         if (!response.ok || !credentials.access_token)
-          throw new Error("Authorization was not completed. Please try again.");
+          throw Object.assign(new Error("Authorization was not completed."), {
+            status: response.status,
+            code: [
+              "bad_verification_code",
+              "incorrect_client_credentials",
+              "redirect_uri_mismatch",
+              "access_denied",
+            ].includes(credentials.error)
+              ? credentials.error
+              : "token_exchange_failed",
+          });
         let userId = state.user_id;
         if (name === "github") {
+          if (
+            String(credentials.scope || "")
+              .split(/[ ,]/)
+              .some((scope) =>
+                /^(repo|public_repo|admin:|write:|delete_repo|workflow)/.test(
+                  scope,
+                ),
+              )
+          ) {
+            await provider.request(
+              `${config.githubApi}/applications/${githubLoginClient(config).id}/grant`,
+              {
+                method: "DELETE",
+                headers: {
+                  Authorization: `Basic ${Buffer.from(`${githubLoginClient(config).id}:${githubLoginClient(config).secret}`).toString("base64")}`,
+                  "Content-Type": "application/json",
+                  "User-Agent": "Pocket-Butler",
+                },
+                body: JSON.stringify({
+                  access_token: credentials.access_token,
+                }),
+                signal: AbortSignal.timeout(15000),
+              },
+            );
+            throw new Error(
+              "An older broad GitHub grant was removed. Sign in again for profile-only access.",
+            );
+          }
+          stage = "profile";
           const me = await provider.request("https://api.github.com/user", {
             headers: {
               Authorization: `Bearer ${credentials.access_token}`,
@@ -171,10 +254,15 @@ export function installAuth(app, config, store, provider) {
             },
             signal: AbortSignal.timeout(30000),
           });
-          if (!me.ok) throw new Error("Could not read your GitHub profile.");
+          if (!me.ok)
+            throw Object.assign(
+              new Error("Could not read your GitHub profile."),
+              { status: me.status },
+            );
           const profile = await me.json();
           if (!profile.id || typeof profile.login !== "string")
             throw new Error("Invalid GitHub profile.");
+          stage = "account";
           const existing = store.get(
             "SELECT * FROM users WHERE github_id=?",
             String(profile.id),
@@ -200,14 +288,33 @@ export function installAuth(app, config, store, provider) {
               userId,
             );
           }
-          const previous = store.connection(userId, name);
-          // An identity-only sign-in must not discard an existing repository grant.
-          if (
-            !previous ||
-            String(credentials.scope).split(/[ ,]/).includes("repo") ||
-            !String(previous.scope).split(/[ ,]/).includes("repo")
-          )
-            store.connection(userId, name, credentials);
+          // Retain only a short-lived, permission-scoped USER token after explicit creation consent.
+          if (state.provider === "github-create") {
+            stage = "project_creation_consent";
+            if (!githubLoginClient(config).app)
+              throw new Error("GitHub App login is required.");
+            try {
+              await saveCreationCredential(
+                config,
+                store,
+                userId,
+                credentials,
+                provider.request,
+              );
+            } catch (error) {
+              if (error.code !== "creation_scope_failed") throw error;
+              // Identity has succeeded. Installation consent can provide the
+              // dedicated creation permission without retaining this user token.
+              console.error(
+                `[auth] github creation consent continuing with installation: ${JSON.stringify(error.authDiagnostic)}`,
+              );
+              cookie(res, config, "butler_account", store.session(userId));
+              return res.redirect(
+                `/auth/github/install?returnTo=${encodeURIComponent(state.return_to)}`,
+              );
+            }
+            resumeCreation(userId, state.return_to);
+          }
         } else {
           if (!userId) throw new Error("Sign in with GitHub first.");
           store.connection(userId, name, {
@@ -215,15 +322,137 @@ export function installAuth(app, config, store, provider) {
             expiresAt: now() + Number(credentials.expires_in || 3600) * 1000,
           });
         }
+        stage = "session";
         cookie(res, config, "butler_account", store.session(userId));
         res.redirect(state.return_to);
       } catch (error) {
-        console.error(`[auth] ${name} callback failed: ${error.name}`);
+        // Deliberately omit request URLs, codes, tokens and provider response bodies.
+        const code = /^[a-z_]{1,80}$/.test(error.code || "")
+          ? error.code
+          : "callback_failed";
+        console.error(
+          `[auth] ${name} callback failed: ${JSON.stringify({ stage, code, status: Number(error.status) || null, ...error.authDiagnostic })}`,
+        );
+        const message =
+          stage === "project_creation_consent"
+            ? "GitHub signed you in, but couldn’t authorize creating your project. Your saved work is safe. Please try connecting again."
+            : "Connection failed. Please try again.";
         res.redirect(
-          `${state.return_to}?auth_error=${encodeURIComponent("Connection failed. Please try again.")}`,
+          `${state.return_to}?auth_error=${encodeURIComponent(message)}`,
         );
       }
     });
+  app.get("/auth/github/install", async (req, res) => {
+    if (new URL(config.publicUrl).host !== req.get("host"))
+      return res.redirect(config.publicUrl + req.originalUrl);
+    if (!req.account?.github_id)
+      return res.redirect(
+        `/auth/github?returnTo=${encodeURIComponent(safeReturn(req.query.returnTo))}`,
+      );
+    if (!githubAppReady(config))
+      return res
+        .status(503)
+        .send("Butler’s repository integration is being configured.");
+    const returnTo = safeReturn(req.query.returnTo);
+    const projectId = /^\/p\/([a-f0-9-]{36})$/.exec(returnTo)?.[1];
+    const project =
+      projectId &&
+      store.get(
+        "SELECT * FROM projects WHERE id=? AND owner_id=?",
+        projectId,
+        req.account.id,
+      );
+    const repositoryId =
+      project && JSON.parse(project.resources).githubRepositoryId;
+    const bootstrap = !project?.repo || !Number.isSafeInteger(repositoryId);
+    try {
+      const current = await provider.app(
+        `/users/${encodeURIComponent(req.account.github_login)}/installation`,
+      );
+      await provider.connect(req.account.id, current.id);
+      if (bootstrap) {
+        resumeCreation(req.account.id, returnTo);
+        return res.redirect(returnTo);
+      }
+      // Editing an existing installation preserves access for earlier Butler projects.
+      return res.redirect(
+        `https://github.com/settings/installations/${current.id}`,
+      );
+    } catch (error) {
+      if (error.status !== 404) throw error;
+    }
+    const registration = await provider.app("/app");
+    if (
+      String(registration.id) !== String(config.githubAppId) ||
+      !/^[a-z0-9-]{1,100}$/.test(registration.slug || "")
+    )
+      return res
+        .status(503)
+        .send(
+          "Butler’s GitHub connection could not be verified. Please try again.",
+        );
+    if (config.githubAppSlug !== registration.slug) {
+      config.githubAppSlug = registration.slug;
+      store.setting("provider-settings", {
+        ...(store.setting("provider-settings") || {}),
+        githubAppSlug: registration.slug,
+      });
+    }
+    const state = token(),
+      browser = token();
+    store.run("DELETE FROM oauth_states WHERE created_at<?", now() - 600000);
+    store.run(
+      "INSERT INTO oauth_states VALUES(?,?,?,?,?,?)",
+      digest(state),
+      digest(browser),
+      req.account.id,
+      "github-install",
+      safeReturn(req.query.returnTo),
+      now(),
+    );
+    cookie(res, config, "butler_oauth_github_install", browser, 600);
+    const url = new URL(
+      `https://github.com/apps/${config.githubAppSlug}/installations/new/permissions`,
+    );
+    url.searchParams.set("state", state);
+    url.searchParams.set("suggested_target_id", req.account.github_id);
+    if (!bootstrap)
+      url.searchParams.append("repository_ids[]", String(repositoryId));
+    res.redirect(url.href);
+  });
+  app.get("/auth/github/install/callback", async (req, res) => {
+    const state =
+      typeof req.query.state === "string"
+        ? store.get(
+            "SELECT * FROM oauth_states WHERE hash=? AND provider='github-install' AND created_at>?",
+            digest(req.query.state),
+            now() - 600000,
+          )
+        : null;
+    if (
+      !state ||
+      state.user_id !== req.account?.id ||
+      digest(cookies(req).butler_oauth_github_install || "") !==
+        state.browser_hash
+    )
+      return res
+        .status(400)
+        .send("Connection expired. Return to Butler and connect GitHub again.");
+    store.run("DELETE FROM oauth_states WHERE hash=?", state.hash);
+    cookie(res, config, "butler_oauth_github_install", "", 0);
+    const installationId = Number(req.query.installation_id);
+    if (!Number.isSafeInteger(installationId) || installationId <= 0)
+      return res.status(400).send("Invalid GitHub installation.");
+    try {
+      await provider.connect(req.account.id, installationId);
+      resumeCreation(req.account.id, state.return_to);
+      res.redirect(state.return_to);
+    } catch (error) {
+      res.redirect(
+        `${state.return_to}?auth_error=${encodeURIComponent(error.provider ? error.message : "GitHub connection failed. Try again.")}`,
+      );
+    }
+  });
   app.post("/api/auth/logout", (req, res) => {
     if (cookies(req).butler_account)
       store.run(

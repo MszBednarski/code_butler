@@ -16,6 +16,7 @@ export async function createWorker({
   auth,
   agent,
   reviewer,
+  pause = sleep,
 } = {}) {
   if (
     !/^https:\/\//.test(platform || "") &&
@@ -32,7 +33,8 @@ export async function createWorker({
   reviewer ||= createReviewer(agent, { dataDir, auth });
   const app = express(),
     server = createServer(app);
-  let stopped = false;
+  let stopped = false,
+    busy = false;
   app.disable("x-powered-by");
   app.use((_req, res, next) => {
     res.set("Cache-Control", "no-store");
@@ -48,6 +50,12 @@ export async function createWorker({
     next();
   });
   app.post("/auth/start", async (_req, res) => res.json(await auth.start()));
+  app.get("/status", (_req, res) =>
+    res.json({
+      version: process.env.WORKER_VERSION || null,
+      busy,
+    }),
+  );
   app.get("/auth/status", async (_req, res) => res.json(await auth.status()));
   app.use((_req, res) => res.sendStatus(404));
   app.use((error, _req, res, _next) => {
@@ -59,18 +67,22 @@ export async function createWorker({
   async function loop() {
     let ready = false;
     while (!stopped) {
+      let worked = false;
       try {
+        busy = true;
         if (!ready) {
           await agent.initialize();
           ready = true;
         }
         await reviewer.finish();
-        await agent.codeOne();
+        worked = Boolean(await agent.codeOne());
         await reviewer.one();
       } catch (error) {
         console.error(`[worker] Background request interrupted: ${error.name}`);
+      } finally {
+        busy = false;
       }
-      if (!stopped) await sleep(5000);
+      if (!stopped) await pause(worked ? 5000 : 30000);
     }
   }
   return {

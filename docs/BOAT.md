@@ -1,0 +1,31 @@
+# Boat hosting
+
+Boat is the default host for **new** teams. Open Butler's regular homepage, sign in with GitHub, then follow the Boat browser sign-in in step 2. There is no special entry link, Railway signup or API key to copy. The Butler website and existing Railway projects keep their current addresses and storage. `DEFAULT_HOSTING_PROVIDER=railway` is an explicit operator override for legacy installations; leaving it unset uses Boat. The older `/connect/boat` link still works.
+
+Boat may require activation through its own checkout. The lead reviews the trial, card requirements and charges there. Butler does not accept card details or start a machine during connection. See Boat's [sign-in documentation](https://docs.boat.dev/agent-auth) and [trial terms](https://docs.boat.dev/free-trial).
+
+## Permissions and credentials
+
+The browser sign-in uses Boat's first-party CLI device endpoints. These endpoints are a compatibility dependency, rather than a registered third-party OAuth integration. Butler temporarily encrypts the device session on its persistent volume, creates an empty dedicated environment with credential inheritance disabled, then requests a 90-day credential restricted to that environment and the sandbox/file/command/hosting operations it needs. It rejects wildcard permissions, missing expiry and unrestricted fallback keys. If scoped credential creation is unavailable on the account, setup stops before checkout or provisioning.
+
+The temporary device session is retired after the limited credential is saved. Failed session revocations remain encrypted for retry; incomplete device sessions expire from Butler's setup flow after an hour. The limited credential stays in the control plane. Neither it nor the GitHub installation credential is uploaded to a project VM. The VM receives only its own Butler worker credential. The lead authorizes their Codex subscription on that VM, with login files retained on its project disk.
+
+Do not paste provider credentials, private recovery/invite links, setup links or login codes into public issues, PRs, screenshots or documentation. Local agent logins, keys and databases are excluded from Git and Docker build contexts. Never place runtime credentials in the frontend or `VITE_*` variables. Secret scans supplement these exclusions; they do not replace review.
+
+## Project storage and publishing
+
+Each project gets one fresh private Ubuntu VM with `noEnv: true` and snapshots enabled. Docker runs a worker with a persistent data directory, plus separate app containers for production and each preview. The app is built before tests run, then starts through its own `npm start` on port 3000. This supports static Vite sites and Node servers such as multiplayer games. Production dependencies and app files are included; worker files, credentials and logins are excluded. Enabled Docker startup and container restart policies restore services after the VM resumes. Butler publishes preview links and redeploys the app after reviewed merges without replacing the worker.
+
+Machine creation uses a project-specific idempotency key. Build jobs use persistent locks and completion markers, and verify the expected container is running before reusing a completed job. A lost HTTP response therefore does not require a second machine or discard a saved workspace. Drafts get app-only previews before any PR is opened; creator approval adopts that preview for the PR. Closed preview containers are removed and their ports can be reused; the MVP supports 48 simultaneous draft and PR previews per project.
+
+Projects sleep after 15 minutes without a visible Butler project tab or unfinished coding, review, or build work. Pending approvals and worker polls do not count as activity. A minute-based check shortens the Boat auto-stop deadline to one minute; the VM then stops with its disk snapshotted. This uses the existing `sandbox.update` permission, including for already connected accounts. Paid and trial VMs both have a renewable 20-minute lease, so they also stop if the Butler control service goes offline. Background worker updates and preview cleanup wait until a project is active.
+
+The worker, published website, and previews share the VM: all become unavailable while it sleeps. Opening the project in Butler wakes the same VM and restores its containers, workspace, login and conversations. Opening a public website URL alone does not wake it. The worker waits 30 seconds between empty polls while awake, or five seconds after processing work. See [Boat service recovery](https://docs.boat.dev/long-running-tasks).
+
+Boat documents deletion of unsaved stopped snapshots after 14 days. Long-term backups and named saved snapshots are **not automated by this pilot**. Keep important code pushed to GitHub and arrange a backup before leaving a machine stopped long term. See [Boat snapshots](https://docs.boat.dev/snapshots).
+
+## Validation
+
+Automated tests cover browser-auth persistence, tenant/origin checks, narrow credentials, refusal of unrestricted credentials, checkout handoff, idempotent provisioning, credential-free preview archives, preview reopen/port reuse and VM resume. Browser checks exercise the guided flow with simulated provider responses. These checks do not prove account eligibility, billing, VM startup or real public hosting.
+
+Use a real account to verify connection and scope support, project creation, Codex subscription sign-in, a request → PR → preview → reviewed merge → live app, and VM stop/resume with the same worktree, login and conversation. This real-account acceptance remains pending; making Boat the default does not establish that these external checks have passed.

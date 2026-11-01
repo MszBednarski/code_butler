@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "A concise, memorable product name of one to three words, at most 50 characters. Name the actual idea, not the first words of its description. No quotation marks, URLs, explanation or punctuation-only names."
+    }
+  },
+  "required": ["name"],
+  "additionalProperties": false
+}

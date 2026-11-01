@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createStore, id, token, digest, now } from "../store.mjs";
 import { createPlatform } from "../server.mjs";
+import { createProvisioner } from "../provision.mjs";
 import { createAgent } from "../../project-worker/agent.mjs";
 import { createReviewer } from "../../project-worker/reviewer.mjs";
 const exec = promisify(execFile);
@@ -35,7 +36,7 @@ test("real git transport and app builds carry a teammate request through PR revi
   const upstream = createServer((req, res) => {
     if (
       req.headers.authorization !==
-      `Basic ${Buffer.from("x-access-token:owner-github-fixture").toString("base64")}`
+      `Basic ${Buffer.from("x-access-token:project-installation-fixture").toString("base64")}`
     ) {
       res.writeHead(401);
       res.end();
@@ -99,10 +100,13 @@ test("real git transport and app builds carry a teammate request through PR revi
     "team",
     lead.id,
   );
-  store.connection(lead.id, "github", {
-    access_token: "owner-github-fixture",
-    scope: "repo",
+  store.connection(lead.id, "github_creation", {
+    token: "create-only",
+    accountId: "42",
+    appId: "123",
+    expiresAt: Date.now() + 3600000,
   });
+  store.connection(lead.id, "github_installation", { id: 99, accountId: 42 });
   store.connection(lead.id, "railway", {
     access_token: "owner-railway-fixture",
   });
@@ -113,10 +117,13 @@ test("real git transport and app builds carry a teammate request through PR revi
   const currentPull = async () =>
     pr ? { ...pr, head: { ...pr.head, sha: await sha(pr.head.ref) } } : null;
   const provider = {
+    repositoryToken: async () => "project-installation-fixture",
     github: async (_user, endpoint, method = "GET", body) => {
       const suffix = endpoint.replace("/repos/team/project", "");
-      if (suffix === "/git/ref/heads/main")
-        return { object: { sha: await sha("main") } };
+      if (suffix.startsWith("/git/ref/heads/"))
+        return {
+          object: { sha: await sha(suffix.slice("/git/ref/heads/".length)) },
+        };
       if (suffix.startsWith("/pulls?"))
         return pr?.state === "open" ? [await currentPull()] : [];
       if (suffix === "/pulls" && method === "POST") {
@@ -165,6 +172,11 @@ test("real git transport and app builds carry a teammate request through PR revi
     frontend: "/missing",
     dataDir: path.join(dir, "platform"),
     commit: "test",
+    defaultHostingProvider: "railway",
+    githubAppId: 123,
+    githubAppSlug: "butler-test",
+    githubAppPrivateKey: "fixture-key",
+    githubAppWebhookSecret: "fixture-hook-secret",
   };
   const platform = createPlatform(config, {
     store,
@@ -197,7 +209,8 @@ test("real git transport and app builds carry a teammate request through PR revi
       await call(
         "/api/projects",
         {
-          name: "Together",
+          name: "Your new project",
+          generateName: true,
           description: "A friendly team website",
           requestKey: id(),
         },
@@ -220,13 +233,20 @@ test("real git transport and app builds carry a teammate request through PR revi
     memberCookie = joined.headers.get("set-cookie").split(";")[0];
   await call(
     `/api/projects/${projectId}/messages`,
-    { text: "Change the heading to Hello Team", requestKey: id() },
+    {
+      text: "umm yeah can you like have the heading say hello team thanks",
+      requestKey: id(),
+    },
     memberCookie,
   );
   const bin = path.join(dir, "bin");
   await mkdir(bin);
-  const fakeCodex = `#!${process.execPath}\nconst fs=require('fs'),crypto=require('crypto');const args=process.argv.slice(2),out=args[args.indexOf('--output-last-message')+1];if(args.includes('--output-schema')){fs.writeFileSync(out,JSON.stringify({decision:'approve',summary:'No blocking findings in the test review.',findings:[]}));}else{let p=fs.readFileSync('app/src/main.tsx','utf8');fs.writeFileSync('app/src/main.tsx',p.replace('__PROJECT_NAME__','Hello Team'));const resume=args.indexOf('resume'),thread=resume>=0?args[resume+1]:crypto.randomUUID();fs.appendFileSync(process.env.HOME+'/invocations.jsonl',JSON.stringify(args)+'\\n');console.log(JSON.stringify({type:'thread.started',thread_id:thread}));fs.writeFileSync(out,'Changed the heading to Hello Team.');}\n`;
-  await writeFile(path.join(bin, "codex"), fakeCodex, { mode: 0o700 });
+  const fakeCodex = `#!${process.execPath}\nconst fs=require('fs'),crypto=require('crypto');const args=process.argv.slice(2),out=args[args.indexOf('--output-last-message')+1];if(args[args.indexOf('--output-schema')+1]?.endsWith('name.schema.json')){fs.writeFileSync(out,JSON.stringify({name:'Team Canvas'}));}else if(args[args.indexOf('--output-schema')+1]?.endsWith('verdict.schema.json')){fs.writeFileSync(out,JSON.stringify({decision:'approve',summary:'No blocking findings in the test review.',findings:[]}));}else{let p=fs.readFileSync('app/src/main.tsx','utf8');fs.writeFileSync('app/src/main.tsx',p.replace('__PROJECT_NAME__','Hello Team'));const resume=args.indexOf('resume'),thread=resume>=0?args[resume+1]:crypto.randomUUID();fs.appendFileSync(process.env.HOME+'/invocations.jsonl',JSON.stringify(args)+'\\n');console.log(JSON.stringify({type:'thread.started',thread_id:thread}));fs.writeFileSync(out,JSON.stringify({summary:'Changed the heading to Hello Team.',title:'Update the homepage heading to Hello Team',description:'Show Hello Team as the homepage heading. Validated with the app production build.'}));}\n`;
+  const streamingCodex = fakeCodex.replace(
+    "let p=fs.readFileSync",
+    `console.log(JSON.stringify({type:'item.completed',item:{id:'item_progress',type:'agent_message',text:'I am updating the heading now.'}}));console.log(JSON.stringify({type:'item.completed',item:{id:'private_item',type:'reasoning',text:'private-reasoning-fixture'}}));let p=fs.readFileSync`,
+  );
+  await writeFile(path.join(bin, "codex"), streamingCodex, { mode: 0o700 });
   const originalPath = process.env.PATH;
   process.env.PATH = bin + ":" + originalPath;
   t.after(() => {
@@ -251,33 +271,204 @@ test("real git transport and app builds carry a teammate request through PR revi
     }),
     reviewer = createReviewer(agent, { dataDir: data, auth });
   await agent.initialize();
-  await agent.codeOne();
+  const coding = agent.codeOne();
+  for (let n = 0; n < 200; n++) {
+    if (
+      store.get(
+        "SELECT job_id FROM job_events WHERE text=?",
+        "I am updating the heading now.",
+      )
+    )
+      break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(
+    store.get(
+      "SELECT job_id FROM job_events WHERE text=?",
+      "I am updating the heading now.",
+    ),
+  );
+  assert.ok(
+    store.get(
+      "SELECT id FROM jobs WHERE state='working' AND project_id=?",
+      projectId,
+    ),
+  );
+  await coding;
+  assert.equal(
+    store.get("SELECT name FROM projects WHERE id=?", projectId).name,
+    "Team Canvas",
+  );
+  assert.equal(
+    JSON.parse(await readFile(path.join(data, "branding/name.json"), "utf8"))
+      .name,
+    "Team Canvas",
+  );
   const job = store.get(
     "SELECT * FROM jobs WHERE project_id=? AND state=?",
     projectId,
-    "reviewing",
+    "building_preview",
   );
   assert.ok(job);
-  assert.equal(job.pr_number, 1);
+  assert.equal(job.pr_number, null);
+  assert.equal(
+    pr,
+    null,
+    "Coding and pushing a draft must not open a pull request",
+  );
+  assert.equal(job.pr_title, "Update the homepage heading to Hello Team");
+  const provisioner = createProvisioner(config, store, provider);
+  // The provider deployment is tested separately. This fixture supplies its ready artifact.
+  store.run(
+    "INSERT INTO previews(project_id,pr_number,state,url,commit_sha,environment_id) VALUES(?,-1,'ready','https://preview.example.test',?,'draft-env')",
+    projectId,
+    job.change_sha,
+  );
+  store.run(
+    "UPDATE jobs SET state='awaiting_approval',artifact_number=-1,artifact_url='https://preview.example.test',artifact_ready_at=? WHERE id=?",
+    now(),
+    job.id,
+  );
+  const followup = await (
+    await call(
+      `/api/projects/${projectId}/messages`,
+      {
+        text: "Keep this preview but make the heading the default",
+        requestKey: id(),
+      },
+      memberCookie,
+    )
+  ).json();
+  assert.equal(followup.jobId, job.id);
+  const savedWorkspace = path.join(data, "wt", job.member_id);
+  const separateBranch = job.branch.split("/")[0] + "/separate-saved-change";
+  await git(["switch", "-c", separateBranch], savedWorkspace);
+  const separateEdit = path.join(savedWorkspace, "unfinished-other-change.txt");
+  await writeFile(
+    separateEdit,
+    "Preserve edits belonging to the other change.\n",
+  );
+  await agent.codeOne();
+  assert.equal(
+    store.get("SELECT state FROM jobs WHERE id=?", job.id).state,
+    "failed",
+  );
+  assert.equal(
+    await git(["branch", "--show-current"], savedWorkspace),
+    separateBranch,
+  );
+  assert.equal(
+    await readFile(separateEdit, "utf8"),
+    "Preserve edits belonging to the other change.\n",
+  );
+  // Once clean, retrying must return to this preview's saved branch automatically.
+  await rm(separateEdit);
+  await call(
+    `/api/projects/${projectId}/messages`,
+    { text: "contine", requestKey: id() },
+    memberCookie,
+  );
+  assert.match(
+    store.get("SELECT text FROM jobs WHERE id=?", job.id).text,
+    /heading the default/,
+  );
+  await agent.codeOne();
+  const updated = store.get("SELECT * FROM jobs WHERE id=?", job.id);
+  assert.equal(updated.state, "building_preview");
+  assert.equal(
+    updated.branch,
+    job.branch,
+    "A follow-up updates the existing draft branch",
+  );
+  assert.equal(
+    updated.artifact_number,
+    -1,
+    "A follow-up retains the preview URL and hosting port",
+  );
+  assert.equal(updated.request_revision, 2);
+  assert.equal(
+    store.get("SELECT COUNT(*) AS n FROM jobs WHERE member_id=?", job.member_id)
+      .n,
+    1,
+  );
+  assert.equal(
+    pr,
+    null,
+    "Refining an unpublished preview never creates another PR",
+  );
+  store.run(
+    "UPDATE jobs SET state='awaiting_approval',artifact_ready_at=? WHERE id=?",
+    now(),
+    job.id,
+  );
+  const approvalUrl = `/api/projects/${projectId}/jobs/${job.id}`;
+  assert.equal(
+    (
+      await call(
+        approvalUrl + "/approve",
+        { sha: job.change_sha },
+        memberCookie,
+      )
+    ).status,
+    409,
+  );
+  assert.equal(
+    (
+      await call(
+        approvalUrl + "/inspect",
+        { sha: job.change_sha },
+        memberCookie,
+      )
+    ).status,
+    200,
+  );
+  assert.equal(pr, null);
+  assert.equal(
+    (
+      await call(
+        approvalUrl + "/approve",
+        { sha: job.change_sha },
+        memberCookie,
+      )
+    ).status,
+    202,
+  );
+  await provisioner.openPull(project, { jobId: job.id, sha: job.change_sha });
+  assert.equal(pr.number, 1);
+  assert.equal(pr.title, job.pr_title);
+  assert.ok(
+    !pr.body.includes(job.text),
+    "PR copy describes the intent rather than transcribing the request",
+  );
+  assert.equal(
+    store.get("SELECT state FROM jobs WHERE id=?", job.id).state,
+    "reviewing",
+  );
   const member = store.get("SELECT * FROM members WHERE id=?", job.member_id);
   assert.match(member.thread_id, /^[a-f0-9-]{36}$/);
   assert.ok(authorizedGitRequests > 0);
   assert.ok(
     !(await readFile(path.join(data, "repo/.git/config"), "utf8")).includes(
-      "owner-github-fixture",
+      "project-installation-fixture",
     ),
   );
   const page = await (
     await call(`/api/projects/${projectId}`, undefined, memberCookie)
   ).json();
-  assert.equal(page.messages.at(-1).role, "assistant");
+  assert.ok(page.messages.some((m) => m.role === "assistant"));
+  assert.ok(
+    page.messages.some((m) => m.text === "I am updating the heading now."),
+  );
+  assert.ok(
+    !JSON.stringify(page.messages).includes("private-reasoning-fixture"),
+  );
   assert.ok(page.jobs[0].prUrl.endsWith("/pull/1"));
   await reviewer.one();
   const candidate = (await currentPull()).head.sha;
   store.run(
-    "INSERT INTO previews(project_id,pr_number,state,url,commit_sha) VALUES(?,1,'ready','https://preview.example.test',?)",
-    projectId,
+    "UPDATE previews SET commit_sha=? WHERE project_id=? AND pr_number=1",
     candidate,
+    projectId,
   );
   // Waiting for a preview must not create a new commit on every poll.
   await reviewer.one();
@@ -312,7 +503,39 @@ test("real git transport and app builds carry a teammate request through PR revi
     secret,
     auth,
   });
+  // Persisted worktrees keep their old remote when the platform changes domains.
+  // Reproduce the credential-host mismatch and an unfinished teammate edit.
+  const workerRepo = path.join(data, "repo");
+  const oldOrigin = new URL(config.publicUrl);
+  oldOrigin.hostname = "localhost";
+  await git(
+    [
+      "remote",
+      "set-url",
+      "origin",
+      `${oldOrigin.origin}/api/git/${projectId}/repo.git`,
+    ],
+    workerRepo,
+  );
+  const preservedFile = path.join(data, "wt", member.id, "unfinished-note.txt");
+  await writeFile(preservedFile, "Preserve this unfinished teammate work.\n");
+  const originalHead = await git(
+    ["rev-parse", "HEAD"],
+    path.dirname(preservedFile),
+  );
   await resumed.initialize();
+  assert.equal(
+    await git(["remote", "get-url", "origin"], workerRepo),
+    `${config.publicUrl}/api/git/${projectId}/repo.git`,
+  );
+  assert.equal(
+    await readFile(preservedFile, "utf8"),
+    "Preserve this unfinished teammate work.\n",
+  );
+  assert.equal(
+    await git(["rev-parse", "HEAD"], path.dirname(preservedFile)),
+    originalHead,
+  );
   await call(
     `/api/projects/${projectId}/messages`,
     { text: "Keep the heading Hello Team", requestKey: id() },
@@ -328,7 +551,9 @@ test("real git transport and app builds carry a teammate request through PR revi
     .trim()
     .split("\n")
     .map(JSON.parse);
-  assert.equal(invocations.length, 2);
-  assert.ok(invocations[1].includes("resume"));
-  assert.ok(invocations[1].includes(member.thread_id));
+  assert.equal(invocations.length, 3);
+  for (const invocation of invocations.slice(1)) {
+    assert.ok(invocation.includes("resume"));
+    assert.ok(invocation.includes(member.thread_id));
+  }
 });

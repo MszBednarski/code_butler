@@ -14,6 +14,15 @@ export function configuration(env = process.env) {
       !["localhost", "127.0.0.1"].includes(url.hostname))
   )
     throw new Error("PUBLIC_URL must be an HTTPS origin");
+  const publicAliases = (env.PUBLIC_URL_ALIASES || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  for (const alias of publicAliases) {
+    const parsed = new URL(alias);
+    if (parsed.origin !== alias || parsed.protocol !== "https:")
+      throw new Error("PUBLIC_URL_ALIASES must contain HTTPS origins");
+  }
   if (
     env.RAILWAY_ENVIRONMENT_ID &&
     !readFileSync("/proc/self/mountinfo", "utf8")
@@ -23,6 +32,7 @@ export function configuration(env = process.env) {
     throw new Error("Platform requires a persistent Railway volume at /data");
   return {
     publicUrl,
+    publicAliases,
     secure: url.protocol === "https:",
     port: Number(env.PORT || 3000),
     dataDir: env.DATA_DIR || "/data",
@@ -34,6 +44,12 @@ export function configuration(env = process.env) {
       env.WORKER_DIR || path.resolve(import.meta.dirname, "../project-worker"),
     githubClientId: env.GITHUB_OAUTH_CLIENT_ID,
     githubClientSecret: env.GITHUB_OAUTH_CLIENT_SECRET,
+    githubAppId: env.GITHUB_APP_ID,
+    githubAppSlug: env.GITHUB_APP_SLUG,
+    githubAppPrivateKey: env.GITHUB_APP_PRIVATE_KEY,
+    githubAppWebhookSecret: env.GITHUB_APP_WEBHOOK_SECRET,
+    githubAppClientId: env.GITHUB_APP_CLIENT_ID,
+    githubAppClientSecret: env.GITHUB_APP_CLIENT_SECRET,
     railwayClientId: env.RAILWAY_OAUTH_CLIENT_ID,
     railwayClientSecret: env.RAILWAY_OAUTH_CLIENT_SECRET,
     setupToken: env.SETUP_TOKEN,
@@ -42,6 +58,9 @@ export function configuration(env = process.env) {
     emailFrom: env.EMAIL_FROM,
     githubApi: "https://api.github.com",
     railwayApi: "https://backboard.railway.app/graphql/v2",
+    boatOrigin: "https://boat.dev",
+    defaultHostingProvider:
+      env.DEFAULT_HOSTING_PROVIDER === "railway" ? "railway" : "boat",
     commit: env.RAILWAY_GIT_COMMIT_SHA || "dev",
   };
 }

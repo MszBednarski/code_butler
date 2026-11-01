@@ -6,5 +6,6 @@ for package in app platform project-worker; do
 done
 npm --prefix app run typecheck
 npm --prefix app run build
+npm --prefix app test
 npm --prefix platform test
 npm --prefix project-worker test

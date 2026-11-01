@@ -2,7 +2,15 @@
   "name": "butler-project-worker",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.13" },
-  "scripts": { "start": "node server.mjs", "test": "node --test test/*.test.mjs" },
-  "dependencies": { "express": "^5.2.1" }
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "playwright-core": "1.58.2"
+  }
 }

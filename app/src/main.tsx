@@ -1,6 +1,27 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import ReactDOM from "react-dom/client";
 import "./style.css";
+import { chatBubbles, explainButler } from "./communication";
+import type { ChatMessage } from "./communication";
+import { attachWorkspaceViewport } from "./workspace-viewport";
+import LandingTour from "./LandingTour";
+import VerificationMessage from "./VerificationMessage";
+import GeminiSettings from "./GeminiSettings";
+import Reactions from "./Reactions";
+import type { ReactionSummary, ReactionTarget } from "./Reactions";
+import GroupChat from "./GroupChat";
+import type { Job } from "./workspace-types";
+import { useLatestChat, mergeHistory } from "./latest-chat";
+import { activityNotices } from "./activity";
+import type { Notice } from "./activity";
+import type { GroupAgent, GroupMessage } from "./GroupChat";
 
 type User = {
   id: string;
@@ -11,23 +32,32 @@ type User = {
 };
 type Session = {
   user: User | null;
-  connections: { github: boolean; railway: boolean };
-  capabilities: { github: boolean; railway: boolean; email: boolean };
+  connections: {
+    githubCreation?: boolean;
+    github: boolean;
+    railway: boolean;
+    boat?: boolean;
+  };
+  hostingProvider?: "railway" | "boat";
+  capabilities: {
+    github: boolean;
+    githubRepositories?: boolean;
+    boat?: boolean;
+    railway: boolean;
+    email: boolean;
+  };
   commit: string;
 };
-type Member = { id: string; name: string; prefix: string; role: string };
-type Job = {
+type Member = {
   id: string;
-  requestKey: string;
-  text: string;
-  state: string;
-  result?: string;
-  error?: string;
-  prUrl?: string;
-  previewUrl?: string;
-  createdAt: number;
-  name?: string;
+  name: string;
+  prefix: string;
+  role: string;
+  agentState?: string;
+  startedAt?: number;
+  finishedAt?: number;
 };
+
 type Project = {
   id: string;
   name: string;
@@ -38,21 +68,49 @@ type Project = {
   repoUrl?: string;
   isOwner: boolean;
   codingReady: boolean;
+  hostingState?: "ready" | "stopping" | "sleeping" | "unavailable";
+  hostingProvider?: "railway" | "boat";
+  githubAccess?: { repo: string; url: string } | null;
   member: Member;
+  chatMember?: Member;
+  readOnly?: boolean;
+  canSteerChat?: boolean;
   members: Member[];
   ownMemberships: Member[];
-  messages: { id: string; jobId: string; role: string; text: string }[];
+  messages: ChatMessage[];
+  reactions?: ReactionSummary;
+  groupMessages?: GroupMessage[];
+  groupAgent?: GroupAgent | null;
+  personalUpdateAt?: number;
+  historyBefore?: string | null;
+  groupHistoryBefore?: string | null;
   jobs: Job[];
   activity: Job[];
+  releases?: {
+    number: number;
+    title: string;
+    author?: string;
+    sha: string;
+    mergedAt?: number;
+    publishedAt?: number;
+    isLive: boolean;
+    url: string;
+  }[];
   tasks: { kind: string; state: string; error?: string; attempts: number }[];
 };
+function jobPreviewUrl(job: Job) {
+  return job.state === "awaiting_approval"
+    ? job.artifactUrl
+    : job.previewUrl || job.artifactUrl;
+}
 type Summary = Pick<
   Project,
   "id" | "name" | "description" | "state" | "appUrl"
->;
+> & { isOwner?: boolean };
 type Codex = { state: string; code?: string; url?: string; message?: string };
 const emptySession: Session = {
   user: null,
+  hostingProvider: "boat",
   connections: { github: false, railway: false },
   capabilities: { github: false, railway: false, email: false },
   commit: "dev",
@@ -98,6 +156,7 @@ function useRoute() {
 function Icon({ name, size = 20 }: { name: string; size?: number }) {
   const paths: Record<string, React.ReactNode> = {
     arrow: <path d="m5 12 14 0m-6-6 6 6-6 6" />,
+    bell: <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" />,
     plus: <path d="M12 5v14M5 12h14" />,
     check: <path d="m5 12 4 4L19 6" />,
     close: <path d="m6 6 12 12M6 18 18 6" />,
@@ -118,6 +177,13 @@ function Icon({ name, size = 20 }: { name: string; size?: number }) {
         <path d="M14 3h7v7m0-7L10 14M10 3H4v17h17v-6" />
       </>
     ),
+    share: (
+      <>
+        <path d="M12 15V3m-4 4 4-4 4 4" />
+        <path d="M5 11H4v10h16V11h-1" />
+      </>
+    ),
+    expand: <path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5" />,
     users: (
       <>
         <circle cx="9" cy="8" r="3" />
@@ -209,8 +275,49 @@ function Alert({ children }: { children: React.ReactNode }) {
   return (
     <div className="notice" role="alert">
       <Icon name="spark" size={17} />
-      <span>{children}</span>
+      <div className="notice-body">
+        {typeof children === "string" ? (
+          <ButlerText text={children} kind="error" />
+        ) : (
+          children
+        )}
+      </div>
     </div>
+  );
+}
+function ButlerText({
+  text,
+  kind = "message",
+  developerUrl,
+  diagnostics = [],
+}: {
+  text: string;
+  kind?: string;
+  developerUrl?: string;
+  diagnostics?: string[];
+}) {
+  if (kind === "gemini") return <VerificationMessage text={text} />;
+  const explanation = explainButler(text, kind);
+  const details = [...new Set([text, ...diagnostics])].filter(
+    (value) => value.trim() !== explanation,
+  );
+  return (
+    <>
+      <p>{explanation}</p>
+      {(details.length > 0 || developerUrl) && (
+        <details className="developer-details">
+          <summary>Details for developers</summary>
+          {details.map((value) => (
+            <p key={value}>{value}</p>
+          ))}
+          {developerUrl && (
+            <a href={developerUrl} target="_blank" rel="noopener noreferrer">
+              View code review on GitHub <Icon name="external" size={12} />
+            </a>
+          )}
+        </details>
+      )}
+    </>
   );
 }
 async function copy(text: string) {
@@ -255,6 +362,11 @@ function Modal({
 }
 
 function Landing({ session, error }: { session: Session; error: string }) {
+  const startUrl = session.user
+    ? "/start"
+    : session.capabilities.github
+      ? "/auth/github?purpose=create&returnTo=%2Fstart"
+      : "#get-started";
   return (
     <div className="landing">
       <header className="site-header">
@@ -262,9 +374,10 @@ function Landing({ session, error }: { session: Session; error: string }) {
         <span className="header-note">Good ideas are a team sport.</span>
         <a
           className="button ghost compact"
-          href={session.capabilities.github ? "/auth/github" : "#get-started"}
+          href={session.user ? "/projects" : startUrl}
         >
-          Get started <Icon name="arrow" size={16} />
+          {session.user ? "My projects" : "Get started"}{" "}
+          <Icon name="arrow" size={16} />
         </a>
       </header>
       <main className="landing-main">
@@ -278,37 +391,37 @@ function Landing({ session, error }: { session: Session; error: string }) {
             <br />
             Your people.
             <br />
-            <em>Something real.</em>
+            <em>One website.</em>
           </h1>
           <p className="hero-description">
-            Bring the whole team into building. Share a link, say what you want
-            to change, and watch your website come to life.
+            Building together should be as easy as sharing a link. One person
+            connects the tools. Everyone else scans a QR code and starts
+            creating — by typing or talking, right from their phone.
           </p>
+          {error && <Alert>{error}</Alert>}
           <div id="get-started" className="hero-actions">
             <a
               className={
                 "button primary" +
-                (!session.capabilities.github ? " disabled" : "")
+                (!session.user && !session.capabilities.github
+                  ? " disabled"
+                  : "")
               }
-              href={
-                session.capabilities.github ? "/auth/github" : "#get-started"
-              }
-              aria-disabled={!session.capabilities.github}
+              href={startUrl}
+              aria-disabled={!session.user && !session.capabilities.github}
             >
               <Icon name="github" />
-              Start with GitHub
+              {session.user ? "Start a project" : "Start with GitHub"}
               <Icon name="arrow" size={18} />
             </a>
-            <span>
-              One setup for you.
-              <br />
-              One link for everyone else.
-            </span>
+            <a className="button ghost" href="#try-butler">
+              See how it works <Icon name="arrow" size={16} />
+            </a>
           </div>
           {!session.capabilities.github && (
             <p className="setup-note">
-              {error ||
-                "Sign-in is being prepared. Your Butler operator needs to connect GitHub."}
+              Sign-in is being prepared. Watch the product demo while we get
+              ready.
             </p>
           )}
           <div className="hero-proof">
@@ -324,68 +437,7 @@ function Landing({ session, error }: { session: Session; error: string }) {
             </span>
           </div>
         </section>
-        <section
-          className="hero-scene"
-          aria-label="An illustration of collaborating with Butler"
-        >
-          <div className="scene-note">
-            Everyone’s invited.<span>↘</span>
-          </div>
-          <div className="scene-window">
-            <div className="scene-toolbar">
-              <span className="window-dots">
-                <i />
-                <i />
-                <i />
-              </span>
-              <span>the weekend project</span>
-              <span className="live-pill">
-                <i />
-                LIVE
-              </span>
-            </div>
-            <div className="scene-site">
-              <span className="mini-label">A PLACE FOR GOOD COMPANY</span>
-              <h2>
-                More time
-                <br />
-                together.
-              </h2>
-              <div className="scene-arches">
-                <span />
-                <span />
-                <span />
-              </div>
-              <span className="scene-site-button">Make a little room ↗</span>
-            </div>
-            <div className="scene-chat">
-              <Avatar name="Maya" index={2} />
-              <div>
-                <strong>Maya</strong>
-                <p>Can we make it feel a little warmer?</p>
-              </div>
-            </div>
-            <div className="scene-chat answer">
-              <span className="mini-butler">✳</span>
-              <div>
-                <strong>Butler</strong>
-                <p>A softer palette, a friendlier welcome. Done.</p>
-                <span className="published">
-                  <Icon name="check" size={13} /> Change published
-                </span>
-              </div>
-            </div>
-          </div>
-          <div className="floating-request">
-            <Avatar name="Sam" index={3} />
-            <span>“Let’s add a place to RSVP.”</span>
-            <span className="tiny-star">✳</span>
-          </div>
-          <div className="scene-footer">
-            <span>Different people.</span>
-            <span>One shared creation.</span>
-          </div>
-        </section>
+        <LandingTour />
       </main>
       <section className="how-it-works">
         <div>
@@ -406,9 +458,71 @@ function Landing({ session, error }: { session: Session; error: string }) {
           <span>03</span>
           <h3>Make it together</h3>
           <p>
-            Type or dictate a change. Butler builds, reviews, and publishes it.
+            Type or dictate a change. Try the preview. Say “Make this the
+            website” when you’re happy with it.
           </p>
         </div>
+      </section>
+      <section className="landing-benefits" aria-label="Why build with Butler">
+        <div className="landing-benefits-heading">
+          <span className="eyebrow">EVERY VOICE CAN MAKE SOMETHING</span>
+          <h2>
+            One project.
+            <br />
+            <em>Your whole team, building.</em>
+          </h2>
+        </div>
+        <div className="landing-benefit-grid">
+          <article>
+            <span>↗</span>
+            <h3>Invite, don’t install.</h3>
+            <p>
+              One link or QR code is all your teammates need. No terminal, tool
+              setup, or coding experience. Just a name and an idea.
+            </p>
+          </article>
+          <article>
+            <span>✳</span>
+            <h3>See it happen together.</h3>
+            <p>
+              Each person gets a Butler. Follow each other’s chats, see what’s
+              being made, and talk in the group chat. Tag @Butler to give your
+              shared agent a task while everyone keeps building. React to
+              messages and previews so your team knows what you love. Your chats
+              and drafts are saved, ready to pick up when you return.
+            </p>
+          </article>
+          <article>
+            <span>✓</span>
+            <h3>Try it. Then make it live.</h3>
+            <p>
+              Inspect changes inside your workspace. Approve your own or, as
+              team lead, a teammate’s. Dismiss a preview and recover it from
+              chat history whenever you like. Butler checks and publishes
+              approved changes for everyone. Unread badges and What’s new bring
+              fresh messages, ready previews and website updates to you.
+            </p>
+          </article>
+        </div>
+      </section>
+      <section className="landing-ownership">
+        <div>
+          <span className="eyebrow">QUICK TO START. YOURS TO KEEP.</span>
+          <h2>
+            Start with a little vibe.
+            <br />
+            Take it as far as you like.
+          </h2>
+          <p>
+            Your code stays in your GitHub. Underneath the easy experience are
+            real pull requests, reviews, and automatic publishing. Bring in your
+            usual development tools whenever you’re ready. Butler stays with
+            you.
+          </p>
+        </div>
+        <a className="button primary" href={startUrl}>
+          Bring your team <Icon name="arrow" size={17} />
+        </a>
       </section>
       <footer className="site-footer">
         <Brand small />
@@ -419,63 +533,302 @@ function Landing({ session, error }: { session: Session; error: string }) {
   );
 }
 
+function OnboardingProgress({ step }: { step: number }) {
+  return (
+    <ol className="onboarding-progress" aria-label="Setup progress">
+      {["GitHub", "Hosting", "Your idea", "Codex"].map((label, index) => (
+        <li
+          key={label}
+          className={
+            index < step ? "complete" : index === step ? "current" : ""
+          }
+          aria-current={index === step ? "step" : undefined}
+        >
+          <span>
+            {index < step ? <Icon name="check" size={13} /> : index + 1}
+          </span>
+          <strong>{label}</strong>
+        </li>
+      ))}
+    </ol>
+  );
+}
+function ProjectCards({ projects }: { projects: Summary[] }) {
+  return (
+    <section className="projects-section">
+      <div className="section-title">
+        <h2>Your projects</h2>
+      </div>
+      <div className="project-cards">
+        {projects.map((p, index) => (
+          <button
+            key={p.id}
+            className={`project-card project-tone-${index % 3}`}
+            onClick={() => navigate(`/p/${p.id}`)}
+          >
+            <span className="project-monogram">
+              {p.name.slice(0, 1).toUpperCase()}
+            </span>
+            <h3>{p.name}</h3>
+            <p>{p.description}</p>
+            <span className="project-card-foot">
+              Open your workspace
+              <Icon name="arrow" size={16} />
+            </span>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+type BoatConnectionState = {
+  state: string;
+  url?: string;
+  code?: string;
+  message?: string;
+};
+function BoatConnection({ onConnected }: { onConnected: () => Promise<void> }) {
+  const [connection, setConnection] = useState<BoatConnectionState>({
+      state: "loading",
+    }),
+    [error, setError] = useState(""),
+    [busy, setBusy] = useState(false);
+  const halted = useRef(false);
+  useEffect(() => {
+    let alive = true;
+    const check = () =>
+      halted.current
+        ? Promise.resolve()
+        : api<BoatConnectionState>("/api/auth/boat")
+            .then((value) => {
+              if (!alive) return;
+              setConnection(value);
+              setError("");
+              if (value.state === "connected") onConnected();
+            })
+            .catch((e) => {
+              if (alive) {
+                halted.current = true;
+                setConnection({ state: "signed_out" });
+                setError(e.message);
+              }
+            });
+    check();
+    const timer = setInterval(() => {
+      if (document.visibilityState === "visible") check();
+    }, 5000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [onConnected]);
+  async function start() {
+    halted.current = false;
+    setBusy(true);
+    setError("");
+    try {
+      setConnection(await api<BoatConnectionState>("/api/auth/boat", {}));
+    } catch (e) {
+      halted.current = true;
+      setConnection({ state: "signed_out" });
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="boat-connection">
+      {error && <Alert>{error}</Alert>}
+      {connection.state === "pending" && connection.url ? (
+        <>
+          <p>
+            Open Boat and sign in with your own account. Enter this Boat device
+            code when asked:
+          </p>
+          <div className="device-code">
+            <strong>{connection.code}</strong>
+          </div>
+          <a
+            className="button primary full"
+            href={connection.url}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Open Boat sign-in
+            <Icon name="external" size={17} />
+          </a>
+          <p className="quiet-note">
+            Return here afterward. This step updates automatically.
+          </p>
+        </>
+      ) : connection.state === "billing" && connection.url ? (
+        <>
+          <p>{connection.message}</p>
+          <a
+            className="button primary full"
+            href={connection.url}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Activate my Boat account
+            <Icon name="external" size={17} />
+          </a>
+          <p className="quiet-note">
+            Check Boat’s trial and payment terms before confirming. Return here
+            when activation is complete.
+          </p>
+        </>
+      ) : connection.state === "connected" ? (
+        <p className="inline-status">
+          <Spinner />
+          Your hosting is ready…
+        </p>
+      ) : connection.state === "loading" && !error ? (
+        <p className="inline-status">
+          <Spinner />
+          Checking your Boat account…
+        </p>
+      ) : (
+        <>
+          <p>
+            Sign in to Boat, then Butler will create your team’s workspace. No
+            API key to copy.
+          </p>
+          <button
+            className="button primary full"
+            disabled={busy}
+            onClick={start}
+          >
+            {busy ? <Spinner /> : <Icon name="link" />}
+            {busy
+              ? "Preparing sign-in…"
+              : connection.state === "expired" || error
+                ? "Try Boat sign-in again"
+                : "Continue with Boat"}
+            <Icon name="arrow" size={18} />
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
 function Dashboard({
   session,
   refresh,
+  authError,
+  listOnly = false,
 }: {
   session: Session;
   refresh: () => Promise<void>;
+  authError: string;
+  listOnly?: boolean;
 }) {
   const [projectsLoaded, setProjectsLoaded] = useState(false),
     [memberSaving, setMemberSaving] = useState(false);
   const [projects, setProjects] = useState<Summary[]>([]),
     [error, setError] = useState(""),
-    [busy, setBusy] = useState(false),
-    [workspaces, setWorkspaces] = useState<{ id: string; name: string }[]>([]),
-    [workspace, setWorkspace] = useState("");
-  const [description, setDescription] = useState(
-      () => localStorage.getItem("butler-project-idea") || "",
+    [busy, setBusy] = useState(false);
+  const [workspaces, setWorkspaces] = useState<{ id: string; name: string }[]>(
+      [],
     ),
-    [projectName, setProjectName] = useState(""),
-    [createKey] = useState(
-      () => sessionStorage.getItem("butler-create-key") || crypto.randomUUID(),
-    );
+    [workspace, setWorkspace] = useState(""),
+    [hostingConfirmed, setHostingConfirmed] = useState(false),
+    [hostingLoaded, setHostingLoaded] = useState(false),
+    [hostingFailed, setHostingFailed] = useState(false),
+    [hostingReconnect, setHostingReconnect] = useState(false),
+    [hostingAttempt, setHostingAttempt] = useState(0);
+  const [description, setDescription] = useState(
+    () => localStorage.getItem("butler-project-idea") || "",
+  );
+  const [createKey] = useState(() => {
+    const key =
+      sessionStorage.getItem("butler-create-key") || crypto.randomUUID();
+    sessionStorage.setItem("butler-create-key", key);
+    return key;
+  });
+  const useBoat = session.hostingProvider !== "railway";
+  const workspaceKey = `butler-hosting-${session.user!.id}`;
   useEffect(() => {
+    let alive = true;
     api<{ projects: Summary[] }>("/api/projects")
-      .then((v) => {
-        setProjects(v.projects);
-        if (!session.connections.github && v.projects.length === 1)
-          navigate(`/p/${v.projects[0].id}`, true);
+      .then(({ projects: found }) => {
+        if (!alive) return;
+        setProjects(found);
       })
-      .catch((e) => setError(e.message))
-      .finally(() => setProjectsLoaded(true));
-  }, []);
+      .catch((e) => alive && setError(e.message))
+      .finally(() => alive && setProjectsLoaded(true));
+    return () => {
+      alive = false;
+    };
+  }, [session.user?.id]);
   useEffect(() => {
     localStorage.setItem("butler-project-idea", description);
   }, [description]);
   useEffect(() => {
-    if (session.connections.railway)
-      api<{ id: string; name: string }[]>("/api/railway/workspaces")
-        .then((v) => {
-          setWorkspaces(v);
-          if (v.length === 1) setWorkspace(v[0].id);
-        })
-        .catch((e) => setError(e.message));
-  }, [session.connections.railway]);
+    if (listOnly || useBoat || !session.connections.railway) return;
+    let alive = true;
+    setHostingLoaded(false);
+    setHostingFailed(false);
+    setHostingReconnect(false);
+    api<{ id: string; name: string }[]>("/api/railway/workspaces")
+      .then((found) => {
+        if (!alive) return;
+        setWorkspaces(found);
+        const saved = localStorage.getItem(workspaceKey);
+        const selected =
+          found.length === 1
+            ? found[0].id
+            : found.find((w) => w.id === saved)?.id || "";
+        setWorkspace(selected);
+        setHostingConfirmed(Boolean(selected));
+      })
+      .catch((e) => {
+        if (alive) {
+          setError(e.message);
+          setHostingFailed(true);
+          setHostingReconnect(
+            e instanceof ApiError && [401, 403].includes(e.status),
+          );
+        }
+      })
+      .finally(() => alive && setHostingLoaded(true));
+    return () => {
+      alive = false;
+    };
+  }, [
+    listOnly,
+    useBoat,
+    session.connections.railway,
+    workspaceKey,
+    hostingAttempt,
+  ]);
+  const memberOnly = listOnly;
+  const step =
+    !session.user?.githubLogin || !session.connections.githubCreation
+      ? 0
+      : useBoat
+        ? !session.connections.boat
+          ? 1
+          : 2
+        : !session.connections.railway || !hostingLoaded || !hostingConfirmed
+          ? 1
+          : 2;
+  const githubAvailable = session.user?.githubLogin
+    ? session.capabilities.githubRepositories
+    : session.capabilities.github;
   async function create(event: React.FormEvent) {
     event.preventDefault();
+    if (step !== 2 || busy) return;
     setError("");
     setBusy(true);
-    sessionStorage.setItem("butler-create-key", createKey);
     try {
       const result = await api<{ id: string }>("/api/projects", {
-        name:
-          projectName.trim() ||
-          description.trim().split(/\s+/).slice(0, 5).join(" ").slice(0, 45) ||
-          "Our next idea",
+        name: "Your new project",
+        generateName: true,
         description,
         requestKey: createKey,
-        workspaceId: workspace || undefined,
+        workspaceId: useBoat ? undefined : workspace,
       });
       localStorage.removeItem("butler-project-idea");
       sessionStorage.removeItem("butler-create-key");
@@ -489,8 +842,9 @@ function Dashboard({
   async function logout() {
     await api("/api/auth/logout", {});
     await refresh();
+    navigate("/", true);
   }
-  if (!session.connections.github && !projectsLoaded)
+  if (!projectsLoaded)
     return (
       <div className="loading-page">
         <Brand />
@@ -498,13 +852,21 @@ function Dashboard({
         <p>Finding your workspace…</p>
       </div>
     );
-  if (!session.connections.github && projects.length > 0)
-    return (
-      <div className="dashboard">
-        <header className="site-header">
-          <Brand />
-          <div className="account-menu">
-            <Avatar name={session.user!.name} />
+  return (
+    <div className="dashboard">
+      <header className="site-header">
+        <Brand />
+        <div className="account-menu">
+          {!session.user?.isGuest && <GeminiSettings />}
+          {listOnly && (
+            <a className="button ghost compact" href="/start">
+              <Icon name="plus" size={15} />
+              New project
+            </a>
+          )}
+          <Avatar name={session.user!.name} />
+          <span>{session.user!.name.split(" ")[0]}</span>
+          {session.user?.isGuest ? (
             <button
               className="icon-button"
               aria-label="Save your access"
@@ -512,249 +874,214 @@ function Dashboard({
             >
               <Icon name="lock" />
             </button>
-          </div>
-        </header>
+          ) : (
+            <button
+              className="icon-button"
+              onClick={logout}
+              aria-label="Sign out"
+            >
+              <Icon name="logout" />
+            </button>
+          )}
+        </div>
+      </header>
+      {memberOnly ? (
         <main className="dashboard-main">
-          <div className="eyebrow">YOUR IDEAS HAVE A HOME</div>
-          <h1>
-            Good to have
-            <br />
-            <em>you back.</em>
-          </h1>
+          <h1>Your projects.</h1>
           <p className="page-description">
             Pick up your conversation and keep making things together.
           </p>
-          <section className="projects-section">
-            <div className="project-cards">
-              {projects.map((p, i) => (
-                <button
-                  key={p.id}
-                  className={`project-card project-tone-${i % 3}`}
-                  onClick={() => navigate(`/p/${p.id}`)}
-                >
-                  <span className="project-monogram">{p.name.slice(0, 1)}</span>
-                  <h3>{p.name}</h3>
-                  <p>{p.description}</p>
-                  <span className="project-card-foot">
-                    Open your workspace
-                    <Icon name="arrow" size={16} />
-                  </span>
-                </button>
-              ))}
-            </div>
-          </section>
+          <ProjectCards projects={projects} />
         </main>
-        {memberSaving && (
-          <SaveAccess
-            session={session}
-            projectId={projects[0].id}
-            onClose={() => setMemberSaving(false)}
-          />
-        )}
-      </div>
-    );
-  return (
-    <div className="dashboard">
-      <header className="site-header">
-        <Brand />
-        <div className="account-menu">
-          <Avatar name={session.user!.name} />
-          <span>{session.user!.name.split(" ")[0]}</span>
-          <button
-            className="icon-button"
-            onClick={logout}
-            aria-label="Sign out"
-          >
-            <Icon name="logout" />
-          </button>
-        </div>
-      </header>
-      <main className="dashboard-main">
-        <div className="eyebrow">A LITTLE HELP GETTING STARTED</div>
-        <h1>
-          What shall we
-          <br />
-          <em>make together?</em>
-        </h1>
-        <p className="page-description">
-          A fresh idea, your favorite people, and a Butler for everyone.
-        </p>
-        {error && <Alert>{error}</Alert>}
-        <div className="dashboard-grid">
-          <form className="create-card" onSubmit={create}>
-            <div className="card-heading">
+      ) : (
+        <main className="dashboard-main onboarding-main">
+          <OnboardingProgress step={step} />
+          <div className="eyebrow">STEP {step + 1} OF 4</div>
+          <h1>
+            {step === 0
+              ? "First, your GitHub."
+              : step === 1
+                ? "A home for your app."
+                : "What would you like to build?"}
+          </h1>
+          <p className="page-description">
+            {step === 0
+              ? "Let Butler create and save your project for you."
+              : step === 1
+                ? `Butler uses your ${useBoat ? "Boat" : "Railway"} account to keep your website and your team’s Butlers running.`
+                : "Describe the idea in your own words. Butler will set everything up."}
+          </p>
+          {(error || authError) && <Alert>{error || authError}</Alert>}
+          {step === 0 && (
+            <section className="create-card onboarding-card">
               <span className="round-icon">
-                <Icon name="spark" />
-              </span>
-              <div>
-                <h2>Start something new</h2>
-                <p>Your first website is a conversation away.</p>
-              </div>
-            </div>
-            <label htmlFor="project-idea">What would you like to build?</label>
-            <textarea
-              id="project-idea"
-              autoFocus
-              placeholder="A website for our supper club, with upcoming dinners and a way to join…"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              maxLength={10000}
-              rows={4}
-              required
-              minLength={3}
-            />
-            <details className="optional-details">
-              <summary>
-                Give it a name <span>optional</span>
-              </summary>
-              <input
-                aria-label="Project name"
-                placeholder="Our next idea"
-                value={projectName}
-                onChange={(e) => setProjectName(e.target.value)}
-                maxLength={50}
-              />
-            </details>
-            {workspaces.length > 1 && (
-              <label className="workspace-select">
-                Where should it live?
-                <select
-                  value={workspace}
-                  onChange={(e) => setWorkspace(e.target.value)}
-                  required
-                >
-                  <option value="">Choose your Railway workspace</option>
-                  {workspaces.map((w) => (
-                    <option key={w.id} value={w.id}>
-                      {w.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-            <button
-              className="button primary full"
-              disabled={
-                busy ||
-                !session.connections.github ||
-                !session.connections.railway ||
-                description.trim().length < 3 ||
-                (workspaces.length > 1 && !workspace)
-              }
-            >
-              {busy ? <Spinner /> : <Icon name="plus" />}
-              {busy ? "Creating your project…" : "Create & invite your team"}
-              <Icon name="arrow" size={18} />
-            </button>
-            <p className="quiet-note">
-              Your work and conversations are saved as you go.
-            </p>
-          </form>
-          <aside className="connection-card">
-            <span className="small-label">YOUR CONNECTIONS</span>
-            <h2>
-              Set up once.
-              <br />
-              Keep making things.
-            </h2>
-            <div className="connection-row">
-              <span className="connection-icon">
                 <Icon name="github" />
               </span>
-              <div>
-                <strong>GitHub</strong>
-                <small>A home for your team’s work</small>
-              </div>
-              {session.connections.github ? (
-                <span className="connection-check">
-                  <Icon name="check" size={17} />
-                </span>
-              ) : (
-                <a className="text-link" href="/auth/github">
-                  Connect ↗
-                </a>
-              )}
-            </div>
-            <div className="connection-row">
-              <span className="connection-icon">
+              <h2>Butler handles the project files.</h2>
+              <p>
+                Sign in and let Butler create a new private project for you.
+                If GitHub asks where Butler can work, choose “Only select
+                repositories” to keep access limited. You don’t need an existing
+                repository. Setup continues when you return.
+              </p>
+              <a
+                className={
+                  "button primary full" + (!githubAvailable ? " disabled" : "")
+                }
+                aria-disabled={!githubAvailable}
+                href={
+                  githubAvailable
+                    ? "/auth/github?purpose=create&returnTo=%2Fstart"
+                    : undefined
+                }
+              >
+                {session.user?.githubLogin
+                  ? "Allow Butler to create a new project"
+                  : "Continue with GitHub"}
+                <Icon name="arrow" size={18} />
+              </a>
+              <p className="quiet-note">
+                {githubAvailable
+                  ? "No project files to prepare or tokens to copy. Connect your account, then describe your idea."
+                  : "GitHub setup is being finished. Please try again shortly."}
+              </p>
+            </section>
+          )}
+          {step === 1 && useBoat && (
+            <section className="create-card onboarding-card">
+              <span className="round-icon">
+                <Icon name="grid" />
+              </span>
+              <h2>Let Butler prepare your workspace.</h2>
+              <BoatConnection onConnected={refresh} />
+            </section>
+          )}
+          {step === 1 && !useBoat && (
+            <section className="create-card onboarding-card">
+              <span className="round-icon">
                 <Icon name="railway" />
               </span>
-              <div>
-                <strong>Railway</strong>
-                <small>A home for your website</small>
-              </div>
-              {session.connections.railway ? (
-                <span className="connection-check">
-                  <Icon name="check" size={17} />
-                </span>
-              ) : (
-                <a
-                  className={
-                    "text-link" +
-                    (!session.capabilities.railway ? " disabled" : "")
-                  }
-                  href={session.capabilities.railway ? "/auth/railway" : "#"}
-                >
-                  Connect ↗
-                </a>
-              )}
-            </div>
-            <div className="connection-row muted">
-              <span className="connection-icon">
-                <Icon name="spark" />
-              </span>
-              <div>
-                <strong>Codex</strong>
-                <small>Connect your subscription inside your new project</small>
-              </div>
-            </div>
-            {!session.capabilities.railway && (
-              <p className="quiet-note">
-                Your Butler operator is preparing the Railway connection.
-              </p>
-            )}
-            <div className="connection-foot">
-              <Icon name="users" />
-              <span>
-                Your teammates only need
-                <br />
-                your invitation. We’ll handle the rest.
-              </span>
-            </div>
-          </aside>
-        </div>
-        {projects.length > 0 && (
-          <section className="projects-section">
-            <div className="section-title">
-              <h2>Pick up where you left off</h2>
-              <span>
-                {projects.length} project{projects.length === 1 ? "" : "s"}
-              </span>
-            </div>
-            <div className="project-cards">
-              {projects.map((p, i) => (
+              <h2>
+                {session.connections.railway && workspaces.length > 1
+                  ? "Choose where it should live."
+                  : "Let Butler publish your app."}
+              </h2>
+              {!session.connections.railway ||
+              hostingReconnect ||
+              (hostingLoaded && !hostingFailed && workspaces.length === 0) ? (
+                <>
+                  <p>
+                    Approve Railway access, then you’ll come straight back to
+                    your idea.
+                  </p>
+                  <a
+                    className={
+                      "button primary full" +
+                      (!session.capabilities.railway ? " disabled" : "")
+                    }
+                    aria-disabled={!session.capabilities.railway}
+                    href={
+                      session.capabilities.railway
+                        ? "/auth/railway?returnTo=%2Fstart"
+                        : undefined
+                    }
+                  >
+                    Continue with Railway
+                    <Icon name="arrow" size={18} />
+                  </a>
+                  {!session.capabilities.railway && (
+                    <p className="quiet-note">
+                      Railway setup is being finished. Please try again shortly.
+                    </p>
+                  )}
+                </>
+              ) : !hostingLoaded ? (
+                <p className="inline-status">
+                  <Spinner />
+                  Checking your Railway account…
+                </p>
+              ) : hostingFailed ? (
                 <button
-                  key={p.id}
-                  className={`project-card project-tone-${i % 3}`}
-                  onClick={() => navigate(`/p/${p.id}`)}
+                  className="button primary full"
+                  onClick={() => {
+                    setError("");
+                    setHostingAttempt((n) => n + 1);
+                  }}
                 >
-                  <span className="project-monogram">
-                    {p.name.slice(0, 1).toUpperCase()}
-                  </span>
-                  <h3>{p.name}</h3>
-                  <p>{p.description}</p>
-                  <span className="project-card-foot">
-                    {p.state === "ready"
-                      ? "Open your workspace"
-                      : "Workspace preparing"}
-                    <Icon name="arrow" size={16} />
-                  </span>
+                  Try again
+                  <Icon name="refresh" size={18} />
                 </button>
-              ))}
-            </div>
-          </section>
-        )}
-      </main>
+              ) : (
+                <form
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    if (workspace) {
+                      localStorage.setItem(workspaceKey, workspace);
+                      setHostingConfirmed(true);
+                    }
+                  }}
+                >
+                  <label htmlFor="hosting-workspace">
+                    Your Railway workspace
+                  </label>
+                  <select
+                    id="hosting-workspace"
+                    value={workspace}
+                    onChange={(event) => setWorkspace(event.target.value)}
+                    required
+                  >
+                    <option value="">Choose a workspace</option>
+                    {workspaces.map((w) => (
+                      <option key={w.id} value={w.id}>
+                        {w.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button className="button primary full" disabled={!workspace}>
+                    Continue
+                    <Icon name="arrow" size={18} />
+                  </button>
+                </form>
+              )}
+            </section>
+          )}
+          {step === 2 && (
+            <form className="create-card onboarding-card" onSubmit={create}>
+              <label htmlFor="project-idea">Your idea</label>
+              <textarea
+                id="project-idea"
+                autoFocus
+                placeholder="A website for our supper club, with upcoming dinners and a way to join…"
+                value={description}
+                onChange={(event) => setDescription(event.target.value)}
+                maxLength={10000}
+                rows={5}
+                required
+                minLength={3}
+              />
+              <button
+                className="button primary full"
+                disabled={busy || description.trim().length < 3}
+              >
+                {busy ? <Spinner /> : <Icon name="spark" />}
+                {busy ? "Creating your project…" : "Create my project"}
+                {!busy && <Icon name="arrow" size={18} />}
+              </button>
+              <p className="quiet-note">
+                Next: sign in to Codex, then invite your team.
+              </p>
+            </form>
+          )}
+          {projects.length > 0 && <ProjectCards projects={projects} />}
+        </main>
+      )}
+      {memberSaving && projects.length > 0 && (
+        <SaveAccess
+          session={session}
+          projectId={projects[0].id}
+          onClose={() => setMemberSaving(false)}
+        />
+      )}
     </div>
   );
 }
@@ -920,6 +1247,72 @@ function Invite({
   );
 }
 
+function ShareWebsite({
+  projectId,
+  onClose,
+}: {
+  projectId: string;
+  onClose: () => void;
+}) {
+  const [share, setShare] = useState<{ url: string; qr: string } | null>(null),
+    [message, setMessage] = useState("");
+  useEffect(() => {
+    api<{ url: string; qr: string }>(`/api/projects/${projectId}/share`)
+      .then(setShare)
+      .catch((e) => setMessage(e.message));
+  }, [projectId]);
+  return (
+    <Modal title="Share the current website." onClose={onClose}>
+      <p>
+        Scan to open the live website on any phone. Anyone can look — they won’t
+        be joining your team.
+      </p>
+      {share ? (
+        <>
+          <span className="share-live-label">CURRENT WEBSITE · LIVE</span>
+          <img
+            className="share-website-qr"
+            src={share.qr}
+            alt="QR code for the current website"
+          />
+          <input
+            className="copy-input"
+            aria-label="Current website link"
+            readOnly
+            value={share.url}
+            onFocus={(event) => event.target.select()}
+          />
+          <button
+            className="button primary full"
+            onClick={() =>
+              copy(share.url)
+                .then(() => setMessage("Website link copied."))
+                .catch((e) => setMessage(e.message))
+            }
+          >
+            <Icon name="copy" size={16} />
+            Copy website link
+          </button>
+          <a
+            className="text-button share-open-link"
+            href={share.url}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Open website <Icon name="external" size={13} />
+          </a>
+        </>
+      ) : (
+        !message && <Spinner />
+      )}
+      {message && (
+        <p className="inline-status" role="status">
+          {message}
+        </p>
+      )}
+    </Modal>
+  );
+}
 function SaveAccess({
   session,
   projectId,
@@ -1134,35 +1527,71 @@ function CodexConnection({
             Connect Codex
           </button>
         )}
-        {connection.message && <small>{connection.message}</small>}
-        {error && <small role="alert">{error}</small>}
+        {connection.message && <ButlerText text={connection.message} />}
+        {error && (
+          <div role="alert">
+            <ButlerText text={error} kind="error" />
+          </div>
+        )}
       </div>
     </div>
   );
 }
 const jobLabel: Record<string, string> = {
-  queued: "Queued",
-  working: "Working",
-  reviewing: "Reviewing",
-  deploying: "Publishing",
-  live: "Live",
+  queued: "Waiting to start",
+  working: "Making your changes",
+  reviewing: "Checking your changes",
+  building_preview: "Preparing preview",
+  awaiting_approval: "Ready to try",
+  creating_pr: "Preparing to publish",
+  deploying: "Updating website",
+  live: "On the website",
   unchanged: "Done",
-  failed: "Needs a hand",
-  preview_failed: "Preview needs a hand",
-  publish_failed: "Publishing needs a hand",
-  needs_attention: "Needs a hand",
+  failed: "Butler paused",
+  preview_failed: "Preview couldn’t load",
+  publish_failed: "Website hasn’t updated",
+  needs_attention: "Changes need more work",
+  superseded: "Updated in a newer preview",
 };
-function JobState({ job }: { job: Job }) {
+function elapsed(start: number, end: number) {
+  const seconds = Math.max(0, Math.floor((end - start) / 1000));
+  return seconds < 60
+    ? `${seconds}s`
+    : seconds < 3600
+      ? `${Math.floor(seconds / 60)}m ${seconds % 60}s`
+      : `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+function statusLabel(job: Pick<Job, "state" | "error">) {
+  return job.state === "needs_attention" &&
+    /bwrap|namespace|Review could not|reviewer process|review.*retry|review.*paused/i.test(
+      job.error || "",
+    )
+    ? "Website checks paused"
+    : jobLabel[job.state] || "Getting ready";
+}
+function JobState({ job, clock = Date.now() }: { job: Job; clock?: number }) {
   return (
     <span className={"job-state state-" + job.state}>
       {["live", "unchanged"].includes(job.state) ? (
         <Icon name="check" size={12} />
-      ) : ["working", "reviewing", "deploying"].includes(job.state) ? (
+      ) : [
+          "working",
+          "reviewing",
+          "deploying",
+          "building_preview",
+          "creating_pr",
+        ].includes(job.state) ? (
         <Spinner />
       ) : (
         <i />
       )}
-      {jobLabel[job.state] || job.state}
+      {statusLabel(job)}
+      {job.startedAt && (
+        <span className="elapsed" aria-label="Elapsed time">
+          {" "}
+          · {elapsed(job.startedAt, job.finishedAt || clock)}
+        </span>
+      )}
     </span>
   );
 }
@@ -1179,28 +1608,173 @@ function Workspace({
   const [project, setProject] = useState<Project | null>(null),
     [error, setError] = useState(""),
     [invite, setInvite] = useState(false),
+    [sharingWebsite, setSharingWebsite] = useState(false),
     [saving, setSaving] = useState(false),
     [tab, setTab] = useState("chat"),
+    [teamSection, setTeamSection] = useState("activity"),
+    [sidebarOpen, setSidebarOpen] = useState(true),
+    [websiteExpanded, setWebsiteExpanded] = useState(false),
     [sending, setSending] = useState(false),
     [codexReady, setCodexReady] = useState(false),
-    [memberId, setMemberId] = useState("");
+    [memberId, setMemberId] = useState(""),
+    [chatId, setChatId] = useState(""),
+    [clock, setClock] = useState(Date.now());
   const [text, setText] = useState(
     () => localStorage.getItem(`butler-draft-${projectId}`) || "",
   );
-  const bottom = useRef<HTMLDivElement>(null),
+  const conversation = useRef<HTMLDivElement>(null),
     textarea = useRef<HTMLTextAreaElement>(null),
-    lastMessage = useRef(""),
+    scrollAfterSend = useRef(false),
     pendingKey = useRef<{ text: string; key: string } | null>(null),
     lastLive = useRef("");
   const [previewVersion, setPreviewVersion] = useState("");
+  const [frameReload, setFrameReload] = useState(0);
+  const [artifact, setArtifact] = useState<Job | null>(null);
+  const [approvalBusy, setApprovalBusy] = useState(false);
+  const [visibilityBusy, setVisibilityBusy] = useState("");
+  const [inspection, setInspection] = useState("");
+  const [historyLoading, setHistoryLoading] = useState("");
+  const [historyVersion, setHistoryVersion] = useState({ chat: 0, group: 0 });
+  const [catchUp, setCatchUp] = useState(false);
+  const seenKey = `butler-seen-${projectId}-${session.user?.id || "guest"}`;
+  function savedSeen(key: string): Record<string, number> {
+    try {
+      const value = JSON.parse(localStorage.getItem(key) || "{}");
+      return value && typeof value === "object" && !Array.isArray(value)
+        ? value
+        : {};
+    } catch {
+      return {};
+    }
+  }
+  const [seenState, setSeenState] = useState(() => ({
+    key: seenKey,
+    values: savedSeen(seenKey),
+  }));
+  const seen = useMemo(
+    () => (seenState.key === seenKey ? seenState.values : savedSeen(seenKey)),
+    [seenState, seenKey],
+  );
+  const notices = useMemo(
+    () => (project ? activityNotices(project, seen) : []),
+    [project, seen],
+  );
+  const markNotices = useCallback(
+    (items: Notice[]) =>
+      setSeenState((state) => {
+        const current =
+          state.key === seenKey ? state.values : savedSeen(seenKey);
+        const updates = items.filter((n) => n.at > (current[n.id] || 0));
+        if (!updates.length)
+          return state.key === seenKey
+            ? state
+            : { key: seenKey, values: current };
+        const next = { ...current };
+        for (const item of updates) next[item.id] = item.at;
+        localStorage.setItem(seenKey, JSON.stringify(next));
+        return { key: seenKey, values: next };
+      }),
+    [seenKey],
+  );
+  const readGroup = useCallback(
+    () => markNotices(notices.filter((n) => n.channel === "group")),
+    [markNotices, notices],
+  );
+  useEffect(() => {
+    if (!project || !sidebarOpen || websiteExpanded) return;
+    if (["updates", "team"].includes(tab))
+      markNotices(notices.filter((n) => n.channel === tab));
+  }, [tab, project, sidebarOpen, websiteExpanded, notices, markNotices]);
+  function openNotice(notice: Notice) {
+    markNotices([notice]);
+    setCatchUp(false);
+    setWebsiteExpanded(false);
+    if (notice.job?.isGroup || notice.channel === "group") selectPanel("group");
+    else if (notice.channel === "updates") selectPanel("updates");
+    else if (notice.memberId) viewChat(notice.memberId);
+    if (notice.job && notice.job.state === "awaiting_approval")
+      inspect(notice.job);
+  }
+  const unseen = notices.filter((n) => n.unread).length;
+  const activeAgents = notices.filter((n) => n.active).length;
+  const badge = (channel: string) => {
+    const count = notices.filter(
+      (n) => n.unread && n.channel === channel,
+    ).length;
+    return count ? (
+      <span
+        className="unread-badge"
+        aria-label={`${count} new ${channel} updates`}
+      >
+        {count > 99 ? "99+" : count}
+      </span>
+    ) : null;
+  };
+  const workspaceVisible = Boolean(
+    project &&
+    !(
+      project.isOwner &&
+      !project.codingReady &&
+      !codexReady &&
+      (project.state !== "ready" ||
+        project.jobs.every(
+          (job) => job.requestKey === "initial" && job.state === "queued",
+        ))
+    ),
+  );
+  useEffect(
+    () => (workspaceVisible ? attachWorkspaceViewport() : undefined),
+    [workspaceVisible],
+  );
+  useEffect(() => {
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !document.querySelector("dialog[open]"))
+        setWebsiteExpanded(false);
+    };
+    window.addEventListener("keydown", escape);
+    return () => window.removeEventListener("keydown", escape);
+  }, []);
   const refresh = useCallback(async () => {
     try {
       const data = await api<Project>(
-        `/api/projects/${projectId}${memberId ? "?member=" + memberId : ""}`,
+        `/api/projects/${projectId}?${new URLSearchParams({ ...(memberId ? { member: memberId } : {}), ...(chatId ? { chat: chatId } : {}) })}`,
       );
-      setProject(data);
+      setProject((current) => {
+        if (!current || current.id !== data.id) return data;
+        const sameChat =
+          (current.chatMember?.id || current.member.id) ===
+          (data.chatMember?.id || data.member.id);
+        return {
+          ...data,
+          messages: sameChat
+            ? mergeHistory(current.messages, data.messages)
+            : data.messages,
+          jobs: sameChat ? mergeHistory(current.jobs, data.jobs) : data.jobs,
+          historyBefore: sameChat ? current.historyBefore : data.historyBefore,
+          groupMessages: mergeHistory(
+            current.groupMessages || [],
+            data.groupMessages || [],
+          ),
+          groupHistoryBefore: current.groupHistoryBefore,
+          groupAgent: data.groupAgent
+            ? {
+                ...data.groupAgent,
+                jobs: mergeHistory(
+                  current.groupAgent?.jobs || [],
+                  data.groupAgent.jobs,
+                ),
+                messages: mergeHistory(
+                  current.groupAgent?.messages || [],
+                  data.groupAgent.messages,
+                ),
+              }
+            : current.groupAgent,
+        };
+      });
       setError("");
-      const live = data.jobs.filter((j) => j.state === "live").at(-1)?.id;
+      const live =
+        data.releases?.find((release) => release.isLive)?.sha ||
+        data.jobs.filter((j) => j.state === "live").at(-1)?.id;
       if (live && lastLive.current !== live) {
         lastLive.current = live;
         setPreviewVersion(live);
@@ -1208,8 +1782,97 @@ function Workspace({
     } catch (e) {
       setError((e as Error).message);
     }
-  }, [projectId, memberId]);
+  }, [projectId, memberId, chatId]);
+  useEffect(() => {
+    const timer = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  function viewChat(id: string) {
+    if (!project) return;
+    const own = project.ownMemberships.some((m) => m.id === id);
+    if (project.isOwner) {
+      const currentKey = chatId
+        ? `butler-draft-${projectId}-chat-${chatId}`
+        : `butler-draft-${projectId}`;
+      const nextKey = own
+        ? `butler-draft-${projectId}`
+        : `butler-draft-${projectId}-chat-${id}`;
+      if (currentKey !== nextKey) {
+        localStorage.setItem(currentKey, text);
+        setText(localStorage.getItem(nextKey) || "");
+        pendingKey.current = null;
+      }
+    }
+    if (own) {
+      setMemberId(id);
+      setChatId("");
+    } else setChatId(id);
+    setTab("chat");
+    setSidebarOpen(true);
+  }
+  function selectPanel(value: string) {
+    setTab(value);
+    setSidebarOpen(true);
+    if (value === "team") setTeamSection("activity");
+    if (value === "updates") setTeamSection("updates");
+  }
   const connected = useCallback(() => setCodexReady(true), []);
+  useEffect(() => {
+    if (project?.hostingProvider !== "boat") return;
+    const wake = () => {
+      if (document.visibilityState === "visible")
+        api(`/api/projects/${projectId}/wake`, {}).catch(() => {});
+    };
+    wake();
+    const timer = setInterval(wake, 60000);
+    window.addEventListener("focus", wake);
+    document.addEventListener("visibilitychange", wake);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", wake);
+      document.removeEventListener("visibilitychange", wake);
+    };
+  }, [project?.hostingProvider, projectId]);
+  useEffect(() => {
+    if (project?.hostingState === "ready")
+      setFrameReload((value) => value + 1);
+  }, [project?.hostingState]);
+  useEffect(() => {
+    if (project?.state !== "github_access" || !project.isOwner) return;
+    let checkedAt = 0,
+      checking = false,
+      alive = true;
+    const check = () => {
+      if (
+        document.visibilityState !== "visible" ||
+        checking ||
+        Date.now() - checkedAt < 3000
+      )
+        return;
+      checkedAt = Date.now();
+      checking = true;
+      api<{ ready: boolean }>(`/api/projects/${projectId}/github-access`, {})
+        .then((value) => {
+          if (alive && value.ready) return refresh();
+        })
+        .catch((e) => {
+          if (alive) setError(e.message);
+        })
+        .finally(() => {
+          checking = false;
+        });
+    };
+    check();
+    const timer = setInterval(check, 10000);
+    window.addEventListener("focus", check);
+    document.addEventListener("visibilitychange", check);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      window.removeEventListener("focus", check);
+      document.removeEventListener("visibilitychange", check);
+    };
+  }, [project?.state, project?.isOwner, projectId, refresh]);
   useEffect(() => {
     refresh();
     const timer = setInterval(() => {
@@ -1225,29 +1888,110 @@ function Workspace({
       window.removeEventListener("focus", focus);
     };
   }, [refresh, refreshSession]);
-  useEffect(() => {
-    localStorage.setItem(`butler-draft-${projectId}`, text);
+  useLayoutEffect(() => {
+    localStorage.setItem(
+      chatId && project?.isOwner
+        ? `butler-draft-${projectId}-chat-${chatId}`
+        : `butler-draft-${projectId}`,
+      text,
+    );
     if (textarea.current) {
       textarea.current.style.height = "auto";
       textarea.current.style.height =
         Math.min(textarea.current.scrollHeight, 150) + "px";
     }
-  }, [text, projectId]);
-  useEffect(() => {
-    const latest = project?.messages.at(-1)?.id;
-    if (latest && latest !== lastMessage.current) {
-      const hadPrevious = Boolean(lastMessage.current);
-      lastMessage.current = latest;
-      if (hadPrevious && (!project?.isOwner || codexReady))
-        bottom.current?.scrollIntoView({
-          behavior: "smooth",
-          block: "nearest",
-        });
+  }, [text, projectId, chatId, project?.isOwner]);
+  const trackChatScroll = useLatestChat(
+    conversation,
+    project?.chatMember?.id || project?.member.id || "",
+    historyVersion.chat,
+    scrollAfterSend,
+  );
+  useLayoutEffect(() => {
+    const panel = conversation.current;
+    if (
+      project &&
+      tab === "chat" &&
+      sidebarOpen &&
+      !websiteExpanded &&
+      (!project.chatMember || project.chatMember.id === project.member.id) &&
+      panel &&
+      Math.abs(panel.scrollTop) < 140
+    )
+      markNotices(notices.filter((n) => n.channel === "chat" && !n.job));
+  }, [
+    project?.messages,
+    tab,
+    sidebarOpen,
+    websiteExpanded,
+    notices,
+    markNotices,
+  ]);
+  async function loadHistory(channel: "chat" | "group") {
+    if (!project || historyLoading) return;
+    const cursor =
+      channel === "group" ? project.groupHistoryBefore : project.historyBefore;
+    if (!cursor) return;
+    const selectedChat = project.chatMember?.id || project.member.id;
+    setHistoryLoading(channel);
+    try {
+      const page = await api<{
+        items: (ChatMessage & GroupMessage)[];
+        before: string | null;
+        jobs?: Job[];
+      }>(
+        `/api/projects/${projectId}/history?${new URLSearchParams({ channel, before: cursor, ...(memberId ? { member: memberId } : {}), ...(channel === "chat" ? { chat: selectedChat } : {}) })}`,
+      );
+      setProject((current) => {
+        if (!current || current.id !== projectId) return current;
+        if (channel === "group")
+          return {
+            ...current,
+            groupMessages: mergeHistory(
+              page.items.filter((m) => m.kind === "human"),
+              current.groupMessages || [],
+            ),
+            groupAgent: current.groupAgent
+              ? {
+                  ...current.groupAgent,
+                  jobs: mergeHistory(page.jobs || [], current.groupAgent.jobs),
+                  messages: mergeHistory(
+                    page.items.filter((m) => m.kind !== "human"),
+                    current.groupAgent.messages,
+                  ),
+                }
+              : null,
+            groupHistoryBefore: page.before,
+          };
+        if ((current.chatMember?.id || current.member.id) !== selectedChat)
+          return current;
+        return {
+          ...current,
+          messages: mergeHistory(page.items, current.messages),
+          jobs: mergeHistory(page.jobs || [], current.jobs),
+          historyBefore: page.before,
+        };
+      });
+      setHistoryVersion((current) => ({
+        ...current,
+        [channel]: current[channel] + 1,
+      }));
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setHistoryLoading("");
     }
-  }, [project?.messages]);
+  }
   async function send(event?: React.FormEvent) {
     event?.preventDefault();
-    if (!text.trim() || sending || !project) return;
+    if (
+      !text.trim() ||
+      sending ||
+      !project ||
+      (project.readOnly && !project.canSteerChat) ||
+      (chatId && chatId !== project.member.id && !project.canSteerChat)
+    )
+      return;
     setSending(true);
     setError("");
     const draft = text;
@@ -1256,9 +2000,10 @@ function Workspace({
         ? pendingKey.current
         : { text: draft, key: crypto.randomUUID() };
     pendingKey.current = request;
+    scrollAfterSend.current = true;
     try {
       await api(
-        `/api/projects/${projectId}/messages${memberId ? "?member=" + memberId : ""}`,
+        `/api/projects/${projectId}/messages?${new URLSearchParams({ ...(memberId ? { member: memberId } : {}), ...(chatId && project.canSteerChat ? { chat: chatId } : {}) })}`,
         { text: draft, requestKey: request.key },
       );
       setText("");
@@ -1277,6 +2022,120 @@ function Workspace({
     } catch (e) {
       setError((e as Error).message);
     }
+  }
+  function inspect(job: Job) {
+    setArtifact(job);
+    setInspection("");
+    setTab("preview");
+  }
+  function showCurrentWebsite() {
+    setArtifact(null);
+    setTab("preview");
+  }
+  async function markInspected(job: Job) {
+    if (
+      !project ||
+      (job.memberId !== project.member.id &&
+        !project.isOwner &&
+        !job.canApprove) ||
+      job.state !== "awaiting_approval"
+    )
+      return;
+    try {
+      await api(
+        `/api/projects/${projectId}/jobs/${job.id}/inspect${memberId ? "?member=" + memberId : ""}`,
+        { sha: job.changeSha },
+      );
+      setInspection(job.id);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+  async function approve(job: Job) {
+    setApprovalBusy(true);
+    setError("");
+    try {
+      await api(
+        `/api/projects/${projectId}/jobs/${job.id}/approve${memberId ? "?member=" + memberId : ""}`,
+        { sha: job.changeSha },
+      );
+      setArtifact(null);
+      setTab(job.isGroup ? "group" : "chat");
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setApprovalBusy(false);
+    }
+  }
+  async function retryPreview(job: Job) {
+    try {
+      await api(
+        `/api/projects/${projectId}/jobs/${job.id}/retry${memberId ? "?member=" + memberId : ""}`,
+        {},
+      );
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+  async function setPreviewDismissed(job: Job, dismissed: boolean) {
+    setVisibilityBusy(job.id);
+    setError("");
+    try {
+      await api(
+        `/api/projects/${projectId}/jobs/${job.id}/visibility${memberId ? "?member=" + memberId : ""}`,
+        { dismissed, revision: job.requestRevision || 0, sha: job.changeSha },
+      );
+      if (dismissed && artifact?.id === job.id) setArtifact(null);
+      await refresh();
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setVisibilityBusy("");
+    }
+  }
+  async function react(
+    targetType: ReactionTarget,
+    targetId: string,
+    emoji: string,
+    active: boolean,
+  ) {
+    try {
+      const response = await api<{ reactions: ReactionSummary }>(
+        `/api/projects/${projectId}/reactions${memberId ? "?member=" + memberId : ""}`,
+        { targetType, targetId, emoji, active },
+      );
+      setProject((current) =>
+        current?.id === projectId
+          ? { ...current, reactions: response.reactions }
+          : current,
+      );
+    } catch (error) {
+      setError((error as Error).message);
+      throw error;
+    }
+  }
+  async function sendGroupMessage(text: string, requestKey: string) {
+    const response = await api<{ message: GroupMessage }>(
+      `/api/projects/${projectId}/group/messages${memberId ? "?member=" + memberId : ""}`,
+      { text, requestKey },
+    );
+    setProject((current) =>
+      current?.id === projectId
+        ? {
+            ...current,
+            groupMessages: [
+              ...(current.groupMessages || []).filter(
+                (message) => message.id !== response.message.id,
+              ),
+              response.message,
+            ],
+          }
+        : current,
+    );
+    if (response.message.jobId) await refresh();
   }
   if (!project)
     return (
@@ -1301,8 +2160,153 @@ function Workspace({
       "ready",
     ].indexOf(project.state),
     latestJob = project.jobs.at(-1);
+  const chatMember = project.chatMember || project.member,
+    readOnly = Boolean(project.readOnly && !project.canSteerChat),
+    steering = Boolean(project.readOnly && project.canSteerChat);
+  const allJobs = [...project.jobs, ...(project.groupAgent?.jobs || [])];
+  const shownArtifact = artifact
+    ? allJobs.find((j) => j.id === artifact.id) || artifact
+    : null;
+  const canApprove =
+    (shownArtifact?.memberId === project.member.id ||
+      project.isOwner ||
+      shownArtifact?.canApprove) &&
+    shownArtifact?.state === "awaiting_approval" &&
+    !shownArtifact.dismissedAt;
+  const latestPreview = (
+    tab === "group" ? project.groupAgent?.jobs || project.jobs : project.jobs
+  )
+    .filter((job) => jobPreviewUrl(job) && !job.dismissedAt)
+    .at(-1);
+  const latestHumanRequest = project.jobs
+    .filter((job) => !job.requestKey?.startsWith("review-fix:"))
+    .at(-1);
+  const currentUnpublished =
+    latestHumanRequest &&
+    !latestHumanRequest.approvedAt &&
+    !latestHumanRequest.prUrl &&
+    [
+      "queued",
+      "working",
+      "building_preview",
+      "awaiting_approval",
+      "preview_failed",
+      "failed",
+    ].includes(latestHumanRequest.state)
+      ? latestHumanRequest
+      : undefined;
+  const lastRequestByJob = new Map(
+    project.messages
+      .filter((message) => message.role === "user")
+      .map((message) => [message.jobId, message.id]),
+  );
+  const websiteUrl = shownArtifact
+    ? jobPreviewUrl(shownArtifact)
+    : project.appUrl;
+  const firstSetup =
+    project.isOwner &&
+    !project.codingReady &&
+    !codexReady &&
+    (preparing ||
+      project.jobs.every(
+        (job) => job.requestKey === "initial" && job.state === "queued",
+      ));
+  if (firstSetup)
+    return (
+      <div className="dashboard">
+        <header className="site-header">
+          <Brand />
+          <span className="header-note">{project.name}</span>
+        </header>
+        <main className="dashboard-main onboarding-main">
+          <OnboardingProgress step={3} />
+          <div className="eyebrow">STEP 4 OF 4</div>
+          <h1>
+            {project.githubAccess
+              ? "Approve your project on GitHub."
+              : preparing
+                ? "We’re setting things up."
+                : "One last sign-in."}
+          </h1>
+          <p className="page-description">
+            {preparing
+              ? "Your idea is saved. Butler is creating your project and getting your team’s workspace ready."
+              : "Connect your Codex subscription once. Then invite everyone to their own Butler."}
+          </p>
+          <section className="create-card onboarding-card">
+            {project.githubAccess ? (
+              <>
+                <p>
+                  Your project files are created. GitHub needs your approval
+                  before Butler can finish setup.
+                </p>
+                <p>
+                  Keep <strong>Only select repositories</strong>, add{" "}
+                  <strong style={{ overflowWrap: "anywhere" }}>
+                    {project.githubAccess.repo.split("/")[1]}
+                  </strong>
+                  , then click Install or Save.
+                </p>
+                <a
+                  className="button primary full"
+                  href={project.githubAccess.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Approve project access <Icon name="external" size={18} />
+                </a>
+                <p className="quiet-note">
+                  Come back here afterward. Butler will resume your saved
+                  project.
+                </p>
+              </>
+            ) : project.state === "github_authorization" ? (
+              <>
+                <p>
+                  Your idea is saved. Reconnect GitHub so Butler can create its
+                  new private repository.
+                </p>
+                <a
+                  className="button primary full"
+                  href={`/auth/github?purpose=create&returnTo=${encodeURIComponent(`/p/${project.id}`)}`}
+                >
+                  Reconnect GitHub
+                </a>
+              </>
+            ) : preparing ? (
+              <>
+                <p className="inline-status" role="status">
+                  <Spinner />
+                  {project.state === "repository"
+                    ? "Creating your project files…"
+                    : project.state === "failed"
+                      ? "Setup needs another try."
+                      : "Preparing your workspace…"}
+                </p>
+                {project.error && <Alert>{project.error}</Alert>}
+                {["failed", "retrying"].includes(project.state) && (
+                  <button className="button primary full" onClick={retry}>
+                    Try again
+                    <Icon name="refresh" size={18} />
+                  </button>
+                )}
+              </>
+            ) : (
+              <CodexConnection project={project} onConnected={connected} />
+            )}
+          </section>
+          {error && <Alert>{error}</Alert>}
+        </main>
+      </div>
+    );
   return (
-    <div className="workspace-shell">
+    <div
+      className={
+        "workspace-shell" +
+        (tab === "preview" ? " viewing-website" : "") +
+        (websiteExpanded ? " website-expanded" : "")
+      }
+    >
       <header className="workspace-header">
         <Brand small />
         <span className="header-divider" />
@@ -1310,11 +2314,50 @@ function Workspace({
           <strong>{project.name}</strong>
           <small>Your shared creation</small>
         </div>
+        <nav className="desktop-workspace-nav" aria-label="Workspace panels">
+          {[
+            ["chat", "chat", "Chat"],
+            ["group", "chat", "Group chat"],
+            ["team", "users", "Team"],
+            ["updates", "check", "Updates"],
+          ].map(([value, icon, label]) => (
+            <button
+              key={value}
+              aria-label={label}
+              aria-pressed={
+                sidebarOpen &&
+                (value === "chat"
+                  ? !["team", "updates", "group"].includes(tab)
+                  : tab === value)
+              }
+              onClick={() => selectPanel(value)}
+            >
+              <Icon name={icon} size={15} />
+              {label}
+              {badge(value)}
+            </button>
+          ))}
+        </nav>
         <div className="workspace-header-actions">
+          {session.user && !session.user.isGuest && <GeminiSettings />}
+          <button
+            className="catch-up-button"
+            onClick={() => setCatchUp(true)}
+            aria-label="What’s new"
+          >
+            <Icon name="bell" size={16} />
+            <span>What’s new</span>
+            {activeAgents > 0 && (
+              <small className="working-glance">{activeAgents} working</small>
+            )}
+            {unseen > 0 && (
+              <b className="unread-badge">{unseen > 99 ? "99+" : unseen}</b>
+            )}
+          </button>
           <button
             className="avatar-stack team-toggle"
             aria-label="Show your team"
-            onClick={() => setTab(tab === "team" ? "chat" : "team")}
+            onClick={() => selectPanel(tab === "team" ? "chat" : "team")}
           >
             {project.members.slice(0, 4).map((m, i) => (
               <Avatar key={m.id} name={m.name} index={i} />
@@ -1340,54 +2383,186 @@ function Workspace({
       </header>
       <div className="mobile-tabs" role="tablist" aria-label="Workspace panels">
         {[
-          ["chat", "chat", "Your agent"],
+          ["chat", "chat", "Your chat"],
+          ["group", "chat", "Group"],
           ["preview", "grid", "Website"],
           ["team", "users", "Team"],
+          ["updates", "check", "Updates"],
         ].map(([value, icon, label]) => (
           <button
             key={value}
             role="tab"
+            aria-label={value === "group" ? "Group chat" : label}
             aria-selected={tab === value}
             className={tab === value ? "selected" : ""}
-            onClick={() => setTab(value)}
+            onClick={() => selectPanel(value)}
           >
             <Icon name={icon} size={16} />
             {label}
+            {badge(value)}
           </button>
         ))}
       </div>
-      <main className={"project-layout tab-" + tab}>
-        <section className="preview-panel">
-          <div className="panel-top">
-            <span>
-              <span
-                className={"status-dot" + (project.appUrl ? " green" : "")}
-              />
-              {project.appUrl
-                ? "Your shared website"
-                : "Your website starts here"}
-            </span>
-            {project.appUrl && (
-              <a
-                className="icon-button"
-                href={project.appUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                aria-label="Open website"
+      <main
+        className={
+          "project-layout tab-" + tab + (sidebarOpen ? "" : " sidebar-closed")
+        }
+      >
+        <section
+          className={
+            "preview-panel" +
+            (shownArtifact ? " showing-preview" : " showing-current")
+          }
+          aria-label="Website viewer"
+        >
+          <div className="website-toolbar">
+            <button
+              className="icon-button viewer-back"
+              aria-label="Back to chat"
+              title="Back to chat"
+              onClick={() => {
+                setWebsiteExpanded(false);
+                selectPanel(shownArtifact?.isGroup ? "group" : "chat");
+              }}
+            >
+              <Icon name="arrow" size={18} />
+            </button>
+            <div
+              className="website-version-tabs"
+              role="tablist"
+              aria-label="Website version"
+            >
+              <button
+                role="tab"
+                aria-label="Current website"
+                aria-selected={!shownArtifact}
+                onClick={showCurrentWebsite}
               >
-                <Icon name="external" size={16} />
-              </a>
-            )}
-          </div>
-          <div className="preview-surface">
-            {project.appUrl ? (
-              <iframe
-                key={previewVersion}
-                src={
-                  project.appUrl +
-                  (previewVersion ? "?butler=" + previewVersion : "")
+                <span>Current website</span>
+                <small>{project.appUrl ? "Live" : "Getting ready"}</small>
+              </button>
+              <button
+                role="tab"
+                aria-label="Preview"
+                aria-selected={Boolean(shownArtifact)}
+                disabled={!latestPreview && !shownArtifact}
+                title={shownArtifact?.prTitle || "Inspect a change preview"}
+                onClick={() => {
+                  const job = shownArtifact || latestPreview;
+                  if (job) inspect(job);
+                }}
+              >
+                <span>Preview</span>
+                <small>
+                  {shownArtifact?.state === "live" ? "Copy" : "Not live"}
+                </small>
+              </button>
+            </div>
+            <div className="website-toolbar-actions">
+              <button
+                className="icon-button viewer-notices"
+                aria-label="What’s new in your project"
+                title="What’s new"
+                onClick={() => setCatchUp(true)}
+              >
+                <Icon name="bell" size={16} />
+                {unseen > 0 && <span className="unread-dot" />}
+              </button>
+              <button
+                className="icon-button"
+                disabled={!websiteUrl}
+                onClick={() => setFrameReload((value) => value + 1)}
+                aria-label={
+                  shownArtifact
+                    ? "Refresh change preview"
+                    : "Refresh current website"
                 }
-                title={project.name + " live website"}
+                title="Refresh website"
+              >
+                <Icon name="refresh" size={16} />
+              </button>
+              <button
+                className="icon-button"
+                disabled={!project.appUrl}
+                onClick={() => setSharingWebsite(true)}
+                aria-label="Share current website"
+                title="Share current website"
+              >
+                <Icon name="share" size={16} />
+              </button>
+              {websiteUrl && (
+                <a
+                  className="icon-button"
+                  href={websiteUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={
+                    shownArtifact
+                      ? "Open change preview in new tab"
+                      : "Open current website in new tab"
+                  }
+                  title="Open in new tab"
+                >
+                  <Icon name="external" size={16} />
+                </a>
+              )}
+              <button
+                className="icon-button viewer-expand"
+                onClick={() => setWebsiteExpanded((value) => !value)}
+                aria-label={
+                  websiteExpanded ? "Exit expanded website" : "Expand website"
+                }
+                title={
+                  websiteExpanded ? "Exit expanded website" : "Expand website"
+                }
+              >
+                <Icon name={websiteExpanded ? "close" : "expand"} size={17} />
+              </button>
+            </div>
+          </div>
+          {project.hostingProvider === "boat" && (
+            <p className="hosting-note" role="status">
+              {["sleeping", "stopping"].includes(project.hostingState || "")
+                ? "Waking your project. Your website will return shortly…"
+                : "Your website and worker sleep after 15 minutes away. Open this project in Butler to wake them."}
+            </p>
+          )}
+          {error && (
+            <div className="viewer-error">
+              <Alert>{error}</Alert>
+              <button
+                className="icon-button"
+                aria-label="Dismiss website notice"
+                onClick={() => setError("")}
+              >
+                <Icon name="close" size={14} />
+              </button>
+            </div>
+          )}
+          <div className="preview-surface">
+            {websiteUrl ? (
+              <iframe
+                key={
+                  shownArtifact
+                    ? shownArtifact.id +
+                      shownArtifact.changeSha +
+                      (shownArtifact.artifactReadyAt || 0) +
+                      frameReload
+                    : previewVersion + frameReload
+                }
+                src={
+                  websiteUrl +
+                  (!shownArtifact && previewVersion
+                    ? "?butler=" + previewVersion
+                    : "")
+                }
+                title={
+                  project.name +
+                  (shownArtifact ? " — change preview" : " — current website")
+                }
+                onLoad={() => {
+                  if (shownArtifact) markInspected(shownArtifact);
+                }}
                 sandbox="allow-scripts allow-forms allow-same-origin allow-popups"
               />
             ) : (
@@ -1411,272 +2586,771 @@ function Workspace({
                 </div>
               </div>
             )}
-          </div>
-          <div className="preview-bottom">
-            <span>
-              <Icon name="users" size={14} />
-              {project.members.length} person
-              {project.members.length === 1 ? "" : "s"} making this together
-            </span>
-            {project.isOwner && project.repoUrl && (
-              <a
-                href={project.repoUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Project files ↗
-              </a>
+            {shownArtifact && websiteUrl && (
+              <div className="preview-reactions">
+                <Reactions
+                  key={shownArtifact.id}
+                  targetType="preview"
+                  targetId={shownArtifact.id}
+                  summary={project.reactions}
+                  onReact={react}
+                />
+              </div>
             )}
           </div>
+          {canApprove && shownArtifact && (
+            <div className="preview-approval">
+              <span title={shownArtifact.prTitle}>
+                {shownArtifact.prTitle || "Your change is ready to try"}
+              </span>
+              <button
+                className="button primary compact"
+                disabled={
+                  approvalBusy ||
+                  (!shownArtifact.inspectedAt &&
+                    inspection !== shownArtifact.id)
+                }
+                onClick={() => approve(shownArtifact)}
+              >
+                {approvalBusy ? <Spinner /> : <Icon name="check" size={16} />}
+                Make this the website
+              </button>
+            </div>
+          )}
+          {shownArtifact?.dismissedAt && (
+            <div className="preview-approval">
+              <span>This preview is saved in your chat history.</span>
+              <button
+                className="button secondary compact"
+                disabled={visibilityBusy === shownArtifact.id}
+                onClick={() => setPreviewDismissed(shownArtifact, false)}
+              >
+                Restore preview
+              </button>
+            </div>
+          )}
         </section>
         <section className="conversation-panel">
           <div className="panel-top">
             <div className="agent-heading">
               <span className="mini-butler">✳</span>
               <div>
-                <strong>{project.member.name}’s Butler</strong>
-                <small>Your own space to make things</small>
-              </div>
-            </div>
-            {project.ownMemberships.length > 1 ? (
-              <select
-                className="workspace-picker"
-                aria-label="Your saved workspaces"
-                value={project.member.id}
-                onChange={(e) => setMemberId(e.target.value)}
-              >
-                {project.ownMemberships.map((m, i) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name} · workspace {i + 1}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <span className="saved-label">
-                <Icon name="check" size={12} />
-                Saved
-              </span>
-            )}
-          </div>
-          <div className="conversation-scroll">
-            {preparing && (
-              <div className="provision-card">
-                <span className="small-label">MAKING ROOM FOR YOUR TEAM</span>
-                <h3>
-                  {project.state === "failed"
-                    ? "Let’s get your workspace ready."
-                    : project.state === "retrying"
-                      ? "Giving setup another try…"
-                      : "Your workspace is taking shape."}
-                </h3>
-                <p>Your ideas are saved while we prepare everything.</p>
-                <div className="setup-steps">
-                  {[
-                    "Create project",
-                    "Prepare workspace",
-                    "Publish website",
-                  ].map((label, i) => (
-                    <span
-                      key={label}
-                      className={
-                        stage > i + 1
-                          ? "complete"
-                          : stage === i + 1
-                            ? "current"
-                            : ""
-                      }
-                    >
-                      {stage > i + 1 ? <Icon name="check" size={12} /> : <i />}
-                      {label}
-                    </span>
-                  ))}
-                </div>
-                {project.error && project.isOwner && (
-                  <>
-                    <p className="setup-error">{project.error}</p>
-                    <button className="text-button" onClick={retry}>
-                      Try again <Icon name="refresh" size={13} />
-                    </button>
-                  </>
-                )}
-              </div>
-            )}
-            {project.isOwner &&
-              project.state === "ready" &&
-              project.tasks.some((task) => task.state === "failed") && (
-                <Alert>
-                  Publishing needs another try. Your team’s work is saved.
-                  <button className="text-button" onClick={retry}>
-                    Retry publishing <Icon name="refresh" size={13} />
-                  </button>
-                </Alert>
-              )}
-            {latestJob?.error && !project.isOwner && (
-              <Alert>
-                Your work is saved. This change needs another try before it can
-                go live.
-              </Alert>
-            )}
-            {project.isOwner && (
-              <CodexConnection project={project} onConnected={connected} />
-            )}
-            <div className="agent-welcome">
-              <span className="mini-butler">✳</span>
-              <div>
-                <p>
-                  Hi {project.member.name.split(" ")[0]}. What would you like to
-                  make?
-                </p>
+                <strong>{chatMember.name}’s Butler</strong>
                 <small>
-                  Tell me in your own words. I’ll build it, get it reviewed, and
-                  help bring it to the website.
+                  {steering
+                    ? "Team lead · guiding this agent"
+                    : readOnly
+                      ? "Watching your teammate’s chat"
+                      : "Your chat · visible to your team"}
                 </small>
               </div>
             </div>
-            {project.messages.map((message) => {
-              const job = project.jobs.find((j) => j.id === message.jobId);
-              return (
-                <div
-                  key={message.id}
-                  className={"message message-" + message.role}
+            <div className="side-panel-actions">
+              {project.members.length > 1 ? (
+                <select
+                  className="workspace-picker"
+                  aria-label="Choose a team chat"
+                  value={chatMember.id}
+                  onChange={(e) => viewChat(e.target.value)}
                 >
-                  {message.role === "assistant" && (
-                    <span className="mini-butler">✳</span>
-                  )}
-                  <div className="message-content">
-                    <p>{message.text}</p>
-                    {message.role === "user" && job && <JobState job={job} />}
+                  {project.members.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name}
+                      {project.ownMemberships.some((own) => own.id === m.id)
+                        ? " (you)"
+                        : ""}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <span className="saved-label">
+                  <Icon name="check" size={12} />
+                  Saved
+                </span>
+              )}
+              <button
+                className="icon-button close-side-panel"
+                aria-label="Hide chat"
+                title="Hide chat"
+                onClick={() => setSidebarOpen(false)}
+              >
+                <Icon name="close" size={16} />
+              </button>
+            </div>
+          </div>
+          <div
+            className="conversation-scroll latest-chat"
+            key={chatMember.id}
+            ref={conversation}
+            onScroll={trackChatScroll}
+          >
+            <div className="conversation-history">
+              {project.historyBefore && (
+                <button
+                  className="text-button load-history"
+                  disabled={historyLoading === "chat"}
+                  onClick={() => loadHistory("chat")}
+                >
+                  {historyLoading === "chat"
+                    ? "Loading earlier messages…"
+                    : "Load earlier messages"}
+                </button>
+              )}
+              {preparing && (
+                <div className="provision-card">
+                  <span className="small-label">MAKING ROOM FOR YOUR TEAM</span>
+                  <h3>
+                    {project.state === "failed"
+                      ? "Let’s get your workspace ready."
+                      : project.state === "retrying"
+                        ? "Giving setup another try…"
+                        : "Your workspace is taking shape."}
+                  </h3>
+                  <p>Your ideas are saved while we prepare everything.</p>
+                  <div className="setup-steps">
+                    {[
+                      "Create project",
+                      "Prepare workspace",
+                      "Publish website",
+                    ].map((label, i) => (
+                      <span
+                        key={label}
+                        className={
+                          stage > i + 1
+                            ? "complete"
+                            : stage === i + 1
+                              ? "current"
+                              : ""
+                        }
+                      >
+                        {stage > i + 1 ? (
+                          <Icon name="check" size={12} />
+                        ) : (
+                          <i />
+                        )}
+                        {label}
+                      </span>
+                    ))}
                   </div>
-                </div>
-              );
-            })}
-            {latestJob &&
-              ["working", "reviewing", "deploying"].includes(
-                latestJob.state,
-              ) && (
-                <div className="working-line">
-                  <span className="mini-butler">✳</span>
-                  <Spinner />
-                  <span>
-                    {latestJob.state === "working"
-                      ? "Working on your idea…"
-                      : latestJob.state === "reviewing"
-                        ? "Making sure everything works together…"
-                        : "Publishing your change…"}
-                  </span>
+                  {project.error && project.isOwner && (
+                    <>
+                      <div className="setup-error">
+                        <ButlerText text={project.error} kind="error" />
+                      </div>
+                      <button className="text-button" onClick={retry}>
+                        Try again <Icon name="refresh" size={13} />
+                      </button>
+                    </>
+                  )}
                 </div>
               )}
-            {project.jobs
-              .filter((j) => j.previewUrl)
-              .slice(-1)
-              .map((job) => (
-                <a
-                  key={job.id}
-                  className="preview-link"
-                  href={job.previewUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <Icon name="grid" size={16} />
-                  {job.state === "live"
-                    ? "Your change has been published"
-                    : "Take a look at your change"}
-                  <Icon name="external" size={14} />
-                </a>
-              ))}
-            {session.user?.isGuest && project.messages.length > 0 && (
-              <button
-                className="save-access-card"
-                onClick={() => setSaving(true)}
-              >
-                <Icon name="lock" size={16} />
-                <span>
-                  <strong>Make yourself at home.</strong>
-                  <small>Save access to return from any device.</small>
-                </span>
-                <Icon name="arrow" size={16} />
-              </button>
-            )}
-            {error && <Alert>{error}</Alert>}
-            <div ref={bottom} />
-          </div>
-          <form className="composer" onSubmit={send}>
-            <div className="composer-input">
-              <textarea
-                ref={textarea}
-                placeholder="What would you like to change?"
-                aria-label="Tell your agent what to change"
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-                maxLength={20000}
-                rows={2}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-                    e.preventDefault();
-                    send();
-                  }
-                }}
-              />
-              <button
-                type="submit"
-                className="send-button"
-                aria-label="Send request"
-                disabled={!text.trim() || sending}
-              >
-                {sending ? <Spinner /> : <Icon name="arrow" size={21} />}
-              </button>
-            </div>
-            <div className="composer-note">
-              <span>
-                {preparing
-                  ? "You can send ideas while we prepare."
-                  : !project.codingReady
-                    ? "Your lead is connecting Codex. Requests wait safely."
-                    : "Type it. Dictate it. Make it happen."}
-              </span>
-              <span>↵ ⌘ / Ctrl</span>
-            </div>
-          </form>
-        </section>
-        <section className="team-panel">
-          <div className="panel-top">
-            <strong>Your people</strong>
-            <span>{project.members.length}</span>
-          </div>
-          <div className="team-content">
-            {project.members.map((member, i) => (
-              <div className="team-member" key={member.id}>
-                <Avatar name={member.name} index={i} />
+              {project.isOwner &&
+                !readOnly &&
+                project.state === "ready" &&
+                project.tasks
+                  .filter((task) => task.state === "failed")
+                  .map((task, index) => (
+                    <Alert key={task.kind + index}>
+                      <strong>
+                        {task.kind === "worker-update"
+                          ? "Butler couldn’t update its workspace"
+                          : task.kind === "sync-history"
+                            ? "Website history could not be loaded"
+                            : task.kind === "artifact"
+                              ? "Your preview isn’t ready yet"
+                              : "Your website hasn’t updated yet"}
+                      </strong>
+                      <ButlerText
+                        text={
+                          task.error ||
+                          "Your work is saved. Try this step again."
+                        }
+                        kind="error"
+                      />
+                      <button className="text-button" onClick={retry}>
+                        Retry{" "}
+                        {task.kind === "worker-update"
+                          ? "workspace update"
+                          : task.kind === "sync-history"
+                            ? "history sync"
+                            : task.kind === "artifact"
+                              ? "preview"
+                              : "publishing"}{" "}
+                        <Icon name="refresh" size={13} />
+                      </button>
+                    </Alert>
+                  ))}
+              {project.isOwner && !readOnly && (
+                <CodexConnection project={project} onConnected={connected} />
+              )}
+              <div className="agent-welcome">
+                <span className="mini-butler">✳</span>
                 <div>
-                  <strong>{member.name}</strong>
+                  <p>
+                    {steering
+                      ? `You can guide ${chatMember.name}’s agent and approve their previews.`
+                      : readOnly
+                        ? `You’re watching ${chatMember.name}’s conversation.`
+                        : `Hi ${project.member.name.split(" ")[0]}. What would you like to make?`}
+                  </p>
                   <small>
-                    {member.role === "owner" ? "Team lead" : "Teammate"}
+                    {readOnly
+                      ? "Everyone on this project can follow the work here. Send requests from your own chat."
+                      : "Tell me in your own words. I’ll make a preview. Try it, then choose Make this the website when you’re happy with it."}
                   </small>
                 </div>
-                {member.id === project.member.id && <span>You</span>}
               </div>
-            ))}
-            {project.isOwner && (
-              <button
-                className="button ghost full"
-                onClick={() => setInvite(true)}
-              >
-                <Icon name="plus" size={16} />
-                Invite someone
-              </button>
-            )}
-            <h3>Coming together</h3>
-            {project.activity.map((job) => (
-              <div className="activity-item" key={job.id}>
-                <strong>{job.name}</strong>
-                <p>{job.text}</p>
-                <JobState job={job} />
-              </div>
-            ))}
+              {chatBubbles(project.messages).map((message) => {
+                const job = project.jobs.find((j) => j.id === message.jobId);
+                return (
+                  <div
+                    key={message.id}
+                    className={
+                      "message message-" +
+                      message.role +
+                      " message-kind-" +
+                      (message.kind || "message")
+                    }
+                  >
+                    {message.role === "assistant" && (
+                      <span className="mini-butler">✳</span>
+                    )}
+                    <div className="message-content">
+                      {message.authorName && (
+                        <small className="message-caption">
+                          {message.authorName}
+                          {message.authorRole === "lead" ? " · team lead" : ""}
+                        </small>
+                      )}
+                      {message.kind &&
+                        message.kind !== "message" &&
+                        message.kind !== "saved-preview" && (
+                          <small className="message-caption">
+                            {message.kind === "gemini"
+                              ? "Independent verification"
+                              : message.kind === "review"
+                              ? "Website checks"
+                              : message.kind === "error"
+                                ? "Update failed"
+                                : message.kind === "status"
+                                  ? "Butler"
+                                  : "Codex"}
+                            {message.createdAt
+                              ? ` · ${new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+                              : ""}
+                          </small>
+                        )}
+                      {message.kind === "saved-preview" && job ? (
+                        <article className="saved-preview-card">
+                          <small className="small-label">
+                            {job.dismissedAt
+                              ? "DISMISSED · SAVED HERE"
+                              : "PREVIEW IN CHAT HISTORY"}
+                          </small>
+                          <strong>{job.prTitle || message.text}</strong>
+                          <div className="artifact-card-actions">
+                            {job.dismissedAt && (
+                              <button
+                                className="button secondary compact"
+                                disabled={visibilityBusy === job.id}
+                                onClick={() => setPreviewDismissed(job, false)}
+                              >
+                                Restore preview
+                              </button>
+                            )}
+                            <button
+                              className="text-button"
+                              onClick={() => inspect(job)}
+                            >
+                              View preview <Icon name="arrow" size={13} />
+                            </button>
+                          </div>
+                        </article>
+                      ) : message.role === "user" ? (
+                        <p>{message.text}</p>
+                      ) : (
+                        <ButlerText
+                          text={message.text}
+                          kind={message.kind}
+                          diagnostics={message.diagnostics}
+                        />
+                      )}
+                      {message.role === "user" &&
+                        job &&
+                        lastRequestByJob.get(message.jobId) === message.id && (
+                          <JobState job={job} clock={clock} />
+                        )}
+                      {message.kind !== "saved-preview" && (
+                        <Reactions
+                          targetType="message"
+                          targetId={message.id}
+                          summary={project.reactions}
+                          onReact={react}
+                        />
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+              {latestJob?.error && (
+                <Alert>
+                  <strong>{statusLabel(latestJob)}</strong>
+                  <ButlerText
+                    text={latestJob.error}
+                    kind="error"
+                    developerUrl={latestJob.prUrl}
+                  />
+                  {!readOnly && latestJob.state === "preview_failed" ? (
+                    <button
+                      className="text-button"
+                      onClick={() => retryPreview(latestJob)}
+                    >
+                      Retry {latestJob.approvedAt ? "publishing" : "preview"}{" "}
+                      <Icon name="refresh" size={13} />
+                    </button>
+                  ) : (
+                    !readOnly &&
+                    !/automatically|bwrap|namespace/i.test(latestJob.error) && (
+                      <button
+                        className="text-button"
+                        onClick={() => {
+                          setText(
+                            "Please finish my changes and fix the problem you found.",
+                          );
+                          textarea.current?.focus({ preventScroll: true });
+                        }}
+                      >
+                        Ask Butler to fix this <Icon name="arrow" size={13} />
+                      </button>
+                    )
+                  )}
+                </Alert>
+              )}
+              {latestJob &&
+                [
+                  "working",
+                  "reviewing",
+                  "deploying",
+                  "building_preview",
+                  "creating_pr",
+                ].includes(latestJob.state) && (
+                  <div className="working-line">
+                    <span className="mini-butler">✳</span>
+                    <Spinner />
+                    <span>
+                      {latestJob.state === "working"
+                        ? "Working on your idea…"
+                        : latestJob.state === "building_preview"
+                          ? "Building your preview…"
+                          : latestJob.state === "creating_pr"
+                            ? "Getting your change ready for the website…"
+                            : latestJob.state === "reviewing"
+                              ? "Making sure everything works together…"
+                              : "Publishing your change…"}
+                      {latestJob.startedAt &&
+                        ` · ${elapsed(latestJob.startedAt, clock)}`}
+                    </span>
+                  </div>
+                )}
+              {project.jobs
+                .filter(
+                  (j) =>
+                    j.state === "awaiting_approval" &&
+                    j.artifactUrl &&
+                    !j.dismissedAt &&
+                    j.id === currentUnpublished?.id,
+                )
+                .slice(-1)
+                .map((job) => (
+                  <article className="artifact-card" key={job.id}>
+                    <span className="small-label">
+                      PREVIEW READY · NOT PUBLISHED
+                    </span>
+                    <strong>{job.prTitle || "Your change is ready"}</strong>
+                    <p>
+                      {steering
+                        ? "Inspect this change, then approve it for the shared website."
+                        : readOnly
+                          ? "Your teammate can inspect and approve this change."
+                          : "Try your change before it goes to the shared website."}
+                    </p>
+                    <div className="artifact-card-actions">
+                      <button
+                        className="button primary compact"
+                        onClick={() => inspect(job)}
+                      >
+                        <Icon name="grid" size={16} />
+                        Inspect preview <Icon name="arrow" size={16} />
+                      </button>
+                      <button
+                        className="text-button dismiss-preview"
+                        title="Hide this card for you. Restore it from chat history anytime."
+                        disabled={visibilityBusy === job.id}
+                        onClick={() => setPreviewDismissed(job, true)}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                    <Reactions
+                      targetType="preview"
+                      targetId={job.id}
+                      summary={project.reactions}
+                      onReact={react}
+                    />
+                  </article>
+                ))}
+              {project.jobs
+                .filter((j) => j.previewUrl && !j.dismissedAt)
+                .slice(-1)
+                .map((job) => (
+                  <button
+                    key={job.id}
+                    className="preview-link"
+                    onClick={() =>
+                      job.state === "live" ? showCurrentWebsite() : inspect(job)
+                    }
+                  >
+                    <Icon name="grid" size={16} />
+                    {job.state === "live"
+                      ? "View current website"
+                      : "View change preview"}
+                    <Icon name="arrow" size={14} />
+                  </button>
+                ))}
+              {session.user?.isGuest && project.messages.length > 0 && (
+                <button
+                  className="save-access-card"
+                  onClick={() => setSaving(true)}
+                >
+                  <Icon name="lock" size={16} />
+                  <span>
+                    <strong>Make yourself at home.</strong>
+                    <small>Save access to return from any device.</small>
+                  </span>
+                  <Icon name="arrow" size={16} />
+                </button>
+              )}
+              {error && <Alert>{error}</Alert>}
+            </div>
           </div>
+          {readOnly ? (
+            <div className="composer read-only-notice">
+              <p>You’re viewing {chatMember.name}’s chat.</p>
+              <button
+                className="button secondary full"
+                onClick={() => viewChat(project.member.id)}
+              >
+                Back to my chat <Icon name="arrow" size={16} />
+              </button>
+            </div>
+          ) : (
+            <form className="composer" onSubmit={send}>
+              <div className="composer-input">
+                <textarea
+                  ref={textarea}
+                  placeholder={
+                    steering
+                      ? `Guide ${chatMember.name}’s agent…`
+                      : "What would you like to change?"
+                  }
+                  aria-label={
+                    steering
+                      ? `Guide ${chatMember.name}’s agent`
+                      : "Tell your agent what to change"
+                  }
+                  value={text}
+                  onChange={(e) => setText(e.target.value)}
+                  maxLength={20000}
+                  rows={2}
+                  onKeyDown={(e) => {
+                    if (
+                      e.key === "Enter" &&
+                      !e.shiftKey &&
+                      !e.nativeEvent.isComposing &&
+                      e.keyCode !== 229
+                    ) {
+                      e.preventDefault();
+                      send();
+                    }
+                  }}
+                />
+                <button
+                  type="submit"
+                  className="send-button"
+                  aria-label="Send request"
+                  disabled={!text.trim() || sending}
+                >
+                  {sending ? <Spinner /> : <Icon name="arrow" size={21} />}
+                </button>
+              </div>
+              <div className="composer-note">
+                <span>
+                  {preparing
+                    ? "You can send ideas while we prepare."
+                    : !project.codingReady
+                      ? "Your lead is connecting Codex. Requests wait safely."
+                      : "Type it. Dictate it. Make it happen."}
+                </span>
+                <span>Enter sends · Shift+Enter for a new line</span>
+              </div>
+            </form>
+          )}
+        </section>
+        {tab === "group" && sidebarOpen && !websiteExpanded && (
+          <GroupChat
+            key={project.id + project.member.id}
+            projectId={project.id}
+            memberId={project.member.id}
+            messages={project.groupMessages || []}
+            reactions={project.reactions}
+            onSend={sendGroupMessage}
+            onReact={react}
+            onClose={() => setSidebarOpen(false)}
+            agent={project.groupAgent}
+            onInspect={inspect}
+            onDismiss={setPreviewDismissed}
+            onRetry={retryPreview}
+            visibilityBusy={visibilityBusy}
+            renderStatus={(job) => <JobState job={job} clock={clock} />}
+            onRead={readGroup}
+            historyBefore={project.groupHistoryBefore}
+            historyLoading={historyLoading === "group"}
+            historyVersion={historyVersion.group}
+            onHistory={() => loadHistory("group")}
+          />
+        )}
+        <section className="team-panel" aria-label="Team and website updates">
+          <div className="panel-top">
+            <strong>
+              {teamSection === "updates" ? "Website updates" : "Your team"}
+            </strong>
+            <span>{project.members.length}</span>
+            <button
+              className="icon-button close-side-panel"
+              aria-label="Hide team panel"
+              title="Hide team panel"
+              onClick={() => setSidebarOpen(false)}
+            >
+              <Icon name="close" size={16} />
+            </button>
+          </div>
+          <div
+            className="team-section-switch"
+            role="tablist"
+            aria-label="Team views"
+          >
+            <button
+              role="tab"
+              aria-selected={teamSection === "activity"}
+              onClick={() => selectPanel("team")}
+            >
+              People & activity
+            </button>
+            <button
+              role="tab"
+              aria-selected={teamSection === "updates"}
+              onClick={() => selectPanel("updates")}
+            >
+              Website updates
+            </button>
+          </div>
+          <div className="team-content">
+            {teamSection === "activity" ? (
+              <div className="team-overview">
+                <section className="team-roster" aria-label="Team members">
+                  <div className="team-section-heading">
+                    <h3>People</h3>
+                    <p>Your teammates and their Butlers.</p>
+                  </div>
+                  {project.members.map((member, i) => (
+                    <div className="team-member" key={member.id}>
+                      <Avatar name={member.name} index={i} />
+                      <div>
+                        <strong>{member.name}</strong>
+                        <small>
+                          {member.agentState
+                            ? `${statusLabel({ state: member.agentState })}${member.startedAt ? ` · ${elapsed(member.startedAt, member.finishedAt || clock)}` : ""}`
+                            : member.role === "owner"
+                              ? "Team lead"
+                              : "Teammate"}
+                        </small>
+                      </div>
+                      <button
+                        className="text-button"
+                        onClick={() => viewChat(member.id)}
+                      >
+                        {project.ownMemberships.some((m) => m.id === member.id)
+                          ? "My chat"
+                          : "View chat"}
+                      </button>
+                    </div>
+                  ))}
+                  {project.isOwner && (
+                    <button
+                      className="button ghost full"
+                      onClick={() => setInvite(true)}
+                    >
+                      <Icon name="plus" size={16} />
+                      Invite someone
+                    </button>
+                  )}
+                </section>
+                <section className="team-activity" aria-label="Team activity">
+                  <div className="team-section-heading">
+                    <h3>Team activity</h3>
+                    <p>Requests and work in progress.</p>
+                  </div>
+                  {project.activity.length === 0 && (
+                    <p className="quiet-note">
+                      Your team’s requests will appear here.
+                    </p>
+                  )}
+                  {project.activity.map((job) => (
+                    <div className="activity-item" key={job.id}>
+                      <button
+                        className="text-button"
+                        onClick={() =>
+                          job.isGroup
+                            ? selectPanel("group")
+                            : job.memberId && viewChat(job.memberId)
+                        }
+                      >
+                        <strong>{job.name}</strong>
+                      </button>
+                      <p>{job.text}</p>
+                      <JobState job={job} clock={clock} />
+                    </div>
+                  ))}
+                </section>
+              </div>
+            ) : (
+              <div className="release-history">
+                <div className="team-section-heading">
+                  <h3>Website updates</h3>
+                  <p>What changed, who made it, and when it went live.</p>
+                </div>
+                {(!project.releases || project.releases.length === 0) && (
+                  <p className="quiet-note">
+                    Follow your team’s changes as they’re added to the website.
+                  </p>
+                )}
+                {project.releases?.map((release) => (
+                  <article className="release-card" key={release.number}>
+                    <div className="release-top">
+                      <a
+                        href={release.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        Change #{release.number}{" "}
+                        <Icon name="external" size={12} />
+                      </a>
+                      <span
+                        className={
+                          release.isLive ? "release-live" : "release-pending"
+                        }
+                      >
+                        {release.isLive ? "Live" : "Publishing"}
+                      </span>
+                    </div>
+                    <strong>{release.title}</strong>
+                    <small>
+                      {release.author}
+                      {release.mergedAt
+                        ? ` · Checked ${new Date(release.mergedAt).toLocaleString()}`
+                        : " · Checked"}
+                    </small>
+                    {release.publishedAt && (
+                      <small>
+                        Published{" "}
+                        {new Date(release.publishedAt).toLocaleString()}
+                      </small>
+                    )}
+                    {release.isLive && project.appUrl && (
+                      <button
+                        className="text-button"
+                        onClick={showCurrentWebsite}
+                      >
+                        View current website <Icon name="arrow" size={12} />
+                      </button>
+                    )}
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
+          {project.isOwner && project.repoUrl && (
+            <a
+              className="team-project-files"
+              href={project.repoUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              <Icon name="github" size={13} />
+              Project files <Icon name="external" size={11} />
+            </a>
+          )}
         </section>
       </main>
+      {catchUp && (
+        <Modal title="What’s new" onClose={() => setCatchUp(false)}>
+          <p className="quiet-note">
+            Messages, previews and website updates. Jump straight to what
+            matters.
+          </p>
+          <div className="catch-up-list">
+            {notices.length ? (
+              notices.map((notice) => (
+                <button
+                  key={notice.id}
+                  className={
+                    "notice-item" + (notice.unread ? " notice-unread" : "")
+                  }
+                  onClick={() => openNotice(notice)}
+                >
+                  <span className="notice-symbol">
+                    {notice.job
+                      ? "✳"
+                      : notice.channel === "updates"
+                        ? "✓"
+                        : "↗"}
+                  </span>
+                  <span>
+                    <strong>{notice.title}</strong>
+                    <small>{notice.detail}</small>
+                    <time>
+                      {new Date(notice.at).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </time>
+                  </span>
+                  {notice.unread && <i aria-label="Unread" />}
+                </button>
+              ))
+            ) : (
+              <p className="quiet-note">
+                You’re up to date. New messages and previews will appear here.
+              </p>
+            )}
+          </div>
+          {unseen > 0 && (
+            <button
+              className="text-button"
+              onClick={() => markNotices(notices)}
+            >
+              Mark all as seen
+            </button>
+          )}
+        </Modal>
+      )}
       {invite && <Invite project={project} onClose={() => setInvite(false)} />}{" "}
+      {sharingWebsite && (
+        <ShareWebsite
+          projectId={projectId}
+          onClose={() => setSharingWebsite(false)}
+        />
+      )}
       {saving && (
         <SaveAccess
           session={session}
@@ -1699,7 +3373,7 @@ function Recover({ refresh }: { refresh: () => Promise<void> }) {
     api("/api/auth/recover", { token: secret })
       .then(async () => {
         await refresh();
-        navigate("/", true);
+        navigate("/projects", true);
       })
       .catch((e) => setError(e.message));
   }, [refresh]);
@@ -1750,11 +3424,15 @@ function EmailComplete({ refresh }: { refresh: () => Promise<void> }) {
   );
 }
 function InstallationSetup() {
-  const [secret] = useState(
-    () => new URLSearchParams(location.hash.slice(1)).get("token") || "",
-  );
+  const [secret] = useState(() => {
+    const value = new URLSearchParams(location.hash.slice(1)).get("token");
+    if (value) sessionStorage.setItem("butler-admin-link", value);
+    return value || sessionStorage.getItem("butler-admin-link") || "";
+  });
   const [status, setStatus] = useState<{
       github: boolean;
+      githubApp?: boolean;
+      githubAppName?: string;
       railway: boolean;
       publicUrl: string;
       railwaySettingsUrl: string;
@@ -1775,6 +3453,8 @@ function InstallationSetup() {
     }
     api<{
       github: boolean;
+      githubApp?: boolean;
+      githubAppName?: string;
       railway: boolean;
       publicUrl: string;
       railwaySettingsUrl: string;
@@ -1804,6 +3484,29 @@ function InstallationSetup() {
     } catch (e) {
       setError((e as Error).message);
     } finally {
+      setBusy("");
+    }
+  }
+  async function registerGithubApp() {
+    setBusy("github-app");
+    setError("");
+    try {
+      const result = await api<{ url: string; manifest: object }>(
+        "/api/setup/github-app/manifest",
+        { token: secret },
+      );
+      const form = document.createElement("form");
+      form.method = "POST";
+      form.action = result.url;
+      const input = document.createElement("input");
+      input.type = "hidden";
+      input.name = "manifest";
+      input.value = JSON.stringify(result.manifest);
+      form.append(input);
+      document.body.append(form);
+      form.submit();
+    } catch (e) {
+      setError((e as Error).message);
       setBusy("");
     }
   }
@@ -1891,53 +3594,79 @@ function InstallationSetup() {
                 </div>
                 {status.github && <Icon name="check" />}
               </div>
-              <a
-                className="button ghost full"
-                href={githubUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Open GitHub registration
-                <Icon name="external" size={16} />
-              </a>
               <p className="setup-instructions">
-                Name it Pocket Butler. Use the homepage and callback below if
-                GitHub doesn’t fill them automatically. Register the app and
-                generate a client secret.
+                Sign-in reads a profile only. Code access uses a separate GitHub
+                App with selected repositories, short-lived credentials, and no
+                repository administration or organization permissions.
               </p>
-              {urls("github")}
-              <label>
-                Client ID
-                <input
-                  autoComplete="off"
-                  value={githubId}
-                  onChange={(e) => setGithubId(e.target.value)}
-                  required
-                  placeholder="Paste from GitHub"
-                />
-              </label>
-              <label>
-                Client secret
-                <input
-                  type="password"
-                  autoComplete="new-password"
-                  value={githubSecret}
-                  onChange={(e) => setGithubSecret(e.target.value)}
-                  required
-                  placeholder="Paste the generated secret"
-                />
-              </label>
               <button
+                type="button"
                 className="button primary full"
-                disabled={Boolean(busy) || !githubId || !githubSecret}
+                disabled={Boolean(busy)}
+                onClick={registerGithubApp}
               >
-                {busy === "github" ? (
-                  <Spinner />
-                ) : (
-                  <Icon name="check" size={17} />
-                )}
-                Save GitHub
+                {busy === "github-app"
+                  ? "Opening GitHub…"
+                  : status.githubApp
+                    ? "Register a replacement repository app"
+                    : "Register limited repository app"}
               </button>
+              {status.githubApp && (
+                <p className="inline-status">
+                  Repository app configured: {status.githubAppName}
+                </p>
+              )}
+              <details className="optional-details">
+                <summary>Advanced: profile-only OAuth credentials</summary>
+                <a
+                  className="button ghost full"
+                  href={githubUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Open GitHub registration
+                  <Icon name="external" size={16} />
+                </a>
+                <p className="setup-instructions">
+                  These OAuth credentials are for profile sign-in only. Keep the
+                  existing values if already saved. The repository app above
+                  saves its own credentials automatically when you confirm
+                  registration.
+                </p>
+                {urls("github")}
+                <label>
+                  Client ID
+                  <input
+                    autoComplete="off"
+                    value={githubId}
+                    onChange={(e) => setGithubId(e.target.value)}
+                    required
+                    placeholder="Paste from GitHub"
+                  />
+                </label>
+                <label>
+                  Client secret
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={githubSecret}
+                    onChange={(e) => setGithubSecret(e.target.value)}
+                    required
+                    placeholder="Paste the generated secret"
+                  />
+                </label>
+                <button
+                  className="button primary full"
+                  disabled={Boolean(busy) || !githubId || !githubSecret}
+                >
+                  {busy === "github" ? (
+                    <Spinner />
+                  ) : (
+                    <Icon name="check" size={17} />
+                  )}
+                  Save GitHub
+                </button>
+              </details>
             </form>
             <form className="create-card" onSubmit={(e) => save("railway", e)}>
               <div className="card-heading">
@@ -1945,7 +3674,7 @@ function InstallationSetup() {
                   <Icon name="railway" />
                 </span>
                 <div>
-                  <h2>2. Railway</h2>
+                  <h2>Railway (optional legacy hosting)</h2>
                   <p>
                     {status.railway
                       ? "Connected — you can update it below."
@@ -2006,15 +3735,18 @@ function InstallationSetup() {
         ) : (
           !error && <Spinner />
         )}
-        {status?.github && status.railway && (
+        {status?.github && status.githubApp && (
           <div className="setup-complete">
             <Icon name="check" />
             <h2>Ready for your first team.</h2>
             <p>
-              Sign in with GitHub, connect your Railway account, and create a
+              Sign in with GitHub, connect your Boat account, and create a
               project. Codex sign-in happens inside the project.
             </p>
-            <a className="button primary" href="/auth/github">
+            <a
+              className="button primary"
+              href="/auth/github?purpose=create&returnTo=%2Fstart"
+            >
               Start your first project
               <Icon name="arrow" size={17} />
             </a>
@@ -2033,7 +3765,10 @@ function App() {
   const route = useRoute(),
     [session, setSession] = useState<Session>(emptySession),
     [loaded, setLoaded] = useState(false),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [authError, setAuthError] = useState(
+      () => new URLSearchParams(location.search).get("auth_error") || "",
+    );
   const refresh = useCallback(async () => {
     try {
       setSession(await api<Session>("/api/session"));
@@ -2044,20 +3779,16 @@ function App() {
       setLoaded(true);
     }
   }, []);
+  const boatConnected = useCallback(async () => {
+    await refresh();
+    navigate("/start", true);
+  }, [refresh]);
   useEffect(() => {
     const value = new URLSearchParams(location.search).get("auth_error");
     if (value) {
-      setError(value);
+      setAuthError(value);
       history.replaceState({}, "", location.pathname + location.hash);
     }
-    const resize = () =>
-      document.documentElement.style.setProperty(
-        "--app-height",
-        `${window.visualViewport?.height || innerHeight}px`,
-      );
-    resize();
-    window.visualViewport?.addEventListener("resize", resize);
-    return () => window.visualViewport?.removeEventListener("resize", resize);
   }, [refresh]);
   useEffect(() => {
     refresh();
@@ -2083,11 +3814,68 @@ function App() {
         <Spinner />
       </div>
     );
-  return session.user ? (
-    <Dashboard session={session} refresh={refresh} />
-  ) : (
-    <Landing session={session} error={error} />
-  );
+  if (route === "/connect/boat")
+    return (
+      <div className="dashboard">
+        <header className="site-header">
+          <Brand />
+        </header>
+        <main className="dashboard-main onboarding-main">
+          <div className="eyebrow">BOAT HOSTING PILOT</div>
+          <h1>A new home for your team.</h1>
+          <p className="page-description">
+            Try Boat for new projects. Your existing projects stay where they
+            are.
+          </p>
+          <section className="create-card onboarding-card">
+            {(error || authError) && <Alert>{error || authError}</Alert>}
+            {session.user?.githubLogin ? (
+              <BoatConnection onConnected={boatConnected} />
+            ) : (
+              <a
+                className="button primary full"
+                href="/auth/github?returnTo=%2Fconnect%2Fboat"
+              >
+                Continue with GitHub
+                <Icon name="arrow" size={18} />
+              </a>
+            )}
+          </section>
+        </main>
+      </div>
+    );
+  if (route === "/start" || route === "/projects")
+    return session.user ? (
+      <Dashboard
+        key={route}
+        session={session}
+        refresh={refresh}
+        authError={authError}
+        listOnly={route === "/projects"}
+      />
+    ) : (
+      <div className="join-page">
+        <Brand />
+        <main className="join-card">
+          <h1>Come on in.</h1>
+          <p>
+            Sign in to{" "}
+            {route === "/start"
+              ? "start a project with your team"
+              : "return to your projects"}
+            .
+          </p>
+          <a
+            className="button primary full"
+            href={`/auth/github?${route === "/start" ? "purpose=create&" : ""}returnTo=${encodeURIComponent(route)}`}
+          >
+            <Icon name="github" />
+            Continue with GitHub
+          </a>
+        </main>
+      </div>
+    );
+  return <Landing session={session} error={error || authError} />;
 }
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

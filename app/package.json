@@ -8,6 +8,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "VITE_COMMIT=${RAILWAY_GIT_COMMIT_SHA:-dev} vite build",
     "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.mjs",
     "start": "serve -s dist -l tcp://0.0.0.0:${PORT:-3000}"
   },
   "dependencies": {
